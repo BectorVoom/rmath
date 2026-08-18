@@ -1,12 +1,12 @@
 # rmath
 
-A SIMD `libm` for `f64` — modular, and configured with a builder.
+A SIMD `libm` for `f64` and `f32` — modular, and configured with a builder.
 
-Vectorising elementwise `f64` math usually stalls on the same wall: LLVM will
-not vectorise a loop containing a call to `exp` or `log`, because the call is
-opaque to it. The loop stays scalar no matter how well the rest of it would
-have vectorised. `rmath` provides those functions as vector code, so the loop
-can vectorise.
+Vectorising elementwise floating-point math usually stalls on the same wall:
+LLVM will not vectorise a loop containing a call to `exp` or `log`, because the
+call is opaque to it. The loop stays scalar no matter how well the rest of it
+would have vectorised. `rmath` provides those functions as vector code, so the
+loop can vectorise.
 
 ```rust
 use rmath::prelude::*;
@@ -18,11 +18,73 @@ assert_eq!(f.eval(1.0_f64), 1.0_f64.exp());
 // Or configured: cheaper algorithm, and the caller vouches for the inputs.
 let quick = Exp::builder().accuracy(Fast).domain(Finite).build();
 
-// One object, any width — and whole buffers.
+// One object, any precision, any width — and whole buffers.
+assert_eq!(f.eval(1.0_f32), 1.0_f32.exp());
+
 let src: Vec<f64> = (1..=1000).map(|i| i as f64).collect();
 let mut out = vec![0.0; src.len()];
 f.eval_slice(&src, &mut out);       // widest vectors, scalar tail
 ```
+
+## What is covered
+
+Around forty functions, in four groups that differ in what they can promise.
+The distinction is not bookkeeping — it decides whether the default policy is
+faster than the call it replaces, so it is stated up front rather than buried.
+
+| group | functions | `BitExact` | `Fast` |
+|---|---|---|---|
+| **Exact** | `floor` `ceil` `round` `trunc` `copysign` `fmod` `remainder` `frexp` `ldexp` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
+| **Ported** | `exp` `exp2` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Delegating** | `sin` `cos` `sincos` `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Own** | `lgamma` `tgamma` | — | one implementation, measured bound |
+
+**Exact** needs no caveat. IEEE-754 pins those results down completely, so any
+correct implementation is bit-identical, on any platform, forever; both policy
+axes are genuine no-ops.
+
+**Ported** is the crate's headline case: the vector code replays the platform
+routine's operation schedule, so it is both bit-exact and several times faster.
+
+**Delegating** is the honest part. glibc implements those families with the IBM
+Accurate Portable Math Library routines, whose schedule turns on tables of
+several hundred entries and on per-expression fused-multiply-add placement that
+the compiler chooses and the C source does not show. That has not been
+reproduced here, so under `BitExact` those kernels call the platform routine
+per lane — still bit-exact, so substituting `rmath` cannot change your result,
+but no faster than what it replaces. `Fast` is where their vector path lives,
+and it is worth a lot: **20x** for the trigonometric family.
+
+**Own** is `lgamma` and `tgamma`. Rust has no `f64::tgamma`, so there is no
+call for `BitExact` to be bit-exact *to*; both policies run one vectorised
+implementation, described by its measured error.
+
+## Both precisions
+
+`f64` and `f32`, at every width the backend provides — `f64x2`, `f64x4`,
+`f64x8`, `f32x4`, `f32x8`. One function object serves all of them: precision
+and width are properties of the data, not of the configuration.
+
+Single precision is not the double-precision code with narrower lanes. The
+platform's `expf`, `logf` and `log2f` are separate algorithms, and they do
+their arithmetic *in `double`* over a small table — which is exactly what lets
+those kernels widen `f32x8` to `f64x8`, replay the schedule lane-parallel, and
+round once. Bit-exact and vectorised at the same time.
+
+`f32` also admits a far stronger test than `f64` does. There are only 2^32
+inputs, so `tests/single.rs` checks **every one of them** rather than a sample.
+That is not ceremony; it earned its place twice:
+
+- `expf` differed from the platform on exactly **2 inputs out of 4294967296**.
+  The cause was one fused multiply-add: glibc computes `r` as a fused
+  `InvLn2N*x - kd`, so the product is never rounded to a double of its own.
+  Reading it out of the C source gives the wrong answer, and no sampled test
+  would ever have found it.
+- An earlier design computed the correctly-rounded `f32` functions in `f64` and
+  rounded once. That is the standard trick and it is *very nearly* right — it
+  failed on 1 input in 4e9 for `log10f` and 2 for `sinhf`, where the `f64`
+  result lands within its own error of an `f32` rounding boundary. Those
+  functions now delegate instead, which is both exact and faster.
 
 ## The two questions it makes you answer
 
@@ -46,36 +108,91 @@ test, and the guarantee becomes yours to keep.
 |              | `FullRange` (default) | `Finite` |
 |---|---|---|
 | **`BitExact`** (default) | identical to scalar `libm`, safe on anything | identical inside the domain, wrong outside it |
-| **`Fast`** | ≤ 2 ulp, safe on anything | ≤ 2 ulp inside the domain |
+| **`Fast`** | measured ulp bound, safe on anything | same bound inside the domain |
+
+`Fast`'s bound is per function, measured against the platform and asserted in
+`tests/accuracy.rs`, so a kernel change that loosens one fails the build rather
+than quietly invalidating this file. Most are within **4 ulp**; the inverse
+trigonometric and inverse hyperbolic families within **8**; `pow` within
+**40**, because `y` multiplies the error in `log2 x` as well as its value.
 
 ## Measured
 
-AMD Ryzen AI 7 350 (Zen 5, AVX-512), 1 M elements, best of 12,
-`RUSTFLAGS="-C target-cpu=native"`. Baseline is the scalar `f64::` method
-you would otherwise call. Reproduce with
-`cargo run --release --example bench`.
+AMD Ryzen AI 7 350 (Zen 5, AVX-512), 1 M elements, best of 8,
+`RUSTFLAGS="-C target-cpu=native"`. Baseline is the scalar routine you would
+otherwise call. Reproduce with
+`RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench`.
+
+Numbers are speedups over that baseline; above 1.00x is faster than the `libm`
+call it replaces.
+
+### Ported — bit-exact *and* faster
 
 | function | scalar | `BitExact` | + `Finite` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|--:|
-| `exp`  | 2.11 ns | 0.93 (**2.26x**) | 0.77 (2.73x) | 0.55 (3.83x) | 0.52 (**4.08x**) |
-| `exp2` | 1.58 ns | 0.94 (**1.69x**) | 0.84 (1.87x) | 0.49 (3.23x) | 0.45 (**3.48x**) |
-| `ln`   | 1.89 ns | 0.81 (**2.32x**) | 0.69 (2.75x) | 0.62 (3.06x) | 0.55 (**3.45x**) |
-| `cbrt` | 8.71 ns | 4.91 (**1.77x**) | 4.99 (1.75x) | — | — |
-| `sqrt` | 0.42 ns | 0.41 (1.00x) | — | — | — |
+| `exp`   |  2.11 ns | **2.22x** | 2.67x | 3.73x | **3.84x** |
+| `exp2`  |  1.62 ns | **1.67x** | 1.89x | 3.41x | **3.43x** |
+| `expm1` |  8.18 ns | **2.48x** | 3.78x | 9.52x | **10.73x** |
+| `ln`    |  1.99 ns | **1.90x** | 2.15x | 3.01x | **3.46x** |
+| `log2`  |  2.27 ns | **1.91x** | 2.06x | 3.66x | **4.46x** |
+| `pow`   | 12.59 ns | **1.47x** | — | 2.26x | — |
+| `cbrt`  |  8.62 ns | **1.67x** | 1.76x | — | — |
+| `sinh`  | 12.22 ns | **3.77x** | 3.86x | 11.49x | **13.17x** |
+| `cosh`  |  3.12 ns | **1.70x** | 1.96x | 4.27x | **4.68x** |
+| `tanh`  | 11.04 ns | **2.67x** | 2.88x | 11.01x | **11.37x** |
+| `sqrt`  |  0.42 ns | 1.00x | — | — | — |
 
-Two of those deserve comment rather than burial:
+### Delegating — parity by default, and a large win under `Fast`
 
+| function | scalar | `BitExact` | `Fast` | + `Finite` |
+|---|--:|--:|--:|--:|
+| `sin`   | 13.18 ns | 1.00x | 19.93x | **20.98x** |
+| `cos`   | 13.67 ns | 1.00x | 20.73x | **21.33x** |
+| `tan`   | 15.87 ns | 0.98x | 21.26x | **22.06x** |
+| `asin`  | 11.24 ns | 1.00x | 9.01x  | 9.86x |
+| `acos`  | 11.21 ns | 0.99x | 9.06x  | 9.83x |
+| `atan`  |  6.57 ns | 0.97x | 8.55x  | 9.51x |
+| `atan2` | 13.66 ns | 0.99x | 8.23x  | — |
+| `asinh` | 10.28 ns | 1.00x | 4.41x  | 5.94x |
+| `acosh` |  9.62 ns | 0.97x | 2.00x  | 9.27x |
+| `atanh` | 14.09 ns | 1.00x | 11.94x | 14.95x |
+| `log10` |  4.93 ns | 0.98x | 7.64x  | 9.63x |
+| `log1p` |  8.87 ns | 0.99x | 10.97x | 13.90x |
+| `hypot` |  3.26 ns | 0.92x | 4.61x  | — |
+| `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
+
+### Single precision
+
+| function | scalar | `BitExact` | `Fast` |
+|---|--:|--:|--:|
+| `expf`  | 1.12 ns | **1.41x** | **3.47x** |
+| `exp2f` | 1.07 ns | **1.40x** | **3.46x** |
+| `logf`  | 1.36 ns | **1.53x** | **3.36x** |
+| `log2f` | 1.33 ns | **1.51x** | 1.51x |
+| `sqrtf` | 0.13 ns | 1.10x | 1.11x |
+| `cbrtf` | 2.49 ns | 0.96x | 0.96x |
+| `tanhf` | 2.82 ns | 0.93x | 1.99x |
+
+Several of those deserve comment rather than burial:
+
+- **The delegating column is 1.00x on purpose.** Those kernels run the
+  platform's own scalar routine once per lane, so parity is the ceiling, and
+  the small shortfall on some rows is the cost of packing and unpacking the
+  lane array around it. If you want those functions vectorised, that is what
+  `Fast` is for — and it is a 4x to 22x difference, not a rounding one.
 - **`sqrt` gains nothing**, and cannot. It is one instruction, LLVM already
   vectorises loops containing it, and `rmath` has nothing to add. It is
   included so a pipeline of these functions does not have to break its pattern
-  for one member — not because it is faster.
-- **`cbrt` barely moves with `Finite`.** Its cost is per-lane exponent
-  surgery at both ends, not the range check, so removing the check saves
-  nothing measurable.
-
-`Fast` was measured at **2 ulp** worst case for `exp`, `exp2` and `ln` over
-300k inputs each; `tests/policy.rs` asserts those bounds, so if a change moves
-them, the test fails and this table is wrong.
+  for one member — not because it is faster. The same is true of `floor`,
+  `ceil` and `trunc`.
+- **`acosh` gains far more from `Finite` than anything else** (1.97x to 8.95x).
+  Its domain test is two comparisons *and* a NaN-producing branch for `x < 1`,
+  which is expensive relative to the small amount of arithmetic that follows.
+- **`cbrtf` and `tanhf` sit just under parity.** Their single-precision
+  routines are cheap enough that widening into the double-precision kernel
+  costs more than it saves, so both policies delegate; see
+  `src/kernels/single/`. A native single-precision `cbrt` approximation would
+  be a real `Fast` path, and is not written yet.
 
 ## What "bit-exact" rests on
 
@@ -92,6 +209,10 @@ twice. That is *not* visible in the C source, and it is not uniform:
   accurate and would stop matching.
 - Even within one function the choice differs: in `exp`'s special-case handler,
   the `k > 0` arm is fused and the `k < 0` arm is not.
+- In `expf`, glibc fuses *both* uses of the same product, so `InvLn2N * x` is
+  never rounded to a double of its own — the C source computes it into a
+  variable and reuses it, and transcribing that faithfully is wrong on two
+  inputs out of four billion.
 
 Every placement was read from a disassembly of the compiled library, not
 inferred. It follows that bit-exactness is a claim about a platform, not a
@@ -131,60 +252,100 @@ instruction. The benchmark prints a warning if you did not.
 
 | path | role |
 |---|---|
-| `src/simd/` | the `Simd` trait every kernel is written against, plus `f64` and `wide` backends |
+| `src/simd/` | the `Real` and `Simd` traits every kernel is written against, plus the scalar and `wide` backends |
 | `src/policy.rs` | `BitExact` / `Fast`, `FullRange` / `Finite` — the typestate |
-| `src/kernels/` | the vector implementations, one module per function |
-| `src/reference.rs` | self-contained scalar ports: the definition of "bit-exact", and the fallback for rare lanes |
-| `src/tables/` | generated data tables |
-| `src/function.rs` | the builder machinery, one `math_fn!` line per function |
-| `tools/gen_tables.py` | regenerates `src/tables/` from upstream C |
+| `src/kernels/exact.rs` | the functions IEEE-754 pins down: one implementation, generic over precision *and* width |
+| `src/kernels/double/` | double-precision kernels, one module per family |
+| `src/kernels/single/` | single-precision kernels |
+| `src/reference/` | scalar references: the definition of "bit-exact", and the fallback for rare lanes |
+| `src/tables/` | generated data tables and `Fast` coefficients |
+| `src/function.rs` | the builder machinery |
+| `src/function_defs.rs` | the catalogue: one `math_fn!` block per function |
+| `tools/gen_tables.py` | regenerates the ported tables from upstream C |
+| `tools/gen_poly.py` | regenerates the `Fast` coefficients by Remez, at 200 bits |
 
-Three properties fall out of that split:
+Four properties fall out of that split:
 
 - **A kernel is generic over the vector type**, so one implementation serves
-  `f64`, `f64x2`, `f64x4` and `f64x8`. Adding a backend means implementing one
-  trait and inheriting every function. Adding a width is one line.
-- **A function object is zero-sized** and not tied to a lane count. `size_of`
-  is 0, `build()` compiles to nothing, and one built object handles every
-  width — because width is a property of the data, not of the configuration.
+  every width of its precision. Adding a backend means implementing one trait
+  and inheriting every function. Adding a width is one line.
+- **A function object is zero-sized** and tied to neither a lane count nor a
+  precision. `size_of` is 0, `build()` compiles to nothing, and one built
+  object handles `f64`, `f32` and every width — because both are properties of
+  the data, not of the configuration.
 - **The hard cases live in one place.** A vector kernel repairs rare lanes —
   overflow, subnormals, NaN — by calling `reference` for those lanes only, so
   correctness at the edges never depends on the vector code getting them right.
   `eval_slice`'s ragged tail runs the same kernel at one lane, so the tail
   cannot drift from the body.
+- **Nothing numeric is transcribed.** Both the ported tables and the `Fast`
+  coefficients are generated, so the provenance of every constant is a script
+  rather than a claim.
 
 ### Adding a function
 
-1. Add `src/kernels/<name>.rs` exposing
-   `pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V`.
-2. Add a scalar port to `src/reference.rs` — **read the schedule out of a
-   disassembly**, not out of the C source.
-3. Add one `math_fn!` block to `src/function.rs`.
-4. Add the corpus and the assertion to `tests/bit_exact.rs`.
+1. Add a module under `src/kernels/double/` (and `single/`) exposing
+   `pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V`.
+2. Add a scalar reference to `src/reference/`. If you are porting, **read the
+   schedule out of a disassembly**, not out of the C source — see above for why.
+3. Add one `math_fn!` block to `src/function_defs.rs` and re-export from
+   `src/lib.rs`.
+4. Add the corpus and the assertion: `tests/bit_exact.rs` for a port,
+   `tests/delegating.rs` for a delegating kernel, `tests/accuracy.rs` for the
+   `Fast` bound, `tests/single.rs` for `f32`.
+
+## Testing
+
+| file | what it establishes |
+|---|---|
+| `tests/bit_exact.rs` | the ported kernels match the platform, at every width, over millions of inputs |
+| `tests/delegating.rs` | `BitExact` really is bit-exact for the delegating kernels too — a kernel that quietly took its `Fast` path would still look fine to an accuracy test |
+| `tests/single.rs` | every `f32` function against the platform; `--ignored` runs all 2^32 inputs per function |
+| `tests/accuracy.rs` | the `Fast` ulp bounds this file quotes, so loosening one fails the build |
+| `tests/policy.rs` | `Finite` agrees with `FullRange` inside the domain, and the builder is zero-cost |
+
+```sh
+cargo test --release
+cargo test --release -- --ignored     # the exhaustive f32 sweeps, ~90 s
+```
 
 ## Status
 
-Covered: `exp`, `exp2`, `ln`, `cbrt`, `sqrt`.
+Covered: the exact, ported, delegating and Gamma groups listed at the top —
+around forty functions, in both precisions.
 
 Known limitations, in rough order of how much they would be missed:
 
-- **Only five functions.** `log2`, `log10`, `pow`, `tanh`, `erf` and the
-  trigonometric family are not implemented. `log2` needs its own table (glibc
-  uses a different, N=64 one); `pow` is the genuinely hard one.
-- **Requires `std`**, for exactly two operations: `f64::mul_add` and
-  `f64::sqrt`, neither of which is in `core`. Supporting `no_std` needs a
-  correctly-rounded software FMA — evaluating `a * b + c` instead would break
-  every guarantee above. Nothing else in the crate uses `std`.
+- **Fourteen functions are delegating, not ported.** Their `BitExact` path is
+  correct but not fast. The trigonometric family is what is most worth porting
+  next, and it is the largest remaining job: glibc uses the IBM Accurate
+  Portable Math Library routines there, with a 440-entry table and a separate
+  reduction for huge arguments. `log10` is a smaller one — it is not the
+  fdlibm composition on `log`, so it needs its own schedule read out.
+- **`Fast` `pow` is the loosest kernel here**, at 40 ulp, because `y`
+  multiplies the error in `log2 x` as well as its value. That is inherent to
+  having no table — which is what `Fast` is for. `BitExact` `pow` carries the
+  logarithm in double-double over glibc's table and is exact.
+- **`lgamma` on the negative half-line** is a difference of comparable terms
+  near its zeros, where relative error is unbounded for any implementation. The
+  bound there is stated as absolute (below 1e-12), not relative.
+- **`tgamma` above 18** is `exp(lgamma(x))`, so its relative error grows with
+  the argument — near the overflow threshold it reaches some 2000 ulp. Below
+  18 the recurrence reaches `[1, 2]` directly and it is within 16.
+- **No native single-precision `cbrt`**, so `cbrtf` delegates under both
+  policies rather than offering a `Fast` path.
+- **Requires `std`**, for exactly two operations: `mul_add` and `sqrt`, neither
+  of which is in `core`. Supporting `no_std` needs a correctly-rounded software
+  FMA — evaluating `a * b + c` instead would break every guarantee above.
 - **Bit-exactness is verified on x86-64 + glibc.** The test suite is the
   arbiter on any other platform, and is designed to fail rather than mislead.
-- **`Fast` has no `cbrt` variant**; the accuracy axis is accepted but ignored
-  there, since the reference algorithm has no cheaper form worth substituting.
 
 ## Licence
 
-MIT. Algorithms and tables for `exp`, `exp2` and `ln` are ported from
+MIT. Algorithms and tables for `exp`, `exp2`, `ln`, `log2`, `pow` and their
+single-precision counterparts are ported from
 [ARM optimized-routines](https://github.com/ARM-software/optimized-routines)
-(MIT OR Apache-2.0 WITH LLVM-exception), the same code glibc uses;
-`cbrt` is ported from [`libm`](https://github.com/rust-lang/compiler-builtins)
-(MIT), itself a port of core-math's `cbrt.c`, Copyright (c) 2021-2022 Alexei
-Sibidanov.
+(MIT OR Apache-2.0 WITH LLVM-exception), the same code glibc uses; `cbrt` is
+ported from [`libm`](https://github.com/rust-lang/compiler-builtins) (MIT),
+itself a port of core-math's `cbrt.c`, Copyright (c) 2021-2022 Alexei Sibidanov.
+The `Fast` coefficients are this crate's own, generated by `tools/gen_poly.py`.

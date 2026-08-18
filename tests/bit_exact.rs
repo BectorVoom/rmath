@@ -93,7 +93,7 @@ fn universal() -> Vec<f64> {
 /// Compare every lane against `scalar`, at the given vector width.
 fn check_width<V, F, G>(name: &str, vals: &[f64], scalar: F, vector: G)
 where
-    V: Simd,
+    V: Simd<Elem = f64>,
     F: Fn(f64) -> f64,
     G: Fn(V) -> V,
 {

@@ -16,13 +16,13 @@
 
 use crate::kernels::not_positive_normal;
 use crate::policy::{Accuracy, Domain};
-use crate::reference;
+use crate::reference::double as reference;
 use crate::simd::{Lanes, Mask, Simd, patch_lanes};
-use crate::tables::log as t;
+use crate::tables::double::log as t;
 
 /// `ln(x)` for a vector of lanes.
 #[inline(always)]
-pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
+pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
     let y = if A::BIT_EXACT { bit_exact(x) } else { fast(x) };
     if D::CHECKED {
         patch_lanes(x, y, not_positive_normal(x), reference::ln)
@@ -39,7 +39,7 @@ const NEAR_HI: f64 = f64::from_bits(0x3ff1090000000000);
 const OFF: u64 = 0x3fe6000000000000;
 
 #[inline(always)]
-fn bit_exact<V: Simd>(x: V) -> V {
+fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let ix = x.to_bits();
 
     let mut invc_a = V::Floats::filled_default();
@@ -83,7 +83,7 @@ fn bit_exact<V: Simd>(x: V) -> V {
 /// The near-1.0 polynomial, with the Veltkamp split that keeps `r - r^2/2`
 /// in double-double.
 #[inline(always)]
-fn near_one<V: Simd>(x: V) -> V {
+fn near_one<V: Simd<Elem = f64>>(x: V) -> V {
     let r = x - V::splat(1.0);
     let p12 = r.mul_add(V::splat(t::B2), V::splat(t::B1));
     let p45 = r.mul_add(V::splat(t::B5), V::splat(t::B4));
@@ -146,7 +146,7 @@ const LN2HI: f64 = 6.93147180369123816490e-01;
 const LN2LO: f64 = 1.90821492927058770002e-10;
 
 #[inline(always)]
-fn fast<V: Simd>(x: V) -> V {
+fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let ix = x.to_bits();
     let mut k_a = V::Floats::filled_default();
     let mut m_bits = V::Bits::filled_default();

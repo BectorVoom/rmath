@@ -1,6 +1,6 @@
 //! `2^x`.
 //!
-//! Shares [`crate::tables::exp`]'s 128-entry table with [`super::exp`] — the
+//! Shares [`crate::tables::double::exp`]'s 128-entry table with [`super::exp`] — the
 //! reduction differs (`r = x - k/128`, with no `ln 2` to subtract), but the
 //! `2^(k/128)` lookup is the same one, which is why adding this function cost
 //! a polynomial and nothing else.
@@ -15,15 +15,15 @@
 
 use crate::kernels::outside;
 use crate::policy::{Accuracy, Domain};
-use crate::reference;
+use crate::reference::double as reference;
 use crate::simd::{Lanes, Simd, patch_lanes};
-use crate::tables::exp as t;
+use crate::tables::double::exp as t;
 
 const MAIN_PATH_LIMIT: f64 = 512.0;
 
 /// `2^x` for a vector of lanes.
 #[inline(always)]
-pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
+pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
     let y = if A::BIT_EXACT { bit_exact(x) } else { fast(x) };
     if D::CHECKED {
         patch_lanes(x, y, outside(x, MAIN_PATH_LIMIT), reference::exp2)
@@ -34,7 +34,7 @@ pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
 
 /// The table path. Every `*` and `+` here is a separate rounding on purpose.
 #[inline(always)]
-fn bit_exact<V: Simd>(x: V) -> V {
+fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::EXP2_SHIFT);
     let kd_s = x + shift;
     let ki = kd_s.to_bits();
@@ -86,7 +86,7 @@ const LN2: f64 = core::f64::consts::LN_2;
 /// The table-free path: reduce to `|r| <= 1/2`, then one Estrin-evaluated
 /// series, with `2^k` written straight into the exponent field.
 #[inline(always)]
-fn fast<V: Simd>(x: V) -> V {
+fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::SHIFT);
     let kd_s = x + shift;
     let kd = kd_s - shift;

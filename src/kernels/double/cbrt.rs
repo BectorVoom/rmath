@@ -26,12 +26,14 @@
 //! the affected lanes only.
 
 use crate::policy::{Accuracy, Domain};
-use crate::reference::{self, CB, ESCALE, OFF_NEAREST, P_M52, P_M60, P_M75, RSC, U0, U1};
+use crate::reference::double::{
+    self as reference, CB, ESCALE, OFF_NEAREST, P_M52, P_M60, P_M75, RSC, U0, U1,
+};
 use crate::simd::{Lanes, Simd};
 
 /// `x^(1/3)` for a vector of lanes.
 #[inline(always)]
-pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
+pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
     let _ = A::BIT_EXACT; // see the module docs: one algorithm, deliberately
     let bits = x.to_bits();
 

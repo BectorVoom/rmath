@@ -1,4 +1,4 @@
-//! Generated data tables.
+//! Generated data tables, one subtree per precision.
 //!
 //! Produced by `tools/gen_tables.py` from ARM optimized-routines' C sources,
 //! rather than transcribed. The generator evaluates the same `#if` conditions
@@ -11,5 +11,5 @@
 //! python3 tools/gen_tables.py
 //! ```
 
-pub mod exp;
-pub mod log;
+pub mod double;
+pub mod single;

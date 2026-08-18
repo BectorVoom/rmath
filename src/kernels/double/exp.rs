@@ -15,16 +15,16 @@
 
 use crate::kernels::outside;
 use crate::policy::{Accuracy, Domain};
-use crate::reference;
+use crate::reference::double as reference;
 use crate::simd::{Lanes, Simd, patch_lanes};
-use crate::tables::exp as t;
+use crate::tables::double::exp as t;
 
 /// Widest `|x|` the vector main path is valid for.
 const MAIN_PATH_LIMIT: f64 = 512.0;
 
 /// `e^x` for a vector of lanes.
 #[inline(always)]
-pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
+pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
     let y = if A::BIT_EXACT { bit_exact(x) } else { fast(x) };
     if D::CHECKED {
         patch_lanes(x, y, outside(x, MAIN_PATH_LIMIT), reference::exp)
@@ -35,7 +35,7 @@ pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
 
 /// The table path, lane-for-lane identical to [`reference::exp`]'s main body.
 #[inline(always)]
-fn bit_exact<V: Simd>(x: V) -> V {
+fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::SHIFT);
     let kd_s = x.mul_add(V::splat(t::INVLN2N), shift);
     let ki = kd_s.to_bits();
@@ -106,7 +106,7 @@ const F: [f64; 12] = [
 
 /// The table-free path.
 #[inline(always)]
-fn fast<V: Simd>(x: V) -> V {
+fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::SHIFT);
     let kd_s = x.mul_add(V::splat(LOG2E), shift);
     let kd = kd_s - shift;
