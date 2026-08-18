@@ -1,0 +1,39 @@
+[package]
+name = "rmath"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A modular SIMD libm for f64, configured with a builder: bit-exact to the platform libm where you need it, fast where you don't."
+repository = "https://github.com/BectorVoom/rmath"
+readme = "README.md"
+keywords = ["simd", "libm", "math", "vectorized", "f64"]
+categories = ["mathematics", "science"]
+exclude = ["/tools", "/.github"]
+
+[features]
+default = ["wide"]
+
+# The `wide` SIMD backend: adds f64x2 / f64x4 / f64x8 vector types.
+# Without it the crate still works — every kernel is generic, and `f64`
+# itself implements `Simd` as a one-lane vector.
+wide = ["dep:wide"]
+
+# NOTE: rmath currently requires `std`, for exactly two operations —
+# `f64::mul_add` and `f64::sqrt`, which are not in `core` (verified: rustc
+# rejects both under `#![no_std]`). Nothing else in the crate needs it; the
+# reference implementations are self-contained ports precisely so that a libm
+# replacement does not call the libm it replaces. Supporting `no_std` means
+# supplying a correctly-rounded software FMA, since evaluating `a * b + c`
+# instead would break every bit-exactness guarantee here. Tracked in README.
+
+[dependencies]
+wide = { version = "1.6", optional = true, default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
