@@ -269,6 +269,53 @@ fn corpus_cbrt(seed: u64) -> Vec<f64> {
     v
 }
 
+/// `sin`/`cos`/`sincos`'s bands: `TINY`/`POLY`/`MID`/`TABLE_LIMIT`, at the
+/// exact bit patterns `src/reference/double/trig.rs` and
+/// `src/kernels/double/trig.rs` branch on (`cos`/`sincos` share one `TINY`,
+/// `sin` has its own). Quadrant boundaries (multiples of `pi/2`, where the
+/// table-band reduction's `n` wraps) and the `__branred` handoff edge get the
+/// same `around()` treatment as every other threshold here — an off-by-one
+/// there is exactly the class of bug this file exists to catch.
+fn corpus_trig(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3e500000_00000000), // sin's TINY
+        f64::from_bits(0x3e400000_00000000), // cos/sincos's TINY
+        f64::from_bits(0x3feb6000_00000000), // POLY: |x| < 0.855469
+        f64::from_bits(0x400368fd_00000000), // MID: |x| < 2.426265
+        f64::from_bits(0x419921fb_00000000), // TABLE_LIMIT / __branred handoff
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    // Quadrant boundaries: `reduce_sincos`'s `n` steps at every multiple of
+    // pi/2, both in the ordinary table band and pushed out near its edge.
+    for k in 1..2000i64 {
+        let q = k as f64 * std::f64::consts::FRAC_PI_2;
+        v.extend(around(q));
+        v.extend(around(-q));
+    }
+    for k in [7000i32, 33_550_336, 67_100_672, 134_201_344] {
+        let q = k as f64 * std::f64::consts::FRAC_PI_2;
+        v.extend(around(q));
+        v.extend(around(-q));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-1000.0, 1000.0)); // ordinary use, table band
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-105_500_000.0, 105_500_000.0)); // straddles __branred
+    }
+    for _ in 0..300_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true)); // subnormals through huge
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -363,6 +410,57 @@ fn reference_cosh_matches_platform_libm() {
     );
 }
 
+#[test]
+fn reference_sin_matches_platform_libm() {
+    assert_reference(
+        "sin",
+        &corpus_trig(0x9E37_79B9_7F4A_7C17),
+        reference::sin,
+        f64::sin,
+    );
+}
+
+#[test]
+fn reference_cos_matches_platform_libm() {
+    assert_reference(
+        "cos",
+        &corpus_trig(0x1234_5678_9ABC_DEF2),
+        reference::cos,
+        f64::cos,
+    );
+}
+
+/// `reference::sincos` must agree with `reference::sin`/`cos` taken
+/// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
+/// are genuinely different computations, so this is not redundant with the
+/// two tests above.
+#[test]
+fn reference_sincos_matches_platform_libm() {
+    let vals = corpus_trig(0xC2B2_AE3D_27D4_EB50);
+    let mut bad = 0usize;
+    let mut shown = 0;
+    for &x in &vals {
+        let (s, c) = reference::sincos(x);
+        let (ws, wc) = (f64::sin(x), f64::cos(x));
+        if s.to_bits() != ws.to_bits() || c.to_bits() != wc.to_bits() {
+            bad += 1;
+            if shown < 8 {
+                shown += 1;
+                eprintln!(
+                    "reference::sincos: x = {x:e} ({:#018x}) => ours ({s:e}, {c:e}), libm ({ws:e}, {wc:e})",
+                    x.to_bits()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        bad,
+        0,
+        "reference::sincos differs from the platform libm on {bad} of {} inputs",
+        vals.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The vector kernels must match the reference at every width.
 // ---------------------------------------------------------------------------
@@ -401,6 +499,44 @@ fn cosh_bit_exact_at_every_width() {
 fn cbrt_bit_exact_at_every_width() {
     let vals = corpus_cbrt(0x2545_F491_4F6C_DD1D);
     check_all_widths!("cbrt", &vals, f64::cbrt, Cbrt::new());
+}
+
+#[test]
+fn sin_bit_exact_at_every_width() {
+    let vals = corpus_trig(0x0BAD_C0DE_DEAD_C0DE);
+    check_all_widths!("sin", &vals, f64::sin, Sin::new());
+}
+
+#[test]
+fn cos_bit_exact_at_every_width() {
+    let vals = corpus_trig(0xFEED_FACE_CAFE_F00D);
+    check_all_widths!("cos", &vals, f64::cos, Cos::new());
+}
+
+/// `sincos` must agree with `sin`/`cos` taken separately at every width — the
+/// pair object cannot go through `check_all_widths!` directly (it returns two
+/// values), so each half is compared through a shim that keeps only that
+/// half, same pattern as `tests/delegating.rs` used before this test moved.
+#[test]
+fn sincos_bit_exact_at_every_width() {
+    let vals = corpus_trig(0x5DEE_CE66_D1B5_4A33);
+
+    #[derive(Clone, Copy)]
+    struct Sin1;
+    impl Function<f64> for Sin1 {
+        fn eval<V: Simd<Elem = f64>>(&self, x: V) -> V {
+            SinCos::new().eval(x).0
+        }
+    }
+    #[derive(Clone, Copy)]
+    struct Cos1;
+    impl Function<f64> for Cos1 {
+        fn eval<V: Simd<Elem = f64>>(&self, x: V) -> V {
+            SinCos::new().eval(x).1
+        }
+    }
+    check_all_widths!("sincos.sin", &vals, f64::sin, Sin1);
+    check_all_widths!("sincos.cos", &vals, f64::cos, Cos1);
 }
 
 #[test]

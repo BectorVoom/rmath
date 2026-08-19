@@ -36,9 +36,9 @@ faster than the call it replaces, so it is stated up front rather than buried.
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
 | **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
-| **Delegating** | `sin` `cos` `sincos` `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Delegating** | `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
 | **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
@@ -60,6 +60,14 @@ bit-exact, with no policy to opt into.
 
 **Ported** is the crate's headline case: the vector code replays the platform
 routine's operation schedule, so it is both bit-exact and several times faster.
+`sin`, `cos` and `sincos` are the largest members of this group: glibc's IBM
+Accurate Mathematical Library schedule for them — a 440-entry table, a
+degree-11 near-zero Taylor band, and fused-multiply-add placement that had to
+be read out of a disassembly (`objdump -d` against `__sin_fma`/`__cos_fma`,
+not inferred from the C source, which gets the fusion pairing wrong in more
+than one place) — is replayed lane-parallel rather than one lane at a time.
+`sincos` benefits most because it shares one argument reduction across both
+outputs, the same asymmetry the platform routine itself exploits.
 
 **Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
 by their shape. Below `|x| = 2` they are rational functions of `x^2` and
@@ -78,7 +86,8 @@ the compiler chooses and the C source does not show. That has not been
 reproduced here, so under `BitExact` those kernels call the platform routine
 per lane — still bit-exact, so substituting `rmath` cannot change your result,
 but no faster than what it replaces. `Fast` is where their vector path lives,
-and it is worth a lot: **20x** for the trigonometric family. `jn` and `yn` are
+and it is worth a lot: **20x** for `tan`, which shares `sin`/`cos`'s schedule
+but has its own unported table shape. `jn` and `yn` are
 here for a different reason: they choose between three algorithms on `n`
 against `x`, and one of them runs a continued fraction whose length is decided
 at run time, so there is no vector shape to give them.
@@ -178,14 +187,15 @@ call it replaces.
 | `cosh`  |  3.12 ns | **1.70x** | 1.96x | 4.27x | **4.68x** |
 | `tanh`  | 11.04 ns | **2.67x** | 2.88x | 11.01x | **11.37x** |
 | `sqrt`  |  0.42 ns | 1.00x | — | — | — |
+| `sin`   | 13.58 ns | **2.97x** | 2.63x | 19.60x | **20.35x** |
+| `cos`   | 14.20 ns | **3.01x** | 2.58x | 20.45x | **21.22x** |
+| `sincos`| 17.97 ns | **3.59x** | 3.72x | 19.11x | **25.55x** |
 
 ### Delegating — parity by default, and a large win under `Fast`
 
 | function | scalar | `BitExact` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|
-| `sin`   | 13.18 ns | 1.00x | 19.93x | **20.98x** |
-| `cos`   | 13.67 ns | 1.00x | 20.73x | **21.33x** |
-| `tan`   | 15.87 ns | 0.98x | 21.26x | **22.06x** |
+| `tan`   | 16.42 ns | 0.98x | 20.84x | **21.98x** |
 | `asin`  | 11.24 ns | 1.00x | 9.01x  | 9.86x |
 | `acos`  | 11.21 ns | 0.99x | 9.06x  | 9.83x |
 | `atan`  |  6.57 ns | 0.97x | 8.55x  | 9.51x |

@@ -9,3 +9,4 @@ pub mod log;
 pub mod log2;
 pub mod poly;
 pub mod pow;
+pub mod trig;

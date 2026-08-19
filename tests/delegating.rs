@@ -152,8 +152,6 @@ macro_rules! suite {
     };
 }
 
-suite!(sin_is_bit_exact, "sin", Sin, wide_corpus(1), f64::sin);
-suite!(cos_is_bit_exact, "cos", Cos, wide_corpus(2), f64::cos);
 suite!(tan_is_bit_exact, "tan", Tan, wide_corpus(3), f64::tan);
 suite!(asin_is_bit_exact, "asin", Asin, unit_corpus(4), f64::asin);
 suite!(acos_is_bit_exact, "acos", Acos, unit_corpus(5), f64::acos);
@@ -204,30 +202,6 @@ suite!(
     wide_corpus(16),
     f64::exp_m1
 );
-
-/// `sincos` must agree with the two functions taken separately.
-#[test]
-fn sincos_is_bit_exact() {
-    let vals = wide_corpus(17);
-    // The pair object cannot go through `all_widths!` directly, so each half
-    // is compared on its own through a shim that keeps only that half.
-    #[derive(Clone, Copy)]
-    struct Cos1;
-    impl Function<f64> for Cos1 {
-        fn eval<V: Simd<Elem = f64>>(&self, x: V) -> V {
-            SinCos::new().eval(x).1
-        }
-    }
-    #[derive(Clone, Copy)]
-    struct Sin1;
-    impl Function<f64> for Sin1 {
-        fn eval<V: Simd<Elem = f64>>(&self, x: V) -> V {
-            SinCos::new().eval(x).0
-        }
-    }
-    all_widths!("sincos.sin", &vals, f64::sin, Sin1);
-    all_widths!("sincos.cos", &vals, f64::cos, Cos1);
-}
 
 /// Compare a two-argument function against the platform, at one width.
 fn check_width2<V, F, G>(name: &str, xs: &[f64], ys: &[f64], scalar: F, vector: G)

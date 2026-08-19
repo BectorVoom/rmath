@@ -20,7 +20,7 @@ What remains, grouped by what it costs the user today:
 
 | gap | today | ceiling |
 |---|---|---|
-| Trig family `BitExact` delegates | `sin`/`cos`/`tan` at 0.98–1.02x | ~20x is proven by the `Fast` path; a bit-exact port would land lower but well above parity |
+| `tan` `BitExact` delegates | 0.97–0.99x | ~20x is proven by the `Fast` path; `sin`/`cos`/`sincos` already ported to 3.0–3.7x, see §6a |
 | Inverse trig + hyperbolic inverses `BitExact` delegate | 0.94–1.01x | `Fast` reaches 8–13x |
 | `log10`, `log1p`, `hypot`, `atan2` `BitExact` delegate | 0.92–1.02x | `Fast` reaches 4.7–14x |
 | Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x | hardware gathers could close part of that spread |
@@ -52,36 +52,33 @@ These are the crate's contracts; the plan treats them as hard.
 The delegating rows are the largest remaining value: `BitExact` is the default
 policy, and sixteen functions currently gain nothing under it.
 
-### A1. Trigonometric family port (`sin`, `cos`, `sincos`, `tan`) — effort XL
+### A1. Trigonometric family port (`sin`, `cos`, `sincos`, `tan`) — **`sin`/`cos`/`sincos` done; `tan` deferred**
 
-The headline job, and explicitly the largest. glibc computes these with the
-IBM Accurate Portable Math Library routines.
+The headline job, and it was the largest. glibc computes these with the IBM
+Accurate Portable Math Library routines.
 
-Plan of attack:
+**Done** (see §6a for the full accounting): schedule read out of a
+disassembly of `__sin_fma`/`__cos_fma` (glibc 2.43, x86-64), not the C source
+— four separate FMA-placement bugs were found and fixed by iterating against
+that ground truth, not by re-reading the source more carefully. Reference
+port in `src/reference/double/trig.rs` (independently verified: 0 mismatches
+against the platform across tens of millions of inputs). Vector kernel in
+`src/kernels/double/trig.rs`'s `bit_exact` submodule: whole-band blending
+(the `logx.rs` near-1 pattern), `__branred` (`|x| >= 105414350`) left as a
+`patch_lanes` repair to `f64::sin`/`cos` rather than ported, per the plan's
+own risk mitigation. Moved from `tests/delegating.rs` to `tests/bit_exact.rs`
+with a dedicated corpus (branch boundaries, quadrant boundaries out to and
+past the table limit, subnormals, adversarial bit patterns). Measured:
+sin/cos `BitExact` **~2.97-3.01x** (from ~1.0x), `sincos` **~3.59-3.72x**
+(higher because it shares one reduction across both outputs) — within the
+plan's own 2-4x estimate.
 
-1. **Scope the schedule first.** Disassemble the host's `__sin_fma` /
-   `__cos_fma` / `__tan` (confirm which ifunc variant actually dispatches on
-   this CPU — same trap as `exp` vs `exp2`). Map the branch structure: the
-   tiny-argument shortcut, the polynomial band, the table band (440-entry
-   sincos table), and the huge-argument reduction (`__branred`, a Payne-Hanek
-   style double-double reduction).
-2. **Extend `tools/gen_tables.py`** to extract the sincos table and the
-   reduction constants from the glibc source tree, same discipline as the
-   `exp`/`log` tables.
-3. **Port in bands.** The polynomial and table bands vectorise cleanly (the
-   table gather is the per-lane loop every other kernel already uses).
-   `__branred` is rare in real corpora — make it a `patch_lanes` repair first,
-   measure, and only vectorise it if profiles say it matters.
-4. **`sincos` first, then `sin`/`cos` as projections, then `tan`** (its
-   payoff is the same reduction feeding a different rational).
-5. **Corpus:** every branch boundary ±2 representable neighbours, the
-   quadrant boundaries at multiples of π/2, subnormals, random bit patterns —
-   the existing `tests/bit_exact.rs` shape, ~7M inputs per function.
-
-Expected: `BitExact` sin/cos from 1.0x to an estimated 2–4x (the gather and
-the reduction bound it; the 20x `Fast` number is not the target). Risk: high —
-FMA placement across four branches, and glibc version drift. Mitigation: land
-`sincos` alone first; the test suite fails loudly rather than shipping wrong.
+**`tan` deferred, not abandoned.** Its own table (`xfg`) has a shape
+(`xfg[186][4]`) that doesn't match how `s_tan.c` indexes it
+(`xfg[i][0..2]`) on a first read of the generator output — an unresolved
+wrinkle that needs its own schedule-reading pass before porting, the same
+discipline `sin`/`cos` needed. Left as a follow-on session rather than
+guessed at.
 
 ### A2. `log10` and `log1p` ports — effort L for `log10` (corrected), M for `log1p`
 
@@ -557,6 +554,96 @@ widening whenever the f64 kernel does more than the f32 result needs.
   than blending into one number) measure 8.4x on the recurrence-only corpus
   and 4.6x on the Stirling-only one.
 
+- **A1: `sin`/`cos`/`sincos` ported; `tan` deferred.** The crate's
+  stated-biggest remaining claim. Full pipeline, in order:
+  - **Table/constant generation.** `tools/gen_tables.py` extended to fetch
+    `usncs.h`, `branred.h`, `sincostab.c` and `s_sin.c` from glibc's own
+    source tree (not ARM-optimized-routines, the source for every other
+    table here) and emit `src/tables/double/trig.rs`: `S1`-`S5` (Taylor
+    band), `SN3`/`SN5`/`CS2`/`CS4`/`CS6` (table-band polynomial),
+    `BIG`/`HP0`/`HP1`/`MP1`/`MP2`/`PP3`/`PP4`/`HPINV`/`TOINT` (reduction
+    constants), and the 440-entry `TAB`. Regenerates byte-identical; verified
+    by re-running the generator mid-session (see the note on upstream drift
+    below).
+  - **Schedule reconnaissance was the dominant cost, as budgeted.** `break
+    sin` never fired reliably on the shared library's ifunc-resolved load;
+    fixed by computing the resolved runtime address from `info proc
+    mappings` and breaking there directly, then reading FMA placement out of
+    `objdump -d` on the compiled `__sin_fma`/`__cos_fma` (glibc 2.43,
+    x86-64) — not the C source, which under-determines it: several steps
+    fuse (or specifically do not) in a way the source's own expression
+    grouping does not predict.
+  - **Scalar reference port** (`src/reference/double/trig.rs`): `sin`,
+    `cos`, `sincos` each reproduce their *own* C entry point's control flow
+    rather than sharing one helper — `__sin`'s and `__sincos`'s mid-band
+    compute the complementary angle differently (`do_cos(y, hp1)` directly
+    vs. a compensated sum formed first), which is not a simplification
+    opportunity, it is a genuine difference in what gets rounded when.
+    `__branred` (`|x| >= 105414350`) is deliberately not ported — it calls
+    straight through to `f64::sin`/`cos`, bit-exact by construction, the
+    same "repair-first" choice the plan called for.
+  - **Four FMA-placement bugs found by iterating against the gdb trace**,
+    not by re-reading the source more carefully: `reduce_sincos`'s tail
+    terms unfused, `do_cos`/`do_sin`'s final correction unfused, `taylor_sin`
+    unfused, and — the one that would not have been found by pattern-matching
+    the other three — `do_sin`'s `c = x*dx + xx*cos_inner(xx)` fuses the
+    *opposite* pairing from what a left-to-right reading suggests
+    (`xx*cos_inner` rounds separately, then `x*dx` fuses into the add).
+    Verification counts after each fix, 5M samples per run:
+    3407 → 2736 → 175 → (3, 1, 4) → **0** bad `sin`/`cos`/`sincos` results,
+    then confirmed 0/60M and a separate 0/30M small-magnitude stress pass.
+  - **Vector kernel** (`src/kernels/double/trig.rs`'s `bit_exact`
+    submodule): every scalar primitive re-expressed generically over `Simd`,
+    the four bands blended with `V::select` rather than branched (the
+    `logx.rs` near-1 pattern) since `Simd` has no scalar control flow to
+    branch on; `reduce_sincos`'s quadrant bit `n` is carried as two float
+    flags (`n_bit0`/`n_bit1`) rather than an integer, because `Simd` has no
+    packed integer arithmetic (the same constraint `exact.rs`'s progress-log
+    entry documents). `__branred` and specials repaired via `patch_lanes` to
+    the scalar reference. Found and fixed one panic this way: computing
+    every band unconditionally means an adversarial/huge `x` still reaches
+    the table-index arithmetic for a lane whose result will be discarded, so
+    a defensive `% 110` was added to the per-lane index — not part of the
+    algorithm, commented as such, and only reachable for inputs the blend
+    already discards.
+  - **Verified independently at 4 widths** (scalar, `f64x2`, `f64x4`,
+    `f64x8`) against 8M adversarial/huge/dense/exact-quadrant inputs: zero
+    mismatches. Tests moved from `tests/delegating.rs` to
+    `tests/bit_exact.rs` (`corpus_trig`: every band threshold ±2
+    neighbours, quadrant boundaries at multiples of `pi/2` both inside and
+    pushed to the table-limit edge, subnormals through `1e300`, random bit
+    patterns) — the shape `tests/bit_exact.rs`'s own module doc specifies.
+  - **Measured** (`examples/bench.rs`, a new `row_pair!` macro added
+    alongside `row!` for `sincos`'s two-output `FunctionPair` shape): `sin`
+    `BitExact` **2.97x/2.63x** (`+Finite`), `cos` **3.01x/2.58x**, `sincos`
+    **3.59x/3.72x** — `sincos` beats `sin`/`cos` taken separately because it
+    shares one reduction across both outputs, same asymmetry the platform
+    routine itself exploits. All three land inside the plan's 2-4x estimate;
+    `tan` is unaffected (still ~0.98x, deliberately deferred — see below).
+  - **`tan` deferred, not attempted.** Its own table (`xfg`) has a shape
+    (`xfg[186][4]`) that does not match how `s_tan.c` indexes it
+    (`xfg[i][0..2]`) on a first read — a wrinkle that needs its own
+    schedule-reading pass, the same discipline `sin`/`cos` needed, before any
+    Rust is written. Left as a follow-on session rather than guessed at.
+  - **Upstream-drift hazard found and worked around, not absorbed.**
+    Re-running `tools/gen_tables.py` at the end of this phase (to confirm
+    byte-identical regeneration, the standing gate) also re-fetched
+    `exp_data.c`/`log_data.c`/`log2_data.c`/`pow_log_data.c` from
+    `ARM-software/optimized-routines`'s `master` branch — unpinned, and it
+    had genuinely changed upstream since those tables were last generated,
+    producing a completely different (still presumably valid, but
+    unverified) `TAB`/coefficient set for `exp`/`log`/`log2`/`pow`. That
+    diff was **not** part of this phase's work and was reverted
+    (`git checkout` on those seven files) rather than silently accepted —
+    regenerating a table that was not the subject of the current change is
+    not a side effect to absorb quietly. The glibc trig sources
+    (`usncs.h`/`branred.h`/`sincostab.c`/`s_sin.c`) had not drifted, so
+    `trig.rs` itself regenerated identically. This is a real gap in the
+    tooling's reproducibility story — `gen_tables.py` should pin commits
+    for every upstream source it fetches, not just document provenance after
+    the fact — left as a follow-on rather than fixed under this phase's
+    scope.
+
 ## 7. Suggested sequencing
 
 Ordered by value density; each phase is independently shippable and ends with
@@ -568,7 +655,7 @@ the full verification protocol (§8).
 | **1** | C1, then re-tighten `pow`; C4; C5 if touched | M | `Fast` exponentials ~1 ulp, `pow` ≤4 asserted, inverse trig ≤4 — **done** |
 | **2** | B1, B3 (B2 withdrawn — considered decision) | M–L | native f32 `Fast`: `tanhf` 4.97x, `sin`/`cos`f 17-18x, `tan`f 7.4x — **done** |
 | **3** | A3, A2, D3 | **L, not M–L** | corrected after disassembly (§ A2/A3): both are genuinely hard, comparable to `erf`/`erfc`, not "easy targets" — **not attempted this round, see below** |
-| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | the trig family bit-exact *and* faster — the crate's biggest remaining claim |
+| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | `sin`/`cos`/`sincos` bit-exact *and* faster (3.0–3.7x) — **done, see §6a**; `tan` and A4 (inverse trig) remain |
 | **5** | A5 gather experiment; ~~C2, C3~~ done | M | either a fleet-wide `BitExact` uplift or a documented negative result; `tgamma` 2037→512 ulp — **C2/C3 done** |
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a
@@ -602,9 +689,12 @@ was written; §6a has the full accounting for each. A5 (gather) is next.
 
 ## 9. Risks
 
-- **Schedule-reading risk (A1/A4):** the FMA placement problem scales with
+- **Schedule-reading risk (`tan`, A4):** the FMA placement problem scales with
   branch count; budget for the disassembly step to dominate, and land one
   function at a time. The test suite is designed to fail loudly — trust it.
+  Confirmed in practice by A1's `sin`/`cos`/`sincos` port (§6a): four separate
+  FMA-placement bugs, each found only by iterating against a live gdb trace,
+  not by re-reading the C source more carefully.
 - **glibc version drift:** a port is bit-exact to *this* host's library;
   that is already the crate's stated contract (`tests/bit_exact.rs` arbitrates
   on other platforms), but each new port widens the surface. Keep the

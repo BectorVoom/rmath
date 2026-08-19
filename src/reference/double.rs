@@ -31,10 +31,12 @@
 pub mod bessel;
 pub mod erf_parts;
 pub mod erfc_parts;
+pub mod trig;
 
 pub use bessel::{j0, j1, jn, y0, y1, yn};
 pub use erf_parts::erf;
 pub use erfc_parts::erfc;
+pub use trig::{cos, sin, sincos};
 
 use crate::tables::double::{exp as et, exp10 as x10t, log as lt, pow as pt};
 
@@ -602,10 +604,6 @@ macro_rules! delegate {
     };
 }
 
-delegate! { /// `sin(x)`, the platform's. `x` in radians.
-sin => sin }
-delegate! { /// `cos(x)`, the platform's. `x` in radians.
-cos => cos }
 delegate! { /// `tan(x)`, the platform's. `x` in radians.
 tan => tan }
 delegate! { /// `asin(x)`, the platform's.
@@ -642,12 +640,6 @@ hypot => hypot, 2 }
 #[inline(always)]
 pub fn atanh(x: f64) -> f64 {
     f64::atanh(x)
-}
-
-/// `(sin(x), cos(x))`, the platform's.
-#[inline(always)]
-pub fn sincos(x: f64) -> (f64, f64) {
-    (f64::sin(x), f64::cos(x))
 }
 
 // ---------------------------------------------------------------------------

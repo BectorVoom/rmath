@@ -131,6 +131,24 @@ fn header() {
     println!("{}", "-".repeat(60));
 }
 
+/// Same shape as [`time`], for a two-output [`FunctionPair`] run.
+fn time_pair(
+    src: &[f64],
+    a: &mut [f64],
+    b: &mut [f64],
+    mut run: impl FnMut(&[f64], &mut [f64], &mut [f64]),
+) -> f64 {
+    run(src, a, b);
+    let mut best = f64::INFINITY;
+    for _ in 0..REPS {
+        let t = Instant::now();
+        run(src, a, b);
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    std::hint::black_box((a[0], b[0]));
+    best * 1e9 / src.len() as f64
+}
+
 /// One unary function, every configuration, against the scalar baseline.
 macro_rules! row {
     ($name:literal, $src:expr, $dst:expr, $scalar:expr, $obj:ident) => {{
@@ -147,6 +165,39 @@ macro_rules! row {
         let tb = time($src, $dst, |s, d| b.eval_slice(s, d));
         let tc = time($src, $dst, |s, d| c.eval_slice(s, d));
         let te = time($src, $dst, |s, d| e.eval_slice(s, d));
+        println!(
+            "{:<10} {base:>10.2} {:>8.2}x {:>8.2}x {:>8.2}x {:>8.2}x",
+            $name,
+            base / ta,
+            base / tb,
+            base / tc,
+            base / te
+        );
+        record($name, "exact", base / ta);
+        record($name, "exact/F", base / tb);
+        record($name, "fast", base / tc);
+        record($name, "fast/F", base / te);
+    }};
+}
+
+/// [`row!`] for a two-output [`FunctionPair`] such as `SinCos`.
+macro_rules! row_pair {
+    ($name:literal, $src:expr, $da:expr, $db:expr, $scalar:expr, $obj:ident) => {{
+        let base = time_pair($src, $da, $db, |s, oa, ob| {
+            for ((x, ra), rb) in s.iter().zip(oa.iter_mut()).zip(ob.iter_mut()) {
+                let (sa, sb) = $scalar(*x);
+                *ra = sa;
+                *rb = sb;
+            }
+        });
+        let a = $obj::builder().accuracy(BitExact).domain(FullRange).build();
+        let b = $obj::builder().accuracy(BitExact).domain(Finite).build();
+        let c = $obj::builder().accuracy(Fast).domain(FullRange).build();
+        let e = $obj::builder().accuracy(Fast).domain(Finite).build();
+        let ta = time_pair($src, $da, $db, |s, oa, ob| a.eval_slice(s, oa, ob));
+        let tb = time_pair($src, $da, $db, |s, oa, ob| b.eval_slice(s, oa, ob));
+        let tc = time_pair($src, $da, $db, |s, oa, ob| c.eval_slice(s, oa, ob));
+        let te = time_pair($src, $da, $db, |s, oa, ob| e.eval_slice(s, oa, ob));
         println!(
             "{:<10} {base:>10.2} {:>8.2}x {:>8.2}x {:>8.2}x {:>8.2}x",
             $name,
@@ -191,6 +242,7 @@ fn main() {
     // Moderate arguments for the hyperbolic family.
     let hypargs: Vec<f64> = (0..N).map(|_| rng.uniform(-20.0, 20.0)).collect();
     let mut dst = vec![0.0; N];
+    let mut dst2 = vec![0.0; N];
 
     header();
     row!("exp", &expargs, &mut dst, f64::exp, Exp);
@@ -206,6 +258,14 @@ fn main() {
     header();
     row!("sin", &angargs, &mut dst, f64::sin, Sin);
     row!("cos", &angargs, &mut dst, f64::cos, Cos);
+    row_pair!(
+        "sincos",
+        &angargs,
+        &mut dst,
+        &mut dst2,
+        f64::sin_cos,
+        SinCos
+    );
     row!("tan", &angargs, &mut dst, f64::tan, Tan);
     row!("asin", &unitargs, &mut dst, f64::asin, Asin);
     row!("acos", &unitargs, &mut dst, f64::acos, Acos);
