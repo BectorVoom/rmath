@@ -20,9 +20,9 @@ math_fn! {
     free: exp,
     k64: crate::kernels::double::exp,
     k32: crate::kernels::single::exp,
-    /// `e^x`, bit-exact and safe on any input.
+    /// `e^x`, fast approximation safe on any input.
     ///
-    /// The shorthand for `Exp::new().eval(x)`.
+    /// The fast-path shorthand for `<Exp<Fast, FullRange>>::default().eval(x)`.
 }
 
 math_fn! {
@@ -32,7 +32,7 @@ math_fn! {
     free: exp2,
     k64: crate::kernels::double::exp2,
     k32: crate::kernels::single::exp2,
-    /// `2^x`, bit-exact and safe on any input.
+    /// `2^x`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -50,7 +50,7 @@ math_fn! {
     free: exp10,
     k64: crate::kernels::double::exp10,
     k32: crate::kernels::single::exp10,
-    /// `10^x`, bit-exact and safe on any input.
+    /// `10^x`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -60,7 +60,7 @@ math_fn! {
     free: ln,
     k64: crate::kernels::double::ln,
     k32: crate::kernels::single::ln,
-    /// `ln(x)`, bit-exact and safe on any input.
+    /// `ln(x)`, fast approximation safe on any input.
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ math_fn! {
     free: cbrt,
     k64: crate::kernels::double::cbrt,
     k32: crate::kernels::single::cbrt,
-    /// `x^(1/3)`, bit-exact and safe on any input.
+    /// `x^(1/3)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -259,7 +259,7 @@ math_fn! {
     free: log2,
     k64: crate::kernels::double::logx::log2,
     k32: crate::kernels::single::log2,
-    /// `log2(x)`, bit-exact and safe on any input.
+    /// `log2(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -269,7 +269,7 @@ math_fn! {
     free: log10,
     k64: crate::kernels::double::logx::log10,
     k32: crate::kernels::single::log10,
-    /// `log10(x)`, bit-exact and safe on any input.
+    /// `log10(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -279,7 +279,7 @@ math_fn! {
     free: log1p,
     k64: crate::kernels::double::logx::log1p,
     k32: crate::kernels::single::log1p,
-    /// `ln(1 + x)`, bit-exact and safe on any input.
+    /// `ln(1 + x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -289,7 +289,7 @@ math_fn! {
     free: expm1,
     k64: crate::kernels::double::expm1,
     k32: crate::kernels::single::expm1,
-    /// `e^x - 1`, bit-exact and safe on any input.
+    /// `e^x - 1`, fast approximation safe on any input.
 }
 
 math_fn2! {
@@ -299,7 +299,7 @@ math_fn2! {
     free: pow,
     k64: crate::kernels::double::pow,
     k32: crate::kernels::single::pow,
-    /// `x^y`, bit-exact and safe on any input.
+    /// `x^y`, fast approximation safe on any input.
 }
 
 math_fn2! {
@@ -309,7 +309,7 @@ math_fn2! {
     free: hypot,
     k64: crate::kernels::double::hypot,
     k32: crate::kernels::single::hypot,
-    /// `hypot(x, y)`, bit-exact and safe on any input.
+    /// `hypot(x, y)`, fast approximation safe on any input.
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ math_fn! {
     free: sin,
     k64: crate::kernels::double::trig::sin,
     k32: crate::kernels::single::sin,
-    /// `sin(x)`, bit-exact and safe on any input.
+    /// `sin(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -333,7 +333,7 @@ math_fn! {
     free: cos,
     k64: crate::kernels::double::trig::cos,
     k32: crate::kernels::single::cos,
-    /// `cos(x)`, bit-exact and safe on any input.
+    /// `cos(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -343,7 +343,7 @@ math_fn! {
     free: tan,
     k64: crate::kernels::double::trig::tan,
     k32: crate::kernels::single::tan,
-    /// `tan(x)`, bit-exact and safe on any input.
+    /// `tan(x)`, fast approximation safe on any input.
 }
 
 math_fn_pair! {
@@ -363,7 +363,7 @@ math_fn_pair! {
     free: sincos,
     k64: crate::kernels::double::trig::sincos,
     k32: crate::kernels::single::sincos,
-    /// `(sin(x), cos(x))`, bit-exact and safe on any input.
+    /// `(sin(x), cos(x))`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -373,7 +373,7 @@ math_fn! {
     free: asin,
     k64: crate::kernels::double::invtrig::asin,
     k32: crate::kernels::single::asin,
-    /// `asin(x)`, bit-exact and safe on any input.
+    /// `asin(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -383,7 +383,7 @@ math_fn! {
     free: acos,
     k64: crate::kernels::double::invtrig::acos,
     k32: crate::kernels::single::acos,
-    /// `acos(x)`, bit-exact and safe on any input.
+    /// `acos(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -393,7 +393,7 @@ math_fn! {
     free: atan,
     k64: crate::kernels::double::invtrig::atan,
     k32: crate::kernels::single::atan,
-    /// `atan(x)`, bit-exact and safe on any input.
+    /// `atan(x)`, fast approximation safe on any input.
 }
 
 math_fn2! {
@@ -405,7 +405,7 @@ math_fn2! {
     free: atan2,
     k64: crate::kernels::double::invtrig::atan2,
     k32: crate::kernels::single::atan2,
-    /// `atan2(y, x)`, bit-exact and safe on any input.
+    /// `atan2(y, x)`, fast approximation safe on any input.
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +419,7 @@ math_fn! {
     free: sinh,
     k64: crate::kernels::double::hyper::sinh,
     k32: crate::kernels::single::sinh,
-    /// `sinh(x)`, bit-exact and safe on any input.
+    /// `sinh(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -429,7 +429,7 @@ math_fn! {
     free: cosh,
     k64: crate::kernels::double::hyper::cosh,
     k32: crate::kernels::single::cosh,
-    /// `cosh(x)`, bit-exact and safe on any input.
+    /// `cosh(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -439,7 +439,7 @@ math_fn! {
     free: tanh,
     k64: crate::kernels::double::hyper::tanh,
     k32: crate::kernels::single::tanh,
-    /// `tanh(x)`, bit-exact and safe on any input.
+    /// `tanh(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -449,7 +449,7 @@ math_fn! {
     free: asinh,
     k64: crate::kernels::double::hyper::asinh,
     k32: crate::kernels::single::asinh,
-    /// `asinh(x)`, bit-exact and safe on any input.
+    /// `asinh(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -459,7 +459,7 @@ math_fn! {
     free: acosh,
     k64: crate::kernels::double::hyper::acosh,
     k32: crate::kernels::single::acosh,
-    /// `acosh(x)`, bit-exact and safe on any input.
+    /// `acosh(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -472,7 +472,7 @@ math_fn! {
     free: atanh,
     k64: crate::kernels::double::hyper::atanh,
     k32: crate::kernels::single::atanh,
-    /// `atanh(x)`, bit-exact and safe on any input.
+    /// `atanh(x)`, fast approximation safe on any input.
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +658,7 @@ math_fn! {
     free: j0,
     k64: crate::kernels::double::bessel::j0,
     k32: crate::kernels::single::bessel::j0,
-    /// `j0(x)`, bit-exact and safe on any input.
+    /// `j0(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -668,7 +668,7 @@ math_fn! {
     free: j1,
     k64: crate::kernels::double::bessel::j1,
     k32: crate::kernels::single::bessel::j1,
-    /// `j1(x)`, bit-exact and safe on any input.
+    /// `j1(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -681,7 +681,7 @@ math_fn! {
     free: y0,
     k64: crate::kernels::double::bessel::y0,
     k32: crate::kernels::single::bessel::y0,
-    /// `y0(x)`, bit-exact and safe on any input.
+    /// `y0(x)`, fast approximation safe on any input.
 }
 
 math_fn! {
@@ -691,7 +691,7 @@ math_fn! {
     free: y1,
     k64: crate::kernels::double::bessel::y1,
     k32: crate::kernels::single::bessel::y1,
-    /// `y1(x)`, bit-exact and safe on any input.
+    /// `y1(x)`, fast approximation safe on any input.
 }
 
 math_fn2! {
@@ -712,7 +712,7 @@ math_fn2! {
     free: jn,
     k64: crate::kernels::double::bessel::jn,
     k32: crate::kernels::single::bessel::jn,
-    /// `jn(n, x)`, bit-exact and safe on any input.
+    /// `jn(n, x)`, fast approximation safe on any input.
 }
 
 math_fn2! {
@@ -723,5 +723,5 @@ math_fn2! {
     free: yn,
     k64: crate::kernels::double::bessel::yn,
     k32: crate::kernels::single::bessel::yn,
-    /// `yn(n, x)`, bit-exact and safe on any input.
+    /// `yn(n, x)`, fast approximation safe on any input.
 }

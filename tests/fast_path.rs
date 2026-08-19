@@ -33,7 +33,7 @@ fn test_fast_free_functions_f32() {
 #[test]
 #[cfg(feature = "wide")]
 fn test_fast_free_functions_vectors() {
-    use wide::{f64x4, f32x8};
+    use wide::{f32x8, f64x4};
 
     let vx = f64x4::splat(1.0);
     let exp_vx = fast::exp(vx);
@@ -49,4 +49,23 @@ fn test_fast_free_functions_vectors() {
     let vf = f32x8::splat(1.0);
     let exp_vf = fast::exp(vf);
     assert!((exp_vf.to_array()[0] - 1.0_f32.exp()).abs() < 1e-5);
+}
+
+#[test]
+fn test_toplevel_free_functions_use_fast_path() {
+    let x = 1.0_f64;
+    assert_eq!(rmath::exp(x), rmath::fast::exp(x));
+    assert_eq!(rmath::ln(x), rmath::fast::ln(x));
+    assert_eq!(rmath::sin(x), rmath::fast::sin(x));
+    assert_eq!(rmath::cos(x), rmath::fast::cos(x));
+    assert_eq!(rmath::tan(x), rmath::fast::tan(x));
+    assert_eq!(rmath::sqrt(4.0_f64), rmath::fast::sqrt(4.0_f64));
+    assert_eq!(
+        rmath::pow(2.0_f64, 3.0_f64),
+        rmath::fast::pow(2.0_f64, 3.0_f64)
+    );
+    assert_eq!(rmath::erf(x), rmath::fast::erf(x));
+    assert_eq!(rmath::erfc(x), rmath::fast::erfc(x));
+    assert_eq!(rmath::cbrt(27.0_f64), rmath::fast::cbrt(27.0_f64));
+    assert_eq!(rmath::sincos(x), rmath::fast::sincos(x));
 }

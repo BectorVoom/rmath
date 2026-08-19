@@ -31,7 +31,7 @@
 //! All four are generic over the element type, so `Pow` implements
 //! `Function2<f64>` and `Function2<f32>` and one object serves both.
 
-use crate::policy::{BitExact, FullRange};
+use crate::policy::{BitExact, Fast, FullRange};
 use crate::simd::{Lanes, Real, Simd};
 
 /// The widest `f64` vector the enabled backend provides.
@@ -352,9 +352,9 @@ macro_rules! math_fn {
         #[inline(always)]
         pub fn $free<V: Simd>(x: V) -> V
         where
-            $Name<BitExact, FullRange>: Function<V::Elem>,
+            $Name<Fast, FullRange>: Function<V::Elem>,
         {
-            <$Name<BitExact, FullRange> as Function<V::Elem>>::eval(&$Name::new(), x)
+            <$Name<Fast, FullRange> as Function<V::Elem>>::eval(&$Name::default(), x)
         }
     };
 }
@@ -394,9 +394,9 @@ macro_rules! math_fn2 {
         #[inline(always)]
         pub fn $free<V: Simd>(x: V, y: V) -> V
         where
-            $Name<BitExact, FullRange>: Function2<V::Elem>,
+            $Name<Fast, FullRange>: Function2<V::Elem>,
         {
-            <$Name<BitExact, FullRange> as Function2<V::Elem>>::eval(&$Name::new(), x, y)
+            <$Name<Fast, FullRange> as Function2<V::Elem>>::eval(&$Name::default(), x, y)
         }
     };
 }
@@ -436,9 +436,9 @@ macro_rules! math_fn_pair {
         #[inline(always)]
         pub fn $free<V: Simd>(x: V) -> (V, V)
         where
-            $Name<BitExact, FullRange>: FunctionPair<V::Elem>,
+            $Name<Fast, FullRange>: FunctionPair<V::Elem>,
         {
-            <$Name<BitExact, FullRange> as FunctionPair<V::Elem>>::eval(&$Name::new(), x)
+            <$Name<Fast, FullRange> as FunctionPair<V::Elem>>::eval(&$Name::default(), x)
         }
     };
 }
@@ -479,9 +479,9 @@ macro_rules! math_fn2_pair {
         #[inline(always)]
         pub fn $free<V: Simd>(x: V, y: V) -> (V, V)
         where
-            $Name<BitExact, FullRange>: Function2Pair<V::Elem>,
+            $Name<Fast, FullRange>: Function2Pair<V::Elem>,
         {
-            <$Name<BitExact, FullRange> as Function2Pair<V::Elem>>::eval(&$Name::new(), x, y)
+            <$Name<Fast, FullRange> as Function2Pair<V::Elem>>::eval(&$Name::default(), x, y)
         }
     };
 }
