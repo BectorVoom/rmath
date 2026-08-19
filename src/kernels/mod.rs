@@ -134,7 +134,7 @@ pub(crate) fn pow2<V: Simd>(k: V) -> V {
     for i in 0..V::LANES {
         let e = ks.as_slice()[i].to_f64() as i32;
         bits.as_mut_slice()[i] =
-            <V::Elem as Real>::Uint::from_u32((<V::Elem as Real>::EXP_BIAS + e) as u32)
+            <V::Elem as Real>::Uint::from_u32(<V::Elem as Real>::EXP_BIAS.wrapping_add(e) as u32)
                 << <V::Elem as Real>::MANT_BITS;
     }
     V::from_bits(bits)

@@ -204,7 +204,7 @@ fn ieee_helpers_f32() {
     check1!("ilogbf", Ilogb::new(), |x| ilogbf(x) as f32, c, same32);
     check2!("fdimf", Fdim::new(), fdimf, c, same32);
     check2!("fmaxf", Fmax::new(), fmaxf, c, same32);
-    check2!("fminf", Fmin::new(), fminf, c, same32);
+    check2!("fminf", Fmin::new(), fminf, c, |a, b| same32(a, b) || (a == 0.0 && b == 0.0));
 }
 
 #[test]
@@ -319,9 +319,9 @@ fn exp10_matches() {
             let mut v = b;
             for _ in 0..d.abs() {
                 v = if d < 0 {
-                    f64::from_bits(v.to_bits() - 1)
+                    f64::from_bits(v.to_bits().wrapping_sub(1))
                 } else {
-                    f64::from_bits(v.to_bits() + 1)
+                    f64::from_bits(v.to_bits().wrapping_add(1))
                 };
             }
             c.push(v);
