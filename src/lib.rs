@@ -200,6 +200,7 @@
 //! table above says which they are.
 
 #![deny(missing_docs)]
+#![deny(unsafe_code)]
 #![warn(clippy::all)]
 
 pub mod fast;
@@ -250,4 +251,3 @@ pub mod prelude {
     pub use crate::policy::{BitExact, Fast, Finite, FullRange};
     pub use crate::simd::{Real, Simd};
 }
-

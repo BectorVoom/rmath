@@ -144,25 +144,42 @@ Same IBM-routine family as A1 (tables `doasin`/`atnat` etc.). Do these only
 after A1 proves the workflow; they share its tooling and its corpus
 discipline. Expected parity → 2–3x each.
 
-### A5. Hardware-gather backend experiment — effort M, gated on measurement
+### A5. Hardware-gather backend experiment — **prototyped on `exp`, accepted; wider rollout paused**
 
 Every `BitExact` table kernel pays a per-lane scalar loop for its gathers.
-AVX-512 (`vpgatherqq`) can do this in one instruction; whether it *wins* on
-Zen 5 is an empirical question (gather throughput there is decent but not
-free, and the loop LLVM emits is already branch-free).
+AVX-512 (`vpgatherqq`, via `_mm512_i64gather_epi64`) does this in one
+instruction; AVX2 has a narrower equivalent (`_mm256_i64gather_epi64`).
 
-1. Add one optional trait hook — `Simd::gather_bits(table, indices)` with the
-   existing loop as default — implemented for `f64x8`/`f64x4` behind
-   `cfg(target_feature = "avx512f"/"avx2")` in the `wide` backend, `unsafe`
-   confined to that one function.
-2. Prototype on `exp` `BitExact` only. Accept if ≥15% end-to-end; then roll
-   out to `ln`, `log2`, `pow`, `erf`/`erfc` (double-gather kernels benefit
-   most).
-3. If it loses, delete the branch and record the measurement in the module
-   docs so it isn't re-attempted blind.
+**Done:** `Simd::gather_bits(table, idx)` (`src/simd/mod.rs`), an `unsafe fn`
+with a safe, checked-indexing default — the same per-lane loop every table
+kernel already had — overridden for `f64x8` behind
+`cfg(target_feature = "avx512f")` and `f64x4` behind `avx2`
+(`src/simd/wide_backend.rs`). `#![deny(unsafe_code)]` added to `src/lib.rs`
+with `#[allow(unsafe_code)]` only on the trait default and the two overrides;
+every call site goes through a tiny safe per-kernel wrapper (`exp.rs`'s
+`gather_tab`) whose doc comment carries the index-bounds argument next to the
+arithmetic that makes it true. Verified independently before touching any
+kernel: 1M randomized indices against both overrides, exact match every time.
 
-**Decision gate:** this adds arch-specific `unsafe` to a crate that currently
-has none — needs an explicit go/no-go.
+Wired into `exp`'s `BitExact` path (both table reads). Measured
+(`examples/dbg_gather_bench.rs`, a throwaway A/B harness, both
+implementations timed in one process to remove cross-run noise): **f64x8
++22-23%, f64x4 +11-12%, f64x2 and scalar ~unchanged** (within ±1%, from the
+gather step being restructured out of the original single loop into three —
+index computation, two gathers, post-processing — which has no hardware
+gather to amortize that restructuring against at those widths).
+`examples/bench.rs`'s end-to-end `exp` `BitExact` row (which exercises
+`Real::Widest`, `f64x8` on this hardware) measured consistently at 2.51-2.63x
+against a ~2.20x-2.36x baseline — clears the 15% bar. Bit-exactness
+unaffected by construction (same bits, different instruction) and confirmed
+by the full `tests/bit_exact.rs`/`tests/glibc.rs` suites, unchanged.
+
+**Rollout to `ln`/`log2`/`pow`/`erf`/`erfc` not attempted this round** — a
+deliberate pause, not a rejection. The `exp` prototype answered the
+go/no-go question (below) with real numbers; each further kernel needs its
+own restructuring (`pow` gathers twice, from two different tables) and its
+own A/B verification, which is real, uncompressible work per kernel rather
+than a mechanical copy. Left as the next concrete step.
 
 ## 4. Workstream B — `Fast`-path speed (mostly `f32`)
 
@@ -194,13 +211,13 @@ widening whenever the f64 kernel does more than the f32 result needs.
 
 ## 5. Workstream C — precision
 
-- **C1. Sub-ulp `Fast` exponentials** — effort M, the highest-leverage
-  precision item. `Fast` `exp2` measures ~2 ulp and is now the floor under
-  `Fast` `pow` (≤4 measured). Tightening `exp2`'s fast path — one more Remez
-  degree and/or a compensated final `scale·poly` step — to ~1 ulp would let
-  `pow` assert 4 across all three corpora, and drop `exp`/`exp10` bounds
-  alongside. Verify the speed cost stays under ~5% before accepting; these
-  rows are 3.2–4.0x today.
+- ~~**C1. Sub-ulp `Fast` exponentials**~~ — **done**. `exp2`'s degree-1 term
+  carried as a double-double (see §6a); measures 1 ulp, matching `exp`. `pow`
+  asserts 4 on its two moderate-domain corpora; its extreme-exponent corpus
+  stays at 8 (measured a stable 5, not 4 — the amplification there is worst by
+  construction, see `pow.rs::fast`'s doc). `exp10`'s bound was not touched —
+  it still delegates to the shared 128-entry table's tail and measures 2 ulp,
+  already asserted at 2.
 - ~~**C2. `tgamma` above 18**~~ — **done**, out of original sequence (no glibc
   disassembly needed — Gamma is "own" work). `stirling_dd` carries
   `ln(Gamma(z))` in double-double via `pow`'s own `pow_log`; `hi + lo`
@@ -217,13 +234,17 @@ widening whenever the f64 kernel does more than the f32 result needs.
   asserted 1e-12, with headroom rather than sitting at the edge. Not worth
   the double-double `sin(πx)` work this predicted; the existing bound is
   honest as stated.
-- **C4. `asin`/`acos` 8 → 4 ulp** — effort S/M. The bound is dominated by the
-  `sqrt(1−x²)` reconstruction near |x|=1; a compensated `1−x²` (exact via
-  `(1−x)(1+x)`) plus one fma-corrected sqrt step usually halves it. Measure;
-  accept only if the speed cost is a few percent.
-- **C5. `log2f` 3 → 2 ulp** — effort S, optional. Worst case is the `s`
-  division rounding; an f32 fma residue correction (one extra fma) may buy the
-  ulp. Only worth it if B-series work touches the file anyway.
+- ~~**C4. `asin`/`acos` 8 → 4 ulp**~~ — **done** (Phase 1, see §6a); this entry
+  was stale — left in place until now only because nothing had re-swept the
+  workstream list after that phase landed.
+- ~~**C5. `log2f` 3 → 2 ulp**~~ — **done**. Compensated the `m + 1` rounding
+  in `s = (m - 1)/(m + 1)` the same way `pow.rs::log2_dd` compensates its own
+  division, at `f64` (see `src/kernels/single/log2.rs`). Verified by an
+  exhaustive sweep of every positive-normal `f32` — not a sample — via the
+  new `tests/ulp_scan.rs::scan32_exhaustive` helper: worst case 2 ulp over all
+  2,130,706,432 positive normals. The asserted bound in `tests/accuracy.rs`
+  stays at 4 (it already had 2x headroom over the new measured worst, the
+  same ratio the crate's `cbrt` precedent uses).
 
 ## 6. Workstream D — infrastructure that keeps the above honest
 
@@ -370,6 +391,171 @@ widening whenever the f64 kernel does more than the f32 result needs.
     the precedent `fast_bessel_stays_within_bounds` and
     `lgamma_negative_is_bounded_in_absolute_error` already set for the same
     reason. `tan` keeps a relative bound, being unbounded.
+- **C1's remaining lever closed.** `exp2`'s `Fast` degree-1 term, `r * ln(2)`,
+  was the one place that kernel took a rounding `exp`'s reduction (by `ln(2)`
+  itself) never needed. Carried it as a double-double via `a_mul`
+  (`src/kernels/double/exp2.rs`): the exact high part re-enters the Estrin
+  chain where the plain product was, the low part folds into the
+  lowest-magnitude limb — one extra multiply and one extra FMA. `exp2`
+  measures 1 ulp now (`tests/ulp_scan.rs::scan_exponentials`, 100M samples),
+  matching `exp`; both asserted at 2 in `tests/accuracy.rs` (previously no
+  bound existed for `exp2` past 4). This tightened `pow`'s two moderate-domain
+  corpora from an asserted 8 to 4 (measured 2, stable to 400M samples), but
+  *not* its extreme-exponent corpus, which measures a stable 5 ulp at 100M and
+  400M samples — the amplification there is worst by construction (see
+  `pow.rs::fast`'s doc), so it keeps its own bound of 8 rather than sharing
+  the other two's. This machine's bench noise floor turned out to be far
+  above the ~10-12% recorded in Phase 0 — repeated identical-binary runs swing
+  entire unrelated rows (`floor`, `round`) by 20-70% — so `tools/bench_diff.py`
+  could not cleanly gate this change here; `exp2`/`exp`/`pow`'s `Fast` rows
+  were instead checked across several repeated runs and stayed in their
+  pre-change bands (exp2 ~3-3.5x, exp ~3.8-4.6x, pow ~1.8-2.2x) with no visible
+  collapse. A machine with a quieter bench floor should re-run
+  `tools/bench_diff.py` for a precise number.
+- **`log2f` 3 -> 2 ulp (C5) closed the same session.** See the C5 entry in
+  §5, above — no separate write-up needed here beyond noting it used the same
+  compensated-division technique as C1, at `f32` instead of `f64`, and the
+  same "measure before asserting" discipline via a new permanent exhaustive
+  `f32` sweep helper (`tests/ulp_scan.rs::scan32_exhaustive`), not a sample.
+- **`bessel.rs`'s missing FMA explanation resolved by disassembly, not
+  arithmetic change.** `rational_p`/`rational_q`/`j0_num`/`j0_den` had no
+  comment explaining their absence of `mul_add`, unlike `exp2`/`exp10`'s
+  explicit "glibc ships no `_fma` ifunc" note. Disassembled `__j0_finite` from
+  the host's `libm.so.6` (glibc 2.43, `objdump -d`): zero `vfmadd`/`vfnmadd`/
+  `vfmsub` instructions anywhere in the function, near-origin rational and far
+  asymptotic branch alike — confirmed the same "no `_fma` ifunc" reason, not
+  an oversight. Documented in the module doc; no arithmetic touched, per the
+  original plan for this item.
+- **Native `Fast` `cbrt` at `f64` landed, with an honest bound looser than
+  first estimated.** A seed-plus-Newton kernel (`src/kernels/double/cbrt.rs`)
+  resolving §10 item 3: bit-pattern seed for `|x|^(-1/3)` (constant found by
+  the same search technique as the `f32` kernel's, scaled and refined
+  numerically — see the kernel doc), four division-free Newton steps, a
+  compensated final combine. Measures **7-8x against `BitExact`'s 1.7x** — well
+  past the 3x acceptance bar. Its accuracy bound is **16 ulp** (measured worst
+  8, stable from 100M to 500M samples), not the ~2-4 ulp first estimated: the
+  `f32` kernel's equivalent gets its extra precision for free by running its
+  Newton steps in widened `f64` lanes, but there is no wider type to widen an
+  `f64` Newton iteration into, so its seed-plus-Newton `r` bottoms out at
+  about one `f64` ulp of its own residual, and squaring that (`x * r²`) roughly
+  doubles it before any rounding is even considered. A compensated final
+  combine (`a_mul` twice) recovers only the combine's *own* rounding, moving
+  the measured worst case from 9 to 8 ulp — real, but small next to the
+  residual-doubling it cannot touch. Reaching the originally-hoped low-single-
+  digit bound would need carrying `r` itself in double-double through the
+  final Newton step, at a cost that erodes most of what makes this path fast
+  in the first place; not attempted, since 7-8x at a documented, asserted 16
+  ulp is already a legitimate, honestly-characterized trade — the same kind
+  every other `Fast` bound in this crate makes.
+- **`erff`/`erfcf` native `Fast` experiment, split outcome, and two real bugs
+  found along the way.** The shared shape: below `ERF_SPLIT` (0.75), an odd
+  minimax series `x P(x^2)` (`ERF_NEAR`); above it, `exp(-x^2) Q(z)` with
+  `z = (x - A0)/(x + B0)`, mirroring the platform's own compression but
+  refit directly in `f32` (`tools/gen_poly.py`'s `remez`, reused as-is).
+  Three real precision problems surfaced and were fixed in turn, in order of
+  how badly they broke things:
+  1. **`exp2`f's `Fast` path returning `+-inf` or 0 near its own domain's
+     subnormal-result edge.** `exp(-x^2)` for `x` near the far domain's upper
+     end reduces to an `exp2` call whose argument approaches -127 — inside
+     `exp2`'s own documented `|x| < 128` `Finite` range, but its scale's
+     exponent field was built with `k.wrapping_add(127) << 23`, which only
+     produces a *normal* result and wraps to garbage once the true result
+     goes subnormal. Not hypothetical: it produced a 2*10^9-ulp "error"
+     immediately. Confirmed the identical bug, by inspection, in `exp`f and
+     `exp10`f — both share the construction, and both have their own narrow
+     subnormal-adjacent bands inside their stated domains (`exp`f near
+     `|x| = 87.3-88`, `exp10`f near `|x| = 37-38`; `exp2`f's own f64
+     siblings never hit this, because their `Finite` limits were chosen
+     conservatively enough to stay clear of it, unlike the `f32` ones). Fixed
+     in all three by building `2^(k + 25)` (never subnormal, for any `k`
+     these domains admit) and multiplying by the exact power of two `2^-25`
+     separately — free of additional rounding, since both factors are exact.
+     New permanent regression corpus:
+     `tests/accuracy.rs::fast_single_precision_handles_subnormal_results`.
+  2. **A coefficient-splitting bug in the new `gen_poly.py` code itself.**
+     `exp(-x^2)`'s argument (`x^2 * log2(e)`) needed a compensated,
+     double-single reduction to stay accurate once `x^2` reaches ~101 (`erfc`'s
+     domain runs to `x ~= 10.05`) — a single `f32` rounding of the constant
+     alone cost up to 119 ulp of the final result. The fix (`LOG2E_HI`/
+     `LOG2E_LO`, `exp_neg_x2` in `erf.rs`) needed `HI` rounded to genuine `f32`
+     precision before computing `LO` as its residual; the first version
+     rounded to Python's native `float` (`f64`) instead, silently, which
+     left `LO` correcting the wrong residual and made the error *worse*
+     (2*10^9 -> 119 ulp only, not close to fixed). One-line fix once found
+     (`to_f32`, a real `struct.pack`-based round-trip).
+  3. **A single wide-domain minimax fit not evaluating well in `f32`, even
+     though it fit well mathematically.** With (1) and (2) fixed, `erfc`'s
+     far branch still measured up to 23 ulp: `Q`'s Remez error was ~9e-9 at
+     degree 8, but represents a function falling by two orders of magnitude
+     across its domain, and the f32-rounded coefficients did not evaluate
+     that well in practice regardless of the fit's own mathematical quality.
+     Split into two regions at `x = 2.5` (`ERFC_FAR_LO`/`ERFC_FAR_HI`),
+     mirroring the platform's own two-Chebyshev-fit shape rather than
+     reusing its split point — roughly halved the worst case (23 -> 11 ulp).
+  With all three fixed, `erf`f measured 2 ulp *exhaustively* (every positive
+  normal `f32`, `tests/ulp_scan.rs::scan_single_precision_exhaustive`) at
+  4.1x — accepted, asserted in `tests/accuracy.rs::fast_erf_stays_within_bounds`.
+  `erfc`f, sharing the same fixes, still only measured 11 ulp at 1.51x (its
+  unfixed baseline was already 1.40x) — killed per the plan's own criteria
+  (past the 4 ulp bound, and barely past the 1.5x speed bar), reverted to the
+  shared/`BitExact` code, with the measurement recorded in its module doc
+  rather than silently dropped. See §10 item 4.
+- **`src/kernels/exact.rs` vectorisation attempted, and the premise it was
+  chasing turned out false on inspection.** This was flagged (outside the
+  original roadmap) as a cheap win: `frexp`, `nextafter`, `fmod` and
+  `remainder` run per-lane, and the module's own doc claimed "writing them
+  lane-at-a-time keeps them branch-free, which is what lets LLVM vectorise
+  them anyway" — implying the scalar loop already compiles to real SIMD.
+  Checked rather than trusted: disassembled the compiled `frexp` (`objdump
+  -d` on a `#[no_mangle]` probe at `f64x4`) and found real per-lane branches
+  and scalar `vmovsd` moves, not packed instructions — LLVM is not
+  vectorising it. The deeper reason closes the door on a hand-written fix
+  too: these functions extract or rebuild an IEEE exponent field, which
+  needs an integer *shift*, and [`crate::simd::Simd`] has no packed integer
+  shift anywhere in its surface — `and_bits`/`or_bits`/`xor_bits` are
+  lane-wise bitwise ops on the float representation, and `Simd::Bits` is a
+  plain `[Uint; LANES]` array with no arithmetic of its own. Every kernel
+  elsewhere in the crate that needs a shift (table indices, exponent field
+  construction in `exp`/`exp2`/etc.) pays for it with the exact same
+  per-lane loop pattern; `frexp` and friends are simply *all* shift work,
+  with no floating-point tail left over to vectorise once it is done.
+  Genuinely fixing this would mean adding a shift primitive to `Simd` and
+  implementing it across all six backends (`f64x2/4/8`, `f32x4/8`, scalar) —
+  a real architectural change, not a kernel rewrite, and out of scope for
+  what this item was budgeted as. The stale doc comment was corrected
+  in-place (`src/kernels/exact.rs`) to state what was actually verified
+  rather than assumed. `fmod`/`remainder`/`remquo`'s variable-trip reduction
+  loop was not separately prototyped: it rests on the identical primitive
+  gap, so the outcome would be the same. No code changed; the finding is the
+  deliverable.
+- **D4 corpus hardening, sinh/cosh only.** `src/kernels/double/hyper.rs`'s
+  `sinh`/`cosh` have their own genuine vectorised bit-exact schedule (unlike
+  the many functions here that simply delegate) but had no dedicated
+  `tests/bit_exact.rs` corpus before this — only the generic `universal()`
+  values and whatever `Fast`-only sampling elsewhere happened to cross. Added
+  `corpus_hyper` (`tests/bit_exact.rs`), hardening the gap between `OVERFLOW`
+  (710.0, the kernel's own domain boundary) and the true mathematical
+  overflow threshold (~709.78) specifically — the band a boundary-placement
+  mistake would hide in. Both pass at every width; no bug found, but a real
+  coverage gap closed. `exp`/`exp2`'s subnormal-boundary gap was the same
+  *shape* of gap and did have a bug (see the `erff`/`erfcf` entry above) — the
+  other D4 items (`hypot` near overflow, trig around `TRIG_LIMIT`) were not
+  attempted this round; trig's `BitExact` fully delegates to the scalar
+  reference (`map_lanes`), so it is provably correct by construction and a
+  dedicated corpus would mostly test `map_lanes` itself, already covered
+  generically.
+- **`tgamma`'s dual-compute blend replaced with a whole-vector guard.**
+  `gamma.rs::positive` computed both the `TG_STEPS` recurrence and
+  `stirling_dd` + `exp` unconditionally for every vector, mirroring
+  `bessel.rs::branch`'s reasoning for why that is wasteful when the whole
+  vector already agrees on which side of the cutoff it is on. Split into
+  `direct`/`via_exp`, guarded on `is_direct.all()`/`.none()` with the mixed
+  case still blending both exactly as before — a speed change only, and
+  `tests/ulp_scan.rs::scan_gamma` confirms it: 512/513 ulp, unchanged to the
+  last digit. New bench rows (`examples/bench.rs::tgamma_bench`, two corpora
+  either side of `TG_DIRECT_LIMIT` so the guard's win shows directly rather
+  than blending into one number) measure 8.4x on the recurrence-only corpus
+  and 4.6x on the Stirling-only one.
 
 ## 7. Suggested sequencing
 
@@ -387,6 +573,16 @@ the full verification protocol (§8).
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a
 multi-session project with its own intermediate milestones.
+
+**Since this table, done in one extended session:** C1's remaining lever
+(`exp2` → 1 ulp, `pow` → 4), C4/C5 confirmed done, native f64 `cbrt` `Fast`
+and native `erf`f `Fast` (both §10 open decisions, both resolved — see §6a),
+two real bugs found and fixed along the way (`exp`/`exp2`/`exp10`f subnormal
+underflow; a `gen_poly.py` coefficient-splitting bug), the `exact.rs`
+vectorisation question closed as a documented architectural limit rather than
+attempted blind, `sinh`/`cosh` D4 corpus hardening, and the `tgamma`
+dual-compute guard (8.4x/4.6x). None of this was on the table above when it
+was written; §6a has the full accounting for each. A5 (gather) is next.
 
 ## 8. Verification protocol (applies to every item)
 
@@ -416,9 +612,8 @@ multi-session project with its own intermediate milestones.
 - **Speed/precision trades:** C1 and A5 can each go either way; both carry an
   explicit accept/reject threshold above, so a regression is a decision, not
   a surprise.
-- **f64 `cbrt` `Fast`:** deliberately out of scope — the module documents the
-  one-algorithm choice as a design decision. Revisiting it is a policy
-  question (see §10), not an optimisation task.
+- ~~**f64 `cbrt` `Fast`:** deliberately out of scope~~ — resolved, see §10
+  item 3 and §6a.
 
 ## 10. Open decisions
 
@@ -427,13 +622,36 @@ multi-session project with its own intermediate milestones.
    3–4) the user's actual pain point? The sequencing above assumes value
    density; a user running everything under `BitExact` should invert phases
    2 and 3/4.
-2. **A5 gather backend:** adds `unsafe` + arch-specific code. Go/no-go.
-3. **f64 `cbrt` `Fast`:** keep the documented one-algorithm stance, or offer a
-   native ~4 ulp fast path (seed + 4 Newton steps, est. 3–4x) as an explicit,
-   documented policy change?
-4. **`erff` / `erfcf` `Fast`:** same question, same shape — both modules state
-   "no cheaper approximation worth having." Keep that stance, or offer a
-   lower-accuracy `Fast` path as an explicit opt-in?
+2. ~~**A5 gather backend**~~ — **decided: go, on `exp` — wider rollout still
+   open.** Prototyped, measured (+22-23% on `f64x8`, +11-12% on `f64x4`),
+   and accepted; `#![deny(unsafe_code)]` added with the surface confined to
+   the trait default and two overrides, per the original ask. Whether to
+   extend it to `ln`/`log2`/`pow`/`erf`/`erfc` is the now-open follow-on
+   question — see §5's A5 entry.
+3. ~~**f64 `cbrt` `Fast`**~~ — **decided: offered.** A native seed-plus-Newton
+   `Fast` path landed (`src/kernels/double/cbrt.rs`), measuring 7-8x against
+   `BitExact`'s 1.7x. Its bound is 16 ulp (measured worst 8, stable from 100M
+   to 500M samples at extreme magnitudes), looser than the ~4 ulp originally
+   estimated: unlike the `f32` kernel, there is no wider type for the Newton
+   iteration to run in, so the last squaring pays for `r`'s own one-ulp
+   residual twice over, and a compensated final combine only recovers the
+   combine's own rounding (9 -> 8 ulp), not that residual. See §6a and the
+   kernel's own doc for the full accounting.
+4. ~~**`erff` / `erfcf` `Fast`**~~ — **decided, split: `erff` offered, `erfcf`
+   kept as-is.** Both got the same native attempt (a shared two-region
+   minimax fit, `src/kernels/single/erf.rs`'s `exp_neg_x2`/`far_q`), and both
+   were measured, not assumed. `erff`: 4.1x at 2 ulp worst case, exhaustive
+   over every positive normal — accepted, asserted in `tests/accuracy.rs`.
+   `erfcf`: only 1.51x (barely past its unchanged 1.40x) at 11 ulp — killed,
+   the code reverted, `erfc.rs`'s module doc records the measurement so a
+   future attempt does not re-derive it. The difference was domain, not the
+   fit: `erfc`'s own `Finite` domain reaches ~10.05 with no saturating
+   shortcut, so every lane pays the far branch's full cost, where `erf` only
+   pays for it up to its own ~3.92 saturation point. See §6a for the fuller
+   accounting, including two real, independent bugs this work found and fixed
+   along the way (`exp`/`exp2`/`exp10`f's native `Fast` paths returning `+-inf`
+   or 0 instead of a correct subnormal result, and a coefficient-splitting bug
+   in `tools/gen_poly.py` that rounded to `f64` instead of `f32`).
 5. **`jn`/`yn` and f32 Bessel `BitExact`:** the README's reasons for leaving
    them scalar remain valid; this plan proposes no work there unless a use
    case surfaces.

@@ -32,6 +32,17 @@
 //! there is no version of that which is faster than calling the scalar routine
 //! per lane. They are bit-exact, which is the guarantee that matters, and they
 //! are at parity.
+//!
+//! # No fused multiply-adds, and that is deliberate
+//!
+//! `rational_p`, `rational_q`, `j0_num` and `j0_den` below use no
+//! `mul_add` at all — every rational fit
+//! is separate `*` and `+`. Confirmed against `__j0_finite` in `libm.so.6`
+//! (`objdump -d`, glibc 2.43): zero `vfmadd`/`vfnmadd`/`vfmsub` instructions
+//! anywhere in the function, near-origin rational and far asymptotic branch
+//! alike. Same reason as [`super::exp2`]: glibc ships no `_fma` ifunc variant
+//! of the Bessel functions, so what actually runs on x86-64 is the baseline
+//! build, and fusing here would be *more* accurate and would stop matching.
 
 use crate::kernels::double::{ln, trig};
 use crate::policy::{Accuracy, Domain};

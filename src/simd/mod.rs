@@ -355,6 +355,32 @@ pub trait Simd:
     fn splat_f64(v: f64) -> Self {
         Self::splat(Self::Elem::of_f64(v))
     }
+
+    /// `table[idx[i]]` per lane, as raw bit patterns.
+    ///
+    /// The table kernels' one per-lane loop that is not integer bookkeeping —
+    /// every `BitExact` port with a table (`exp`, `ln`, `log2`, `pow`, `erf`,
+    /// `erfc`, ...) unpacks to scalar for exactly this step, because there is
+    /// no packed-vector gather in [`Simd`]'s surface otherwise. The default
+    /// below is that same per-lane loop, kept safe with checked indexing;
+    /// hardware backends may override it with a real gather instruction
+    /// where the target has one — see `src/simd/wide_backend.rs` for the
+    /// AVX-512/AVX2 overrides and the measurement that gates using them.
+    ///
+    /// # Safety
+    /// Every value in `idx` must be strictly less than `table.len()`. The
+    /// default implementation upholds this with ordinary checked indexing
+    /// (so it panics rather than misbehaves on a caller bug); a hardware
+    /// override is not required to.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn gather_bits(table: &[<Self::Elem as Real>::Uint], idx: Self::Bits) -> Self::Bits {
+        let mut out = Self::Bits::filled_default();
+        for i in 0..Self::LANES {
+            out.as_mut_slice()[i] = table[idx.as_slice()[i].as_u32() as usize];
+        }
+        out
+    }
 }
 
 /// The sign-bit pattern for an element type.

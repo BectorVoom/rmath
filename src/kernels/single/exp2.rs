@@ -50,6 +50,17 @@ fn bit_exact<V: Simd<Elem = f32>>(x: V) -> V {
 /// The table-free path: degree-6 series in `2^r` on `|r| <= 1/2`.
 ///
 /// Measured error: below 2 ulp over `|x| < 128`.
+///
+/// The scale's exponent field is built directly (`k.wrapping_add(127) << 23`
+/// below), which only produces a *normal* result: for `k <= -127` — `x`
+/// approaching `MAIN_PATH_LIMIT`'s lower end, where `2^x` is itself subnormal
+/// or zero — that field construction wraps and returns `+-inf` or 0 instead,
+/// silently, for an `x` this policy's own domain claims to handle. Lanes past
+/// that threshold instead build `2^(k + 25)` (comfortably normal for every
+/// `k` `Finite`'s domain admits, since the smallest representable subnormal
+/// is `2^-149`) and multiply by `2^-25` separately — both factors are exact
+/// powers of two, so the product is `2^k` exactly, with no rounding beyond
+/// what the direct path already pays.
 #[inline(always)]
 fn fast<V: Simd<Elem = f32>>(x: V) -> V {
     /// `(ln 2)^k / k!` for `k` in `1..=6`, the Taylor coefficients of `2^r`.
@@ -83,9 +94,16 @@ fn fast<V: Simd<Elem = f32>>(x: V) -> V {
 
     let ki = kd_s.to_bits();
     let mut bits = V::Bits::filled_default();
+    let mut subnormal_adjust = V::Floats::filled_default();
     for i in 0..V::LANES {
-        let k = (ki.as_slice()[i] & 0x007f_ffff).wrapping_sub(1u32 << 22);
-        bits.as_mut_slice()[i] = k.wrapping_add(127) << 23;
+        let k = (ki.as_slice()[i] & 0x007f_ffff).wrapping_sub(1u32 << 22) as i32;
+        if k <= -127 {
+            bits.as_mut_slice()[i] = ((k + 25 + 127) as u32) << 23;
+            subnormal_adjust.as_mut_slice()[i] = f32::from_bits(0x3300_0000); // 2^-25
+        } else {
+            bits.as_mut_slice()[i] = ((k + 127) as u32) << 23;
+            subnormal_adjust.as_mut_slice()[i] = 1.0;
+        }
     }
-    V::from_bits(bits) * p
+    (V::from_bits(bits) * V::from_array(subnormal_adjust)) * p
 }

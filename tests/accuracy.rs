@@ -32,6 +32,7 @@ mod libm {
         pub safe fn y1(x: f64) -> f64;
         pub safe fn j0f(x: f32) -> f32;
         pub safe fn y0f(x: f32) -> f32;
+        pub safe fn erff(x: f32) -> f32;
     }
 }
 
@@ -275,14 +276,36 @@ fn fast_atanh_differs_from_the_platform_only_where_the_platform_is_worse() {
 
 /// `exp` and `exp2` had no `Fast` bound asserted anywhere in this file before
 /// this test — a real gap, since they are the crate's headline "ported"
-/// functions and the README quotes numbers for them. Both measure at 1-2 ulp
-/// over tens of millions of samples (`tests/ulp_scan.rs`); the bound here
-/// carries the crate's usual headroom rather than pinning the exact figure.
+/// functions and the README quotes numbers for them. Both measure 1 ulp over
+/// hundreds of millions of samples (`tests/ulp_scan.rs`); `exp2` reached that
+/// only after its degree-1 term `r * ln(2)` was carried as a double-double
+/// (`src/kernels/double/exp2.rs`) rather than a single rounded product, which
+/// had previously left it a rounding worse than `exp`.
 #[test]
 fn fast_exponentials_stay_within_bounds() {
     let e = |r: &mut Rng| r.uniform(-500.0, 500.0);
-    check("exp", 27, 4.0, e, fast!(Exp), f64::exp);
-    check("exp2", 28, 4.0, e, fast!(Exp2), f64::exp2);
+    check("exp", 27, 2.0, e, fast!(Exp), f64::exp);
+    check("exp2", 28, 2.0, e, fast!(Exp2), f64::exp2);
+}
+
+/// `cbrt`'s `Fast` policy used to be a no-op — `BitExact` and `Fast` ran the
+/// same correctly-rounded algorithm, deliberately (see the module doc's
+/// history). This is its first divergent bound: a native seed-plus-Newton
+/// kernel with no double-double step, measured at 8 ulp worst case, stable
+/// from 100M to 500M samples at extreme magnitudes
+/// (`tests/ulp_scan.rs::scan_cbrt`) — looser than most `Fast` bounds in this
+/// file because there is no wider type to widen into and refine `r` in, the
+/// way the `f32` kernel does; see `src/kernels/double/cbrt.rs::fast` for why.
+#[test]
+fn fast_cbrt_stays_within_bounds() {
+    check(
+        "cbrt",
+        29,
+        16.0,
+        |r| r.log_uniform(1e-300, 1e300, true),
+        fast!(Cbrt),
+        f64::cbrt,
+    );
 }
 
 #[test]
@@ -329,14 +352,18 @@ fn fast_pow_and_hypot_stay_within_bounds() {
     // division's residue, the `log2(e)` scale and the first two series terms
     // are all carried exactly, pushing the error of *computing* it below one
     // part in 2^53 of the logarithm itself. What remains is dominated by the
-    // `Fast` exponential's own bound, which is why the third corpus — pinned
-    // near the `|y log2 x| < 1020` edge of the vector domain, where the
-    // amplification is at its worst — measures no worse than the first two.
-    // (Before the double-double logarithm, that corpus measured 40 ulp.)
+    // `Fast` exponential's own bound: with `exp2` now at 1 ulp (see
+    // `fast_exponentials_stay_within_bounds`), the first two corpora measure
+    // 2 ulp over hundreds of millions of samples (`tests/ulp_scan.rs`). The
+    // third corpus is pinned near the `|y log2 x| < 1020` edge of the vector
+    // domain, where the amplification is at its worst, and stays measurably
+    // looser — 5 ulp, stable from 100M to 400M samples — so it keeps its own,
+    // wider bound rather than sharing the other two's. (Before the
+    // double-double logarithm, every corpus here measured 40 ulp.)
     check2(
         "pow",
         19,
-        8.0,
+        4.0,
         |r| (r.log_uniform(1e-30, 1e30, false), r.uniform(-20.0, 20.0)),
         fast2!(Pow),
         f64::powf,
@@ -344,7 +371,7 @@ fn fast_pow_and_hypot_stay_within_bounds() {
     check2(
         "pow (moderate exponent)",
         20,
-        8.0,
+        4.0,
         |r| (r.uniform(0.1, 10.0), r.uniform(-8.0, 8.0)),
         fast2!(Pow),
         f64::powf,
@@ -541,6 +568,55 @@ macro_rules! fast32 {
     }};
 }
 
+/// The narrow band just inside each `Fast` exponential's `Finite` domain
+/// limit where `2^x`/`e^x`/`10^x` is itself subnormal.
+///
+/// Found by `Fast` `erfc`f's own corpus (`|x|` up to its 10.05 bound) landing
+/// `exp2` arguments near -127 through the `exp(-x^2)` composition, where the
+/// scale's exponent field construction (`k.wrapping_add(127) << 23`) wrapped
+/// silently to `+-inf` or 0 instead of the correct subnormal -- a real bug in
+/// `exp`/`exp2`/`exp10`f's `fast`, not merely an accuracy shortfall, since it
+/// was inside the domain each kernel's own `Finite` claims to cover. Fixed by
+/// building `2^(k + 25)` (never subnormal, for any `k` these domains admit)
+/// and multiplying by the exact power of two `2^-25` separately; see each
+/// kernel's `fast` doc. Compared against `BitExact` here, not the platform:
+/// `BitExact` already proves it returns the correct subnormal
+/// (`tests/bit_exact.rs`), so it is a self-contained ground truth for this
+/// regression, no new platform binding needed.
+#[test]
+fn fast_single_precision_handles_subnormal_results() {
+    macro_rules! exact32 {
+        ($t:ident) => {{
+            let k = $t::builder().accuracy(BitExact).domain(Finite).build();
+            move |x: f32| Function::<f32>::eval(&k, x)
+        }};
+    }
+    check32(
+        "exp (subnormal band)",
+        45,
+        4.0,
+        |r| r.uniform(-88.0, -87.0) as f32,
+        fast32!(Exp),
+        exact32!(Exp),
+    );
+    check32(
+        "exp2 (subnormal band)",
+        46,
+        4.0,
+        |r| r.uniform(-128.0, -126.0) as f32,
+        fast32!(Exp2),
+        exact32!(Exp2),
+    );
+    check32(
+        "exp10 (subnormal band)",
+        47,
+        4.0,
+        |r| r.uniform(-38.0, -37.0) as f32,
+        fast32!(Exp10),
+        exact32!(Exp10),
+    );
+}
+
 #[test]
 fn fast_single_precision_stays_within_bounds() {
     let e = |r: &mut Rng| r.uniform(-40.0, 40.0) as f32;
@@ -582,9 +658,11 @@ fn fast_single_precision_stays_within_bounds() {
     // the relative bound stands, widened because it is measured near its own
     // poles as well as its zeros.
     check32("tan", 44, 16.0, indomain32, fast32!(Tan), f32::tan);
-    // The remaining single-precision `Fast` kernels widen to `f64` and run
-    // the double-precision vector path, so they inherit its bound with a
-    // `f32` rounding on top -- comfortably inside 4 ulp of the `f32` result.
+    // `tanh` is native (`src/kernels/single/tanh.rs`), not widened -- see
+    // that module's own doc for its bound. `log10`, `expm1` and `atan` below
+    // are the ones that widen to `f64` and run the double-precision vector
+    // path, so they inherit its bound with an `f32` rounding on top --
+    // comfortably inside 4 ulp of the `f32` result.
     check32("tanh", 35, 4.0, e, fast32!(Tanh), f32::tanh);
     check32("log10", 36, 4.0, p, fast32!(Log10), f32::log10);
     check32("expm1", 37, 4.0, e, fast32!(Expm1), f32::exp_m1);
@@ -606,6 +684,24 @@ fn fast_single_precision_stays_within_bounds() {
         |r| r.log_uniform(1e-38, 1e38, true) as f32,
         fast32!(Cbrt),
         f32::cbrt,
+    );
+}
+
+/// `erff`'s `Fast` path, unlike every other single-precision function above:
+/// native rather than widened, and — unlike `erfc`f, whose own native attempt
+/// was measured and reverted (see `src/kernels/single/erfc.rs`'s module
+/// doc) — accepted. Measured 2 ulp exhaustively over every positive normal
+/// `f32` (`tests/ulp_scan.rs::scan_single_precision_exhaustive`, not a
+/// sample), at 4.1x against `BitExact`'s 1.6x.
+#[test]
+fn fast_erf_stays_within_bounds() {
+    check32(
+        "erf",
+        48,
+        4.0,
+        |r| r.uniform(-6.0, 6.0) as f32,
+        fast32!(Erf),
+        |x| libm::erff(x),
     );
 }
 

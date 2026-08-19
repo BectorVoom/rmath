@@ -216,6 +216,38 @@ fn corpus_log(seed: u64) -> Vec<f64> {
     v
 }
 
+/// `sinh`/`cosh`'s own vectorised bit-exact schedule (`src/kernels/double/hyper.rs`)
+/// had no dedicated corpus here before this — only the generic `universal()`
+/// values and whatever `tests/accuracy.rs`'s `Fast`-only sampling happened to
+/// cross. Hardens the overflow boundary specifically: `OVERFLOW = 710.0` is
+/// where the kernel hands off to the scalar reference, and the true
+/// mathematical overflow (`sinh`/`cosh(x) ~ e^x/2`) sits at `x ~= 709.78`, so
+/// the gap between the two is exactly the band a boundary-placement mistake
+/// would hide in.
+fn corpus_hyper(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        710.0,                  // OVERFLOW: the kernel's own domain boundary
+        709.782712893383973096, // true overflow threshold (same as exp's)
+        700.0,
+        720.0,
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-700.0, 700.0)); // ordinary use
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-720.0, 720.0)); // straddles the overflow band
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
 fn corpus_cbrt(seed: u64) -> Vec<f64> {
     let mut rng = Rng(seed);
     let mut v = universal();
@@ -311,6 +343,26 @@ fn reference_cbrt_matches_platform_libm() {
     );
 }
 
+#[test]
+fn reference_sinh_matches_platform_libm() {
+    assert_reference(
+        "sinh",
+        &corpus_hyper(0x9E37_79B9_7F4A_7C16),
+        reference::sinh,
+        f64::sinh,
+    );
+}
+
+#[test]
+fn reference_cosh_matches_platform_libm() {
+    assert_reference(
+        "cosh",
+        &corpus_hyper(0x1234_5678_9ABC_DEF1),
+        reference::cosh,
+        f64::cosh,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The vector kernels must match the reference at every width.
 // ---------------------------------------------------------------------------
@@ -331,6 +383,18 @@ fn exp2_bit_exact_at_every_width() {
 fn ln_bit_exact_at_every_width() {
     let vals = corpus_log(0x5DEE_CE66_D1B5_4A32);
     check_all_widths!("ln", &vals, f64::ln, Ln::new());
+}
+
+#[test]
+fn sinh_bit_exact_at_every_width() {
+    let vals = corpus_hyper(0x5133_5E36_2B36_1D62);
+    check_all_widths!("sinh", &vals, f64::sinh, Sinh::new());
+}
+
+#[test]
+fn cosh_bit_exact_at_every_width() {
+    let vals = corpus_hyper(0xC2B2_AE3D_27D4_EB4F);
+    check_all_widths!("cosh", &vals, f64::cosh, Cosh::new());
 }
 
 #[test]

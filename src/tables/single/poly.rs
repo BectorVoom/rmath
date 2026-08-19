@@ -109,6 +109,80 @@ pub const LOG2_ATANH: [f32; 4] = [
     f32::from_bits(0x3edd4190), // +4.32140822518575163e-01
 ];
 
+/// `erf(x)/x` as a polynomial in `x^2`, on `|x| <= ERF_SPLIT`.
+/// Shared by `erf` (`x * P(x^2)`) and `erfc` (`1 - x * P(x^2)`).
+///
+/// Maximum relative error of the polynomial alone: 1.418e-09
+pub const ERF_NEAR: [f32; 6] = [
+    f32::from_bits(0x3f906eba), // +1.12837916549670436e+00
+    f32::from_bits(0xbec0939d), // -3.76126187545041957e-01
+    f32::from_bits(0x3de71564), // +1.12833765430495378e-01
+    f32::from_bits(0xbcdbd449), // -2.68346231693354018e-02
+    f32::from_bits(0x3ba79638), // +5.11434298085454171e-03
+    f32::from_bits(0xba30ef1b), // -6.74949643028937489e-04
+];
+
+/// `erfc(x) / exp(-x^2)` as a polynomial in `z = (x - A0_LO)/(x + B0_LO)`,
+/// on `ERF_SPLIT <= x <= ERFC_MID`. Shared by `erf`
+/// (`1 - exp(-x^2) Q(z)`, only up to its own narrower saturation
+/// point) and `erfc` (`exp(-x^2) Q(z)` directly).
+///
+/// Maximum relative error of the polynomial alone: 1.922e-09
+pub const ERFC_FAR_LO: [f32; 7] = [
+    f32::from_bits(0x3f01c6aa), // +5.06937652211580492e-01
+    f32::from_bits(0xbf24da12), // -6.43952470645092423e-01
+    f32::from_bits(0x3d81c427), // +6.33624149639539364e-02
+    f32::from_bits(0x3d992f92), // +7.47977607018851937e-02
+    f32::from_bits(0x3c89a94a), // +1.68043552242483664e-02
+    f32::from_bits(0xbbd49763), // -6.48777337723207594e-03
+    f32::from_bits(0xbc4a474f), // -1.23461029457641973e-02
+];
+
+/// `erfc(x) / exp(-x^2)` as a polynomial in `z = (x - A0_HI)/(x + B0_HI)`,
+/// on `ERFC_MID <= x <= ERFC_POS_LIMIT`. `erfc`-only: `erf` saturates
+/// before this region.
+///
+/// Maximum relative error of the polynomial alone: 1.481e-12
+pub const ERFC_FAR_HI: [f32; 9] = [
+    f32::from_bits(0x3e57dda0), // +2.10806364059664797e-01
+    f32::from_bits(0xbeab4bd9), // -3.34563060274568946e-01
+    f32::from_bits(0x3e2e8590), // +1.70431372171461731e-01
+    f32::from_bits(0xbd5c0679), // -5.37171114430044366e-02
+    f32::from_bits(0x3b97bacf), // +4.63042357213768341e-03
+    f32::from_bits(0x3b60c1f5), // +3.42952941541518896e-03
+    f32::from_bits(0xba46d10b), // -7.58425048670757925e-04
+    f32::from_bits(0xb9e3e04c), // -4.34639286796793789e-04
+    f32::from_bits(0x3938b17f), // +1.76137301485481367e-04
+];
+
+/// Where `erf`/`erfc`'s native `Fast` path switches from [`ERF_NEAR`]
+/// to the far branch.
+pub const ERF_SPLIT: f32 = f32::from_bits(0x3f400000);
+
+/// Where the far branch switches from [`ERFC_FAR_LO`] to [`ERFC_FAR_HI`].
+pub const ERFC_MID: f32 = f32::from_bits(0x40200000);
+
+/// The low region's rational map: `z = (x - A0_LO)/(x + B0_LO)`.
+pub const ERFC_A0_LO: f32 = f32::from_bits(0x3f400000);
+
+/// See [`ERFC_A0_LO`].
+pub const ERFC_B0_LO: f32 = f32::from_bits(0x3f800000);
+
+/// The high region's rational map: `z = (x - A0_HI)/(x + B0_HI)`.
+pub const ERFC_A0_HI: f32 = f32::from_bits(0x40200000);
+
+/// See [`ERFC_A0_HI`].
+pub const ERFC_B0_HI: f32 = f32::from_bits(0x40000000);
+
+/// `log2(e)`, as a double-single pair: `HI + LO` carries it to about
+/// twice `f32`'s working precision. Not Cody-Waite truncated, unlike
+/// `f64`'s `LN2HI`/`LN2LO` -- a true FMA gives an exact product against
+/// *any* `f32`, so there is nothing to truncate for.
+pub const LOG2E_HI: f32 = f32::from_bits(0x3fb8aa3b);
+
+/// See [`LOG2E_HI`].
+pub const LOG2E_LO: f32 = f32::from_bits(0x32a57060);
+
 /// `lgamma(1 + t) / (t(t - 1))` on `t` in `[0, 1]`.
 /// The two zeros are factored out, so the kernel reproduces them exactly.
 ///

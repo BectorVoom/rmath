@@ -316,6 +316,120 @@ def build(single: bool) -> str:
             e, single))
         w("")
 
+    if single:
+        # Native `Fast` `erf`/`erfc`: two shared pieces, the same split the
+        # platform's own (`double`-arithmetic) algorithm uses, refitted
+        # directly in single precision so neither kernel needs to widen.
+        #
+        # Near zero, `|x| <= ERF_SPLIT`: `erf(x) = x P(x^2)` (odd, no
+        # cancellation) and `erfc(x) = 1 - x P(x^2)` reuse the same `P` --
+        # they are the same series.
+        #
+        # Beyond the split, `erfc(x) = exp(-x^2) Q(z)` with
+        # `z = (x - A0)/(x + B0)`, which compresses a region of the remaining
+        # domain into a fixed interval a polynomial fits well; `erf(x) =
+        # 1 - exp(-x^2) Q(z)` on its own, narrower domain reuses the low
+        # region's `Q`. `exp(-x^2)` itself comes from this crate's own native
+        # `Fast` `exp2`, not from a table.
+        #
+        # Two regions, not one, mirroring the platform's own two-Chebyshev-fit
+        # shape (see `erfc.rs`'s `BitExact` doc) rather than reusing its split
+        # point: `Q` has to represent a function that falls by about two
+        # orders of magnitude from `ERF_SPLIT` to `ERFC_POS_LIMIT`, and a
+        # single polynomial's *mathematical* fit error stays tiny across that
+        # whole range (Remez sees it), but its f32-rounded coefficients do not
+        # evaluate that well in practice: probed at a few points, the combined
+        # coefficient-rounding and Horner-accumulation error alone ran into
+        # the tens of ulp, well past the fit's own ~1e-8. Splitting at `2.5`
+        # roughly halves the ulp error at the probed points -- confirming the
+        # dynamic range, not the fit degree, was the limit.
+        erf_split = mpf('0.75')
+        erfc_mid = mpf('2.5')
+        erfc_limit = mpf('10.054195404052734')  # 0x1.41bbf8p+3, f32/erfc.rs's own bound
+
+        f = lambda t: (M.erf(M.sqrt(t)) / M.sqrt(t)) if t > 0 else 2 / M.sqrt(mpi)
+        c, e = remez(f, mpf(0), erf_split ** 2, 5, relative(f))
+        w(emit_array(
+            "ERF_NEAR", c,
+            "`erf(x)/x` as a polynomial in `x^2`, on `|x| <= ERF_SPLIT`.\n"
+            "Shared by `erf` (`x * P(x^2)`) and `erfc` (`1 - x * P(x^2)`).",
+            e, single))
+        w("")
+
+        a0_lo, b0_lo = mpf('0.75'), mpf('1.0')
+        z_of_lo = lambda x: (x - a0_lo) / (x + b0_lo)
+        x_of_lo = lambda z: (a0_lo + b0_lo * z) / (1 - z)
+        zlo, zhi = z_of_lo(erf_split), z_of_lo(erfc_mid)
+        f = lambda z: M.erfc(x_of_lo(z)) / M.exp(-x_of_lo(z) ** 2)
+        c, e = remez(f, zlo, zhi, 6, lambda z: mpf(1))
+        w(emit_array(
+            "ERFC_FAR_LO", c,
+            "`erfc(x) / exp(-x^2)` as a polynomial in `z = (x - A0_LO)/(x + B0_LO)`,\n"
+            "on `ERF_SPLIT <= x <= ERFC_MID`. Shared by `erf`\n"
+            "(`1 - exp(-x^2) Q(z)`, only up to its own narrower saturation\n"
+            "point) and `erfc` (`exp(-x^2) Q(z)` directly).",
+            e, single))
+        w("")
+
+        a0_hi, b0_hi = mpf('2.5'), mpf('2.0')
+        z_of_hi = lambda x: (x - a0_hi) / (x + b0_hi)
+        x_of_hi = lambda z: (a0_hi + b0_hi * z) / (1 - z)
+        zlo, zhi = z_of_hi(erfc_mid), z_of_hi(erfc_limit)
+        f = lambda z: M.erfc(x_of_hi(z)) / M.exp(-x_of_hi(z) ** 2)
+        c, e = remez(f, zlo, zhi, 8, lambda z: mpf(1))
+        w(emit_array(
+            "ERFC_FAR_HI", c,
+            "`erfc(x) / exp(-x^2)` as a polynomial in `z = (x - A0_HI)/(x + B0_HI)`,\n"
+            "on `ERFC_MID <= x <= ERFC_POS_LIMIT`. `erfc`-only: `erf` saturates\n"
+            "before this region.",
+            e, single))
+        w("")
+
+        ty = "f32"
+        w(f"/// Where `erf`/`erfc`'s native `Fast` path switches from [`ERF_NEAR`]")
+        w("/// to the far branch.")
+        w(f"pub const ERF_SPLIT: {ty} = {rust_lit(erf_split, single)};")
+        w("")
+        w("/// Where the far branch switches from [`ERFC_FAR_LO`] to [`ERFC_FAR_HI`].")
+        w(f"pub const ERFC_MID: {ty} = {rust_lit(erfc_mid, single)};")
+        w("")
+        w("/// The low region's rational map: `z = (x - A0_LO)/(x + B0_LO)`.")
+        w(f"pub const ERFC_A0_LO: {ty} = {rust_lit(a0_lo, single)};")
+        w("")
+        w("/// See [`ERFC_A0_LO`].")
+        w(f"pub const ERFC_B0_LO: {ty} = {rust_lit(b0_lo, single)};")
+        w("")
+        w("/// The high region's rational map: `z = (x - A0_HI)/(x + B0_HI)`.")
+        w(f"pub const ERFC_A0_HI: {ty} = {rust_lit(a0_hi, single)};")
+        w("")
+        w("/// See [`ERFC_A0_HI`].")
+        w(f"pub const ERFC_B0_HI: {ty} = {rust_lit(b0_hi, single)};")
+        w("")
+
+        # `log2(e)`, split as a double-single pair rather than truncated
+        # Cody-Waite bits: `erfc`'s `exp(-x^2)` composition needs
+        # `x^2 * log2(e)` accurate well past a single `f32` rounding (`x`
+        # reaches 10.05, so `x^2` reaches ~101, and one rounding of `log2(e)`
+        # alone already costs several ulp of the final result once
+        # exponentiated) but a true FMA makes an exact product of *any* two
+        # `f32`s, split or not, so `HI` is just the best single rounding of
+        # `log2(e)` and `LO` is its own residual, rounded once more.
+        def to_f32(v):
+            import struct as _struct
+            return mpf(_struct.unpack("<f", _struct.pack("<f", float(v)))[0])
+
+        hi = to_f32(1 / M.log(2))
+        lo = to_f32(1 / M.log(2) - hi)
+        w("/// `log2(e)`, as a double-single pair: `HI + LO` carries it to about")
+        w("/// twice `f32`'s working precision. Not Cody-Waite truncated, unlike")
+        w("/// `f64`'s `LN2HI`/`LN2LO` -- a true FMA gives an exact product against")
+        w("/// *any* `f32`, so there is nothing to truncate for.")
+        w(f"pub const LOG2E_HI: {ty} = {rust_lit(hi, single)};")
+        w("")
+        w("/// See [`LOG2E_HI`].")
+        w(f"pub const LOG2E_LO: {ty} = {rust_lit(lo, single)};")
+        w("")
+
     # Gamma on [1, 2], where both Gamma functions are reduced to.
     #
     # `lgamma` is fitted divided by `t(t-1)`, which is exactly its two zeros at

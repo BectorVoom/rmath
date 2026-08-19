@@ -261,18 +261,21 @@ fn log2_dd<V: Simd<Elem = f64>>(x: V) -> (V, V) {
     (hi, ((e - hi) + v) + vlo)
 }
 
-/// Measured error: at most 4 ulp over every corpus in `tests/accuracy.rs`,
-/// including one pinned near the `|y log2 x| < 1020` edge of the vector
-/// domain; the asserted bound is 8.
+/// Measured error: at most 2 ulp on the two moderate-domain corpora in
+/// `tests/accuracy.rs` (asserted bound 4), and 5 ulp on the corpus pinned
+/// near the `|y log2 x| < 1020` edge of the vector domain (asserted bound 8,
+/// stable from 100M to 400M samples in `tests/ulp_scan.rs`).
 ///
 /// The structural hazard here is that `y` multiplies the error in `log2 x`
 /// along with its value, which is why the logarithm comes from [`log2_dd`]:
 /// with the error of computing it below `2^-53` of the logarithm itself, the
 /// amplified contribution stays under an ulp of the result even at the domain
-/// edge, and what dominates is the `Fast` exponential's own bound. The extra
-/// division and handful of FMAs cost about a tenth of this kernel's speedup
-/// against [`log2_extended`]; before them it measured 40 ulp, the loosest in
-/// the crate.
+/// edge, and what dominates is the `Fast` exponential's own bound — now 1 ulp
+/// (`src/kernels/double/exp2.rs`), down from ~2 before its degree-1 term was
+/// carried as a double-double, which is what moved this kernel's moderate-
+/// domain bound from 8 to 4. The extra division and handful of FMAs cost
+/// about a tenth of this kernel's speedup against [`log2_extended`]; before
+/// them it measured 40 ulp, the loosest in the crate.
 #[inline(always)]
 fn fast<V: Simd<Elem = f64>>(x: V, y: V) -> V {
     let (lhi, llo) = log2_dd(x);

@@ -19,9 +19,21 @@
 //! Everything in [`floor`], [`ceil`], [`trunc`], [`round`], [`copysign`] and
 //! [`sqrt`] is branch-free vector code. [`ldexp`] takes a vector main path and
 //! repairs only the lanes that cross into the subnormal range.
-//! [`frexp`], [`nextafter`], [`fmod`] and [`remainder`] are per-lane: they are
-//! integer work on the exponent field, and writing them lane-at-a-time keeps
-//! them branch-free, which is what lets LLVM vectorise them anyway.
+//!
+//! [`frexp`], [`nextafter`], [`fmod`] and [`remainder`] are per-lane, and stay
+//! that way: they extract or rebuild an IEEE exponent field, which needs a
+//! bit *shift* against the mantissa width, and [`Simd`] has no packed integer
+//! shift anywhere in its surface — [`Simd::and_bits`]/[`Simd::or_bits`]/
+//! [`Simd::xor_bits`] are lane-wise bitwise ops on the float representation,
+//! not integer arithmetic, and [`Simd::Bits`] is a plain `[Uint; LANES]`
+//! array with no operations of its own. Genuinely vectorising these would
+//! mean adding a shift primitive to the trait and implementing it across
+//! every backend, not rewriting one kernel — confirmed by disassembling the
+//! compiled `frexp`, which showed real per-lane branches and scalar (`vmovsd`)
+//! moves, not the packed instructions a true vectorisation would emit. (An
+//! earlier version of this comment claimed LLVM vectorised the loop anyway;
+//! it does not, at least not with this crate's current codegen flags — this
+//! was checked, not assumed.)
 
 use crate::policy::{Accuracy, Domain};
 use crate::simd::{Lanes, Mask, Real, Simd, Uint, map_lanes_pair, map_lanes2};

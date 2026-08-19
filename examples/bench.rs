@@ -278,6 +278,11 @@ fn main() {
     println!("\n{:<10} {:>10} {:>9}", "function", "libm ns", "rmath");
     println!("{}", "-".repeat(32));
     gamma("lgamma", &hypargs, &mut dst);
+    let mut grng = Rng(0x9E37_79B9_7F4A_7C15);
+    let tgargs_direct: Vec<f64> = (0..N).map(|_| grng.uniform(0.0, 18.0)).collect();
+    let tgargs_stirling: Vec<f64> = (0..N).map(|_| grng.uniform(18.0, 171.0)).collect();
+    tgamma_bench("tgamma (direct)", &tgargs_direct, &mut dst);
+    tgamma_bench("tgamma (stirling)", &tgargs_stirling, &mut dst);
 
     single_precision();
 
@@ -337,6 +342,24 @@ fn gamma(name: &'static str, src: &[f64], dst: &mut [f64]) {
         }
     });
     let k = LGamma::new();
+    let t = time(src, dst, |s, d| k.eval_slice(s, d));
+    println!("{name:<10} {base:>10.2} {:>8.2}x", base / t);
+    record(name, "rmath", base / t);
+}
+
+/// Separate from [`gamma`]: shows the `TG_DIRECT_LIMIT` guard's win directly
+/// by running each side of it as its own row, rather than one corpus blending
+/// both costs together.
+fn tgamma_bench(name: &'static str, src: &[f64], dst: &mut [f64]) {
+    unsafe extern "C" {
+        safe fn tgamma(x: f64) -> f64;
+    }
+    let base = time(src, dst, |s, d| {
+        for (x, o) in s.iter().zip(d.iter_mut()) {
+            *o = tgamma(*x);
+        }
+    });
+    let k = TGamma::new();
     let t = time(src, dst, |s, d| k.eval_slice(s, d));
     println!("{name:<10} {base:>10.2} {:>8.2}x", base / t);
     record(name, "rmath", base / t);

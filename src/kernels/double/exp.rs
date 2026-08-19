@@ -35,6 +35,26 @@ pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
     }
 }
 
+/// `t::TAB[idx[i]]` per lane. The one safe wrapper this crate's sole
+/// `unsafe` call site (`Simd::gather_bits`) goes through here — kept tiny and
+/// local so the safety argument stays next to the index arithmetic that
+/// makes it true, rather than travelling to a call site far from it.
+///
+/// # Panics
+/// Never, given how the caller builds `idx` — but this is not a `debug_assert`
+/// away from being one: every `idx[i]` genuinely must be `< t::TAB.len()`.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn gather_tab<V: Simd<Elem = f64>>(idx: V::Bits) -> V::Bits {
+    const { assert!(t::TAB.len() == 256) };
+    // SAFETY: every caller in this module builds `idx` as `(k & 127) * 2`
+    // or that plus one, which is always even (or one more than even) and
+    // `< 256` — checked against `t::TAB`'s actual length just above, at
+    // compile time, so a future resize of the table cannot silently
+    // invalidate this.
+    unsafe { V::gather_bits(&t::TAB, idx) }
+}
+
 /// The table path, lane-for-lane identical to [`reference::exp`]'s main body.
 #[inline(always)]
 fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
@@ -47,16 +67,30 @@ fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
         kd.mul_add(V::splat(t::NEGLN2HIN), x),
     );
 
-    // The gather. Two arrays rather than one pass returning a pair, because
-    // the index arithmetic is a few cheap ALU ops and splitting the loop
-    // leaves each one a clean, unconditional, fixed-length copy.
-    let mut tail_bits = V::Bits::filled_default();
-    let mut scale_bits = V::Bits::filled_default();
+    // The gather. Index arithmetic and the post-gather `wrapping_add` are
+    // still per-lane -- `Simd::Bits` has no shift or add of its own, see
+    // `crate::kernels::exact`'s module doc for the fuller account of why --
+    // but the two table reads themselves go through `Simd::gather_bits`,
+    // which is a real hardware gather instruction on `f64x4`/`f64x8` when
+    // the target has `avx2`/`avx512f` (see `src/simd/wide_backend.rs`), and
+    // the same checked per-lane loop as before otherwise. This is the A5
+    // prototype (`ROADMAP.md`): landed here first because `exp` measures the
+    // win most directly, one gather, no other per-lane work sharing the loop.
+    let mut idx0 = V::Bits::filled_default();
+    let mut idx1 = V::Bits::filled_default();
+    let mut kshift = V::Bits::filled_default();
     for i in 0..V::LANES {
         let k = ki.as_slice()[i];
-        let idx = ((k & 127) * 2) as usize;
-        tail_bits.as_mut_slice()[i] = t::TAB[idx];
-        scale_bits.as_mut_slice()[i] = t::TAB[idx + 1].wrapping_add(k << 45);
+        let ix = (k & 127) * 2;
+        idx0.as_mut_slice()[i] = ix;
+        idx1.as_mut_slice()[i] = ix + 1;
+        kshift.as_mut_slice()[i] = k << 45;
+    }
+    let tail_bits = gather_tab::<V>(idx0);
+    let scale_raw = gather_tab::<V>(idx1);
+    let mut scale_bits = V::Bits::filled_default();
+    for i in 0..V::LANES {
+        scale_bits.as_mut_slice()[i] = scale_raw.as_slice()[i].wrapping_add(kshift.as_slice()[i]);
     }
     let tail = V::from_bits(tail_bits);
     let scale = V::from_bits(scale_bits);

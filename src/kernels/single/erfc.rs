@@ -13,8 +13,24 @@
 //! folded into the exponent field of the scale, which turns
 //! `erfc(-|x|) = 2 - erfc(|x|)` into a single add.
 //!
-//! Both policies run the same code. `Finite` means
-//! `0x1.c5bf88p-26 < |x| < 0x1.41bbf8p+3` — outside that `erfc` is 1, 0 or 2.
+//! Both policies run the same code, unlike [`super::erf`] — a native `Fast`
+//! path was tried (`erf`'s own shared `exp_neg_x2`/`far_q`, reusing its
+//! two-region minimax fit) and measured, not merely assumed, before deciding
+//! against it. It reached only 1.51x here (against 1.40x for the code above,
+//! i.e. barely faster) at 11 ulp worst case (`tests/ulp_scan.rs::scan_erf_single_precision`),
+//! well past a 4 ulp bound — a materially worse trade than `erf`'s own native
+//! path, which reached 4.1x at 2 ulp on the *same* two building blocks. The
+//! difference is domain, not the fit: `erfc`'s own `Finite` domain reaches
+//! `0x1.41bbf8p+3` (~10.05) with no saturating shortcut anywhere in it, so
+//! every lane pays the far branch's two divisions and a reflection select in
+//! full, where `erf` only pays for that up to its own ~3.92 saturation point
+//! and skips the rest. Kept for the record rather than deleted, so the next
+//! attempt does not re-derive this from scratch: a coarser `z` reduction near
+//! `|x| = 10` that avoids or cheapens the second division might change the
+//! economics.
+//!
+//! `Finite` means `0x1.c5bf88p-26 < |x| < 0x1.41bbf8p+3` — outside that
+//! `erfc` is 1, 0 or 2.
 
 use crate::policy::{Accuracy, Domain};
 use crate::reference::single::erf_parts as r;

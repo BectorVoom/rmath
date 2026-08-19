@@ -23,6 +23,8 @@ mod libm {
         pub safe fn exp10(x: f64) -> f64;
         pub safe fn lgamma(x: f64) -> f64;
         pub safe fn tgamma(x: f64) -> f64;
+        pub safe fn erff(x: f32) -> f32;
+        pub safe fn erfcf(x: f32) -> f32;
     }
 }
 
@@ -205,6 +207,37 @@ fn scan32(
     println!("{label:<24} worst {worst:>8} ulp at x = {at:e}  (skipped {skipped})");
 }
 
+/// Scan *every* `f32` whose bits fall in `lo..=hi`, exhaustively rather than
+/// by sampling — cheap at `f32` width (at most 2^32 inputs), and the only way
+/// to be sure a worst case measured by sampling was actually the worst one.
+fn scan32_exhaustive(
+    label: &str,
+    lo: u32,
+    hi: u32,
+    ours: impl Fn(f32) -> f32,
+    theirs: impl Fn(f32) -> f32,
+) {
+    let mut worst = 0.0f64;
+    let mut at = 0.0f32;
+    let mut skipped = 0u64;
+    let mut n = 0u64;
+    for bits in lo..=hi {
+        let x = f32::from_bits(bits);
+        n += 1;
+        let want = theirs(x);
+        if !want.is_finite() {
+            skipped += 1;
+            continue;
+        }
+        let u = ulps32(ours(x), want);
+        if u > worst {
+            worst = u;
+            at = x;
+        }
+    }
+    println!("{label:<24} worst {worst:>8} ulp at x = {at:e}  ({n} checked, {skipped} skipped)");
+}
+
 macro_rules! fast {
     ($t:ident) => {{
         let k = $t::builder().accuracy(Fast).domain(FullRange).build();
@@ -279,6 +312,19 @@ fn scan_exponentials() {
 
 #[test]
 #[ignore = "measurement, not a check; run explicitly"]
+fn scan_cbrt() {
+    // Rust's `f64::cbrt`, not the platform's -- see `src/kernels/double/cbrt.rs`.
+    scan(
+        "cbrt",
+        103,
+        |r| r.log_uniform(1e-300, 1e300, true),
+        fast!(Cbrt),
+        f64::cbrt,
+    );
+}
+
+#[test]
+#[ignore = "measurement, not a check; run explicitly"]
 fn scan_gamma() {
     scan(
         "tgamma large",
@@ -328,6 +374,48 @@ fn scan_inverse_hyperbolic() {
         |r| r.log_uniform(1e-10, 1e100, true),
         fast!(Asinh),
         f64::asinh,
+    );
+}
+
+#[test]
+#[ignore = "sweeps all positive-normal f32 inputs; minutes, not seconds"]
+fn scan_single_precision_exhaustive() {
+    // Every positive normal `f32`, bit for bit -- not a sample. `f32` is
+    // small enough that "exhaustive" is affordable, and it is the only way
+    // to be sure a `Fast`-path worst case measured elsewhere is the actual
+    // worst case rather than the worst one sampling happened to find.
+    scan32_exhaustive(
+        "log2f",
+        0x0080_0000, // smallest positive normal
+        0x7f7f_ffff, // largest finite
+        fast32!(Log2),
+        f32::log2,
+    );
+    // `erff`'s native `Fast` path (`src/kernels/single/erf.rs`): every
+    // positive normal, including the saturation band past `ERF_MAX_BITS`
+    // and the `FullRange` patch logic, not just the `fast` function in
+    // isolation.
+    scan32_exhaustive("erff", 0x0080_0000, 0x7f7f_ffff, fast32!(Erf), |x| {
+        libm::erff(x)
+    });
+}
+
+#[test]
+#[ignore = "measurement, not a check; run explicitly"]
+fn scan_erf_single_precision() {
+    scan32(
+        "erff",
+        410,
+        |r| r.uniform(-6.0, 6.0) as f32,
+        fast32!(Erf),
+        |x| libm::erff(x),
+    );
+    scan32(
+        "erfcf",
+        411,
+        |r| r.uniform(-6.0, 10.0) as f32,
+        fast32!(Erfc),
+        |x| libm::erfcf(x),
     );
 }
 

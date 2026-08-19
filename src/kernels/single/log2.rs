@@ -76,7 +76,15 @@ fn bit_exact<V: Simd<Elem = f32>>(x: V) -> V {
 /// exact and the final add fused. All single precision, no widening and no
 /// gather.
 ///
-/// Measured error: below 2 ulp over the positive normals.
+/// Measured error: at most 2 ulp, verified by an exhaustive sweep of every
+/// positive normal `f32` (`tests/ulp_scan.rs::scan_single_precision_exhaustive`),
+/// not a sample. Reaching that from a previously-measured 3 ulp needed
+/// compensating the division that forms `s = (m - 1)/(m + 1)`: `m - 1` is
+/// exact here (`m` is folded into `[sqrt(1/2), sqrt2)`), but `m + 1` rounds,
+/// and that rounding was the worst case's dominant term. `dlo`/`slo` below
+/// recover it with the same branch-free identity `pow.rs::log2_dd` uses at
+/// `f64`, at the cost of one extra division-free fma folded into the final
+/// combine.
 #[inline(always)]
 fn fast<V: Simd<Elem = f32>>(x: V) -> V {
     /// `sqrt(2)`, the point the mantissa is folded about.
@@ -103,11 +111,23 @@ fn fast<V: Simd<Elem = f32>>(x: V) -> V {
     let m = V::from_bits(mant);
     let e = V::from_array(es);
 
-    let s = (m - V::splat(1.0)) / (m + V::splat(1.0));
+    // `s = (m - 1)/(m + 1)`: `m - 1` is exact (`m` is within
+    // `[sqrt(1/2), sqrt2)`), but `m + 1` rounds, and that rounding is the
+    // worst case's dominant term. Recover its residue (`dlo`, the same
+    // branch-free Fast2Sum `pow.rs::log2_dd` uses) and fold it into `s`'s own
+    // division residue (`slo`, by the usual `s_true ~= s + slo` identity) so
+    // the final combine corrects for both in one extra fma.
+    let one = V::splat(1.0);
+    let u = m - one;
+    let d = m + one;
+    let dlo = V::select(m.ge_mask(one), (m - d) + one, (one - d) + m);
+    let s = u / d;
+    let slo = ((-s).mul_add(d, u) - s * dlo) / d;
+
     let s2 = s * s;
     let s4 = s2 * s2;
     let lo = s2.mul_add(V::splat(P[1]), V::splat(P[0]));
     let hi = s2.mul_add(V::splat(P[3]), V::splat(P[2]));
     let poly = s4.mul_add(hi, lo);
-    s.mul_add(poly, e)
+    slo.mul_add(poly, s.mul_add(poly, e))
 }

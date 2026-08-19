@@ -35,7 +35,7 @@
 use crate::kernels::double::{exp, ln, pow};
 use crate::kernels::horner;
 use crate::policy::{Accuracy, Domain, Fast, Finite, FullRange};
-use crate::simd::Simd;
+use crate::simd::{Mask, Simd};
 use crate::tables::double::poly as p;
 
 /// `ln(pi)`.
@@ -385,8 +385,29 @@ pub mod tgamma {
     }
 
     /// `Gamma(y)` for `y > 0`.
+    ///
+    /// Guarded rather than always blended: a vector entirely below
+    /// `TG_DIRECT_LIMIT` has no business paying for `stirling_dd` and `exp`,
+    /// and one entirely above it has no business paying for the `TG_STEPS`
+    /// recurrence — mirrors `bessel.rs::branch`'s whole-vector test for the
+    /// same reason. Mixed vectors still compute and blend both, exactly as
+    /// before; the selection outcome is unchanged either way, so this is a
+    /// speed change only.
     #[inline(always)]
     fn positive<V: Simd<Elem = f64>>(y: V) -> V {
+        let is_direct = y.lt_mask(V::splat(TG_DIRECT_LIMIT));
+        if is_direct.all() {
+            return direct(y);
+        }
+        if is_direct.none() {
+            return via_exp(y);
+        }
+        V::select(is_direct, direct(y), via_exp(y))
+    }
+
+    /// The `TG_STEPS`-recurrence path, for `y < TG_DIRECT_LIMIT`.
+    #[inline(always)]
+    fn direct<V: Simd<Elem = f64>>(y: V) -> V {
         let zero = V::splat(0.0);
         let one = V::splat(1.0);
         let two = V::splat(2.0);
@@ -402,9 +423,13 @@ pub mod tgamma {
         prod = prod / V::select(below, z, one);
         z = z + V::select(below, one, zero);
 
-        let direct = gamma_unit(z) * prod;
+        gamma_unit(z) * prod
+    }
+
+    /// The `stirling_dd` + `exp` path, for `y >= TG_DIRECT_LIMIT`.
+    #[inline(always)]
+    fn via_exp<V: Simd<Elem = f64>>(y: V) -> V {
         let (hi, lo) = stirling_dd(y);
-        let viaexp = exp::eval::<V, Fast, FullRange>(hi + lo);
-        V::select(y.lt_mask(V::splat(TG_DIRECT_LIMIT)), direct, viaexp)
+        exp::eval::<V, Fast, FullRange>(hi + lo)
     }
 }

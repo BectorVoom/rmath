@@ -12,7 +12,7 @@
 use super::{Mask, Simd};
 
 macro_rules! impl_wide {
-    ($vec:ty, $elem:ty, $uint:ty, $lanes:literal, $wide:ty) => {
+    ($vec:ty, $elem:ty, $uint:ty, $lanes:literal, $wide:ty $(, $extra:item)*) => {
         impl Mask for MaskOf<$vec> {
             const LANES: usize = $lanes;
             type Bools = [bool; $lanes];
@@ -184,6 +184,8 @@ macro_rules! impl_wide {
             fn select(mask: Self::Mask, if_true: Self, if_false: Self) -> Self {
                 mask.0.select(if_true, if_false)
             }
+
+            $($extra)*
         }
     };
 }
@@ -221,11 +223,94 @@ macro_rules! backend {
             impl_wide!($vec, f64, u64, $lanes, $vec);
         }
     };
+    // A double-precision width, with a hardware `gather_bits` override.
+    ($modname:ident, $vec:ident, $lanes:literal, gather: $gather:item) => {
+        mod $modname {
+            use super::*;
+            use wide::$vec;
+            all_ones!($vec, f64, u64, $lanes);
+            impl_wide!($vec, f64, u64, $lanes, $vec, $gather);
+        }
+    };
 }
 
 backend!(d2, f64x2, 2);
-backend!(d4, f64x4, 4);
-backend!(d8, f64x8, 8);
+backend!(
+    d4,
+    f64x4,
+    4,
+    gather:
+        /// `AVX2` hardware gather — see `Simd::gather_bits`'s doc for the
+        /// contract and `ROADMAP.md`'s A5 for the measurement that gates
+        /// using it. The default per-lane loop remains the fallback on every
+        /// target without `avx2`, and is what a debug build (or a build
+        /// without `-C target-cpu=native`/`+avx2`) actually runs.
+        #[allow(unsafe_code)]
+        #[inline(always)]
+        unsafe fn gather_bits(table: &[u64], idx: [u64; 4]) -> [u64; 4] {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                use core::arch::x86_64::{_mm256_i64gather_epi64, _mm256_set_epi64x};
+                // SAFETY: forwarded from the caller's own contract (every
+                // `idx[i] < table.len()`) — see `Simd::gather_bits`.
+                unsafe {
+                    let vidx =
+                        _mm256_set_epi64x(idx[3] as i64, idx[2] as i64, idx[1] as i64, idx[0] as i64);
+                    let gathered = _mm256_i64gather_epi64(table.as_ptr().cast(), vidx, 8);
+                    core::mem::transmute::<core::arch::x86_64::__m256i, [u64; 4]>(gathered)
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                let mut out = [0u64; 4];
+                for i in 0..4 {
+                    out[i] = table[idx[i] as usize];
+                }
+                out
+            }
+        }
+);
+backend!(
+    d8,
+    f64x8,
+    8,
+    gather:
+        /// `AVX-512F` hardware gather — see `Simd::gather_bits`'s doc for the
+        /// contract and `ROADMAP.md`'s A5 for the measurement that gates
+        /// using it.
+        #[allow(unsafe_code)]
+        #[inline(always)]
+        unsafe fn gather_bits(table: &[u64], idx: [u64; 8]) -> [u64; 8] {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            {
+                use core::arch::x86_64::{_mm512_i64gather_epi64, _mm512_set_epi64};
+                // SAFETY: forwarded from the caller's own contract (every
+                // `idx[i] < table.len()`) — see `Simd::gather_bits`.
+                unsafe {
+                    let vidx = _mm512_set_epi64(
+                        idx[7] as i64,
+                        idx[6] as i64,
+                        idx[5] as i64,
+                        idx[4] as i64,
+                        idx[3] as i64,
+                        idx[2] as i64,
+                        idx[1] as i64,
+                        idx[0] as i64,
+                    );
+                    let gathered = _mm512_i64gather_epi64(vidx, table.as_ptr().cast(), 8);
+                    core::mem::transmute::<core::arch::x86_64::__m512i, [u64; 8]>(gathered)
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+            {
+                let mut out = [0u64; 8];
+                for i in 0..8 {
+                    out[i] = table[idx[i] as usize];
+                }
+                out
+            }
+        }
+);
 backend!(s4, f32x4, f32, u32, 4, f64x4);
 backend!(s8, f32x8, f32, u32, 8, f64x8);
 
