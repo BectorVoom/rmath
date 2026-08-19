@@ -13,6 +13,7 @@
 //!
 //! `Finite` means `|x| < 512`.
 
+use crate::kernels::double::dd::a_mul;
 use crate::kernels::outside;
 use crate::policy::{Accuracy, Domain};
 use crate::reference::double as reference;
@@ -96,6 +97,17 @@ const LN2: f64 = core::f64::consts::LN_2;
 /// rounding instead of two, on an operand that carries only the part of the
 /// result the polynomial actually determines. Measured: worst-case error
 /// roughly halves for the same operation count.
+///
+/// The degree-1 term `r * ln(2)` is [`exp`][super::exp]'s one structural
+/// disadvantage here: `exp`'s reduction is by `ln(2)` itself, so its degree-1
+/// term is `r` exactly, no rounding at all. `exp2` reduces by `1`, so this
+/// term is a genuine product that has to be rounded — unless it is carried
+/// as a double-double. [`a_mul`] splits `r * ln(2)` into an exact `(hi, lo)`
+/// pair; `hi` re-enters the Estrin chain where the unsplit product was, and
+/// `lo` folds into the lowest-magnitude limb of the sum, which is exactly
+/// where a compensation term belongs — it corrects the one rounding that
+/// would otherwise be the dominant source of error, at the cost of one
+/// extra multiply and one extra FMA.
 #[inline(always)]
 fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::SHIFT);
@@ -107,7 +119,7 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let r4 = r2 * r2;
     let r8 = r4 * r4;
 
-    let c1 = r * V::splat(LN2);
+    let (c1, c1lo) = a_mul(r, V::splat(LN2));
     let c23 = r.mul_add(V::splat(G[1]), V::splat(G[0]));
     let c45 = r.mul_add(V::splat(G[3]), V::splat(G[2]));
     let c67 = r.mul_add(V::splat(G[5]), V::splat(G[4]));
@@ -115,7 +127,7 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let cab = r.mul_add(V::splat(G[9]), V::splat(G[8]));
     let ccd = r.mul_add(V::splat(G[11]), V::splat(G[10]));
 
-    let lo = r2.mul_add(c23, c1);
+    let lo = r2.mul_add(c23, c1lo) + c1;
     let mid = r2.mul_add(c67, c45);
     let hi = r2.mul_add(cab, c89);
     let lo = r4.mul_add(mid, lo);

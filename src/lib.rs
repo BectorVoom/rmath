@@ -202,6 +202,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod fast;
 pub mod function;
 pub mod kernels;
 pub mod policy;
@@ -238,6 +239,7 @@ pub use simd::{Real, Simd};
 
 /// Everything needed to configure and call a function.
 pub mod prelude {
+    pub use crate::fast;
     pub use crate::function::{
         Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Ceil, CopySign, Cos, Cosh, Erf, Erfc,
         Exp, Exp2, Exp10, Expm1, Fdim, Floor, Fmax, Fmin, Fmod, Frexp, Hypot, Ilogb, J0, J1, Jn,
@@ -248,3 +250,4 @@ pub mod prelude {
     pub use crate::policy::{BitExact, Fast, Finite, FullRange};
     pub use crate::simd::{Real, Simd};
 }
+
