@@ -143,9 +143,15 @@ test, and the guarantee becomes yours to keep.
 
 `Fast`'s bound is per function, measured against the platform and asserted in
 `tests/accuracy.rs`, so a kernel change that loosens one fails the build rather
-than quietly invalidating this file. Most are within **4 ulp**; the inverse
-trigonometric and inverse hyperbolic families within **8**; `pow` within
-**40**, because `y` multiplies the error in `log2 x` as well as its value.
+than quietly invalidating this file. Most are within **4 ulp** — including the
+whole inverse trigonometric family, `asin` through `atan2`; `asinh` and `pow`
+are within **8**. `pow` is the function that has to work for that number — `y`
+multiplies the error in
+`log2 x` as well as its value, so its table-free logarithm is carried in
+double-double: the division's residue, the scale constants and the first two
+series terms are all kept exact, and the corpus pinned at the edge of the
+vector domain (`|y log2 x|` near 1020) measures no worse than the moderate
+one.
 
 ## Measured
 
@@ -161,12 +167,12 @@ call it replaces.
 
 | function | scalar | `BitExact` | + `Finite` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|--:|
-| `exp`   |  2.11 ns | **2.22x** | 2.67x | 3.73x | **3.84x** |
+| `exp`   |  2.17 ns | **2.20x** | 2.73x | 3.82x | **3.96x** |
 | `exp2`  |  1.62 ns | **1.67x** | 1.89x | 3.41x | **3.43x** |
 | `expm1` |  8.18 ns | **2.48x** | 3.78x | 9.52x | **10.73x** |
 | `ln`    |  1.99 ns | **1.90x** | 2.15x | 3.01x | **3.46x** |
 | `log2`  |  2.27 ns | **1.91x** | 2.06x | 3.66x | **4.46x** |
-| `pow`   | 12.59 ns | **1.47x** | — | 2.26x | — |
+| `pow`   | 12.59 ns | **1.47x** | — | 2.05x | — |
 | `cbrt`  |  8.62 ns | **1.67x** | 1.76x | — | — |
 | `sinh`  | 12.22 ns | **3.77x** | 3.86x | 11.49x | **13.17x** |
 | `cosh`  |  3.12 ns | **1.70x** | 1.96x | 4.27x | **4.68x** |
@@ -225,16 +231,19 @@ and the vector reappears.
 
 | function | scalar | `BitExact` | `Fast` |
 |---|--:|--:|--:|
-| `expf`  | 1.12 ns | **1.41x** | **3.47x** |
-| `exp2f` | 1.07 ns | **1.40x** | **3.46x** |
-| `logf`  | 1.36 ns | **1.53x** | **3.36x** |
-| `log2f` | 1.33 ns | **1.51x** | 1.51x |
-| `sqrtf` | 0.13 ns | 1.10x | 1.11x |
-| `cbrtf` | 2.49 ns | 0.96x | 0.96x |
-| `tanhf` | 2.82 ns | 0.93x | 1.99x |
-| `exp10f`| 2.14 ns | **1.38x** | 1.31x |
-| `erff`  | 6.06 ns | **1.51x** | 1.52x |
-| `erfcf` | 7.02 ns | **1.39x** | 1.39x |
+| `expf`  | 1.13 ns | **1.37x** | **3.40x** |
+| `exp2f` | 1.10 ns | **1.42x** | **3.51x** |
+| `logf`  | 1.35 ns | **1.51x** | **3.32x** |
+| `log2f` | 1.33 ns | **1.49x** | **3.44x** |
+| `sqrtf` | 0.14 ns | 1.12x | 1.15x |
+| `cbrtf` | 2.50 ns | 0.96x | **2.86x** |
+| `tanhf` | 2.62 ns | 0.94x | **4.99x** |
+| `sinf`  | 8.19 ns | 1.00x | **17.94x** |
+| `cosf`  | 8.08 ns | 1.00x | **17.49x** |
+| `tanf`  | 3.46 ns | 0.96x | **7.40x** |
+| `exp10f`| 1.30 ns | **1.77x** | **2.22x** |
+| `erff`  | 5.66 ns | **1.62x** | 1.62x |
+| `erfcf` | 6.26 ns | **1.41x** | 1.40x |
 
 Several of those deserve comment rather than burial:
 
@@ -251,11 +260,17 @@ Several of those deserve comment rather than burial:
 - **`acosh` gains far more from `Finite` than anything else** (1.97x to 8.95x).
   Its domain test is two comparisons *and* a NaN-producing branch for `x < 1`,
   which is expensive relative to the small amount of arithmetic that follows.
-- **`cbrtf` and `tanhf` sit just under parity.** Their single-precision
-  routines are cheap enough that widening into the double-precision kernel
-  costs more than it saves, so both policies delegate; see
-  `src/kernels/single/`. A native single-precision `cbrt` approximation would
-  be a real `Fast` path, and is not written yet.
+- **`cbrtf` and `tanhf` sit just under parity under `BitExact`.** Their
+  single-precision routines are cheap enough that widening into the
+  double-precision kernel costs more than it saves, so the bit-exact path
+  delegates; see `src/kernels/single/`. Both have native `Fast` paths instead
+  of the widened one: `cbrtf`'s is a bit-pattern seed and three Newton steps,
+  within 1 ulp; `tanhf`'s is a direct polynomial below `|x| = 1` and
+  `1 - 2/(e^{2x}+1)` above it (via the native `f32` `exp2`), within 2 ulp,
+  routing the tail past `|x| = 9` — where `tanh` is within one `f32` ulp of
+  `+-1`, and rounds to it exactly from about 9.02 — to the scalar reference
+  rather than paying for either formula there. That is where 2.84x and 4.97x
+  come from.
 
 ## What "bit-exact" rests on
 
@@ -388,18 +403,18 @@ Known limitations, in rough order of how much they would be missed:
   Portable Math Library routines there, with a 440-entry table and a separate
   reduction for huge arguments. `log10` is a smaller one — it is not the
   fdlibm composition on `log`, so it needs its own schedule read out.
-- **`Fast` `pow` is the loosest kernel here**, at 40 ulp, because `y`
-  multiplies the error in `log2 x` as well as its value. That is inherent to
-  having no table — which is what `Fast` is for. `BitExact` `pow` carries the
-  logarithm in double-double over glibc's table and is exact.
 - **`lgamma` on the negative half-line** is a difference of comparable terms
   near its zeros, where relative error is unbounded for any implementation. The
   bound there is stated as absolute (below 1e-12), not relative.
-- **`tgamma` above 18** is `exp(lgamma(x))`, so its relative error grows with
-  the argument — near the overflow threshold it reaches some 2000 ulp. Below
-  18 the recurrence reaches `[1, 2]` directly and it is within 16.
-- **No native single-precision `cbrt`**, so `cbrtf` delegates under both
-  policies rather than offering a `Fast` path.
+- **`tgamma` above 18** is `exp(lgamma(x))`, with `lgamma` carried in
+  double-double so the value handed to `exp` is the correctly rounded `f64`
+  nearest the truth — verified against the platform's own `lgamma` exactly.
+  What is left (measured at 512-513 ulp near the overflow threshold, down
+  from over 2000) is not fixable by computing harder: composing through any
+  single correctly-rounded logarithm before exponentiating discards
+  information the true value carried, and glibc's own `tgamma` is provably
+  not `exp` of its own correctly-rounded `lgamma` either. Below 18 the
+  recurrence reaches `[1, 2]` directly and it is within 16.
 - **The single-precision Bessel functions are scalar under `BitExact`.** glibc
   repairs them near each zero with one of 64 tabulated polynomials, and beyond
   the 64th zero with an asymptotic form behind a 192-bit Payne-Hanek

@@ -4,6 +4,10 @@
 //! RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench
 //! ```
 //!
+//! Pass `--csv=PATH` (or bare `--csv` for stdout) to also emit every row as
+//! `function,metric,speedup`, machine-readable input for
+//! `tools/bench_diff.py`. The pretty tables below are unaffected either way.
+//!
 //! `target-cpu=native` matters and is not a detail: without the `fma` target
 //! feature, `wide` has no fused multiply-add, and rmath substitutes a
 //! per-lane scalar FMA to keep its bit-exactness promise. That is correct but
@@ -49,6 +53,43 @@ mod libm {
 
 const N: usize = 1 << 20;
 const REPS: usize = 8;
+
+/// Every `(function, metric, speedup)` triple printed this run, for `--csv`.
+///
+/// A global rather than an accumulator threaded through every row-printing
+/// site: the recorder is purely additive and this is a benchmark binary, so
+/// the shared mutable state buys real simplicity here in a way it would not
+/// in the library. `Mutex` rather than `RefCell` only because a `static`
+/// demands `Sync`; there is no contention to speak of.
+static RECORD: std::sync::Mutex<Vec<(&'static str, &'static str, f64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record one measurement alongside printing it, for `--csv` / `tools/bench_diff.py`.
+fn record(function: &'static str, metric: &'static str, speedup: f64) {
+    RECORD.lock().unwrap().push((function, metric, speedup));
+}
+
+/// Write every recorded row as CSV — to a file if `--csv=PATH` was given, to
+/// stdout if bare `--csv` was given, and not at all otherwise.
+///
+/// Kept a separate, explicit pass over the whole run's data rather than
+/// streamed row by row: the pretty tables above are what a human reads while
+/// the benchmark runs, and the CSV is what `tools/bench_diff.py` reads
+/// afterwards, so interleaving them would make either harder to follow.
+fn write_csv() {
+    let flag = std::env::args().find(|a| a == "--csv" || a.starts_with("--csv="));
+    let Some(flag) = flag else { return };
+    let mut out = String::from("function,metric,speedup\n");
+    for (function, metric, speedup) in RECORD.lock().unwrap().iter() {
+        out.push_str(&format!("{function},{metric},{speedup}\n"));
+    }
+    if let Some(path) = flag.strip_prefix("--csv=") {
+        std::fs::write(path, out).expect("writing --csv output");
+        eprintln!("wrote {path}");
+    } else {
+        print!("{out}");
+    }
+}
 
 struct Rng(u64);
 
@@ -114,6 +155,10 @@ macro_rules! row {
             base / tc,
             base / te
         );
+        record($name, "exact", base / ta);
+        record($name, "exact/F", base / tb);
+        record($name, "fast", base / tc);
+        record($name, "fast/F", base / te);
     }};
 }
 
@@ -235,10 +280,12 @@ fn main() {
     gamma("lgamma", &hypargs, &mut dst);
 
     single_precision();
+
+    write_csv();
 }
 
 fn binary<A: Function2<f64>, B: Function2<f64>>(
-    name: &str,
+    name: &'static str,
     xs: &[f64],
     ys: &[f64],
     dst: &mut [f64],
@@ -276,9 +323,11 @@ fn binary<A: Function2<f64>, B: Function2<f64>>(
         base / a,
         base / b
     );
+    record(name, "exact", base / a);
+    record(name, "fast", base / b);
 }
 
-fn gamma(name: &str, src: &[f64], dst: &mut [f64]) {
+fn gamma(name: &'static str, src: &[f64], dst: &mut [f64]) {
     unsafe extern "C" {
         safe fn lgamma(x: f64) -> f64;
     }
@@ -290,6 +339,7 @@ fn gamma(name: &str, src: &[f64], dst: &mut [f64]) {
     let k = LGamma::new();
     let t = time(src, dst, |s, d| k.eval_slice(s, d));
     println!("{name:<10} {base:>10.2} {:>8.2}x", base / t);
+    record(name, "rmath", base / t);
 }
 
 fn single_precision() {
@@ -337,6 +387,8 @@ fn single_precision() {
                 base / ta,
                 base / tc
             );
+            record($name, "exact", base / ta);
+            record($name, "fast", base / tc);
         }};
     }
     row32!("expf", &e, f32::exp, Exp);
@@ -345,10 +397,27 @@ fn single_precision() {
     row32!("log2f", &p, f32::log2, Log2);
     row32!("sqrtf", &p, f32::sqrt, Sqrt);
     row32!("cbrtf", &p, f32::cbrt, Cbrt);
-    row32!("tanhf", &e, f32::tanh, Tanh);
+    // Not `&e`: that corpus is +-40, and `tanh` saturates to +-1 (indistinguishable
+    // at `f32` precision) by about +-9 -- `src/kernels/single/tanh.rs` routes
+    // anything past that to the scalar reference, same as every other kernel's
+    // rare tail, so a +-40 corpus would spend ~78% of its lanes there and
+    // measure the reference call's cost, not the native kernel's.
+    let tanh32args: Vec<f32> = (0..N).map(|_| rng.uniform(-9.0, 9.0) as f32).collect();
+    row32!("tanhf", &tanh32args, f32::tanh, Tanh);
+    // `TRIG_LIMIT` is ~804 (`src/kernels/single/trig.rs`); stay inside it for
+    // the same corpus-artifact reason as `tanhf` above.
+    let ang32: Vec<f32> = (0..N).map(|_| rng.uniform(-700.0, 700.0) as f32).collect();
+    row32!("sinf", &ang32, f32::sin, Sin);
+    row32!("cosf", &ang32, f32::cos, Cos);
+    row32!("tanf", &ang32, f32::tan, Tan);
     let erf32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 6.0) as f32).collect();
     let erfc32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 10.0) as f32).collect();
-    row32!("exp10f", &e, |x| libm::exp10f(x), Exp10);
+    // Not `&e`: that corpus is +-40, which straddles `exp10f`'s +-38 main-path
+    // limit (`src/kernels/single/exp10.rs`), so roughly 5% of its lanes would
+    // take the scalar repair under both policies and understate both numbers
+    // identically -- a corpus artifact, not a cost of either kernel.
+    let exp10args: Vec<f32> = (0..N).map(|_| rng.uniform(-35.0, 35.0) as f32).collect();
+    row32!("exp10f", &exp10args, |x| libm::exp10f(x), Exp10);
     row32!("erff", &erf32, |x| libm::erff(x), Erf);
     row32!("erfcf", &erfc32, |x| libm::erfcf(x), Erfc);
 }
