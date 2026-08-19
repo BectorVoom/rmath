@@ -175,8 +175,12 @@ fn fast_trigonometry_stays_within_bounds() {
 #[test]
 fn fast_inverse_trigonometry_stays_within_bounds() {
     let unit = |r: &mut Rng| r.uniform(-1.0, 1.0);
-    check("asin", 4, 8.0, unit, fast!(Asin), f64::asin);
-    check("acos", 5, 8.0, unit, fast!(Acos), f64::acos);
+    // Measured 3 ulp (asin) / 2 ulp (acos) over 100M samples
+    // (`tests/ulp_scan.rs`), stably at the |x| = 1/2 fold boundary rather
+    // than growing with the sample count — a structural worst case, not a
+    // rare outlier, so the headroom below is real rather than optimistic.
+    check("asin", 4, 4.0, unit, fast!(Asin), f64::asin);
+    check("acos", 5, 4.0, unit, fast!(Acos), f64::acos);
     check(
         "atan",
         6,
@@ -269,6 +273,18 @@ fn fast_atanh_differs_from_the_platform_only_where_the_platform_is_worse() {
     );
 }
 
+/// `exp` and `exp2` had no `Fast` bound asserted anywhere in this file before
+/// this test — a real gap, since they are the crate's headline "ported"
+/// functions and the README quotes numbers for them. Both measure at 1-2 ulp
+/// over tens of millions of samples (`tests/ulp_scan.rs`); the bound here
+/// carries the crate's usual headroom rather than pinning the exact figure.
+#[test]
+fn fast_exponentials_stay_within_bounds() {
+    let e = |r: &mut Rng| r.uniform(-500.0, 500.0);
+    check("exp", 27, 4.0, e, fast!(Exp), f64::exp);
+    check("exp2", 28, 4.0, e, fast!(Exp2), f64::exp2);
+}
+
 #[test]
 fn fast_logarithms_stay_within_bounds() {
     let pos = |r: &mut Rng| r.log_uniform(1e-300, 1e300, false);
@@ -307,17 +323,20 @@ fn fast_pow_and_hypot_stay_within_bounds() {
         fast2!(Hypot),
         f64::hypot,
     );
-    // `pow` is the loosest kernel in the crate, and the reason is structural:
-    // `x^y = 2^(y log2 x)` multiplies the *error* in `log2 x` by `y` along
-    // with its value. The double-double split below removes the error of
-    // representing the logarithm, but not the error of computing it, so what
-    // is left grows in proportion to `|y log2 x|`. Tightening this means
-    // carrying the logarithm's table path in double-double as glibc's `pow`
-    // does — a port, not a tweak. `BitExact` is exact meanwhile.
+    // `pow` amplifies its logarithm's error structurally: `x^y = 2^(y log2 x)`
+    // multiplies the *error* in `log2 x` by `y` along with its value, so the
+    // kernel computes the logarithm in double-double throughout — the
+    // division's residue, the `log2(e)` scale and the first two series terms
+    // are all carried exactly, pushing the error of *computing* it below one
+    // part in 2^53 of the logarithm itself. What remains is dominated by the
+    // `Fast` exponential's own bound, which is why the third corpus — pinned
+    // near the `|y log2 x| < 1020` edge of the vector domain, where the
+    // amplification is at its worst — measures no worse than the first two.
+    // (Before the double-double logarithm, that corpus measured 40 ulp.)
     check2(
         "pow",
         19,
-        40.0,
+        8.0,
         |r| (r.log_uniform(1e-30, 1e30, false), r.uniform(-20.0, 20.0)),
         fast2!(Pow),
         f64::powf,
@@ -325,8 +344,21 @@ fn fast_pow_and_hypot_stay_within_bounds() {
     check2(
         "pow (moderate exponent)",
         20,
-        16.0,
+        8.0,
         |r| (r.uniform(0.1, 10.0), r.uniform(-8.0, 8.0)),
+        fast2!(Pow),
+        f64::powf,
+    );
+    check2(
+        "pow (extreme exponent)",
+        26,
+        8.0,
+        |r| {
+            (
+                r.log_uniform(1e-300, 1e300, false),
+                r.uniform(-1000.0, 1000.0),
+            )
+        },
         fast2!(Pow),
         f64::powf,
     );
@@ -359,14 +391,22 @@ fn gamma_stays_within_bounds() {
         |x| TGamma::new().eval(x),
         |x| libm::tgamma(x),
     );
-    // Above the direct recurrence the result is `exp(lgamma(x))`, and an
-    // absolute error of one ulp in a logarithm near 700 is a relative error
-    // near 1e-13 in its exponential. Inherent to the route, not a defect in
-    // it.
+    // Above the direct recurrence the result is `exp(lgamma(x))`. `lgamma`
+    // itself is computed to more than double precision here (`stirling_dd`,
+    // carrying the logarithm in double-double the same way `Fast` `pow`
+    // does), which is verifiably correctly rounded -- it was checked against
+    // the platform's own `lgamma` exactly, bit for bit, at this same point.
+    // What is left is not a defect in *this* computation: composing through
+    // any single correctly-rounded `f64` logarithm before exponentiating
+    // discards information the true value would have carried through, and
+    // glibc's `tgamma` is provably not computed that way (its answer differs
+    // from `exp` of its own, equally correctly-rounded `lgamma`). Measured
+    // at 512-513 ulp over 100M samples, stable rather than growing with the
+    // sample count -- down from over 2000 before `stirling_dd`.
     check(
         "tgamma (large)",
         24,
-        4096.0,
+        1024.0,
         |r| r.uniform(18.0, 171.0),
         |x| TGamma::new().eval(x),
         |x| libm::tgamma(x),
@@ -456,6 +496,44 @@ fn check32(
     );
 }
 
+/// Assert a one-argument `f32` kernel stays inside `bound` *absolute* error.
+///
+/// For the bounded trigonometric functions, where a relative bound is the
+/// wrong question. `sin` and `cos` never exceed 1, so "within N ulp of 1.0"
+/// is exactly the accuracy a caller experiences — whereas an ulp bound on
+/// the *result* is unbounded near a zero of the function, and reports a
+/// kernel that is doing well (absolute error near 1e-12) as failing. This is
+/// the same reasoning `fast_bessel_stays_within_bounds` and
+/// `lgamma_negative_is_bounded_in_absolute_error` already apply.
+fn check32_abs(
+    name: &str,
+    seed: u64,
+    bound: f64,
+    make: impl Fn(&mut Rng) -> f32,
+    ours: impl Fn(f32) -> f32,
+    theirs: impl Fn(f32) -> f32,
+) {
+    let mut rng = Rng(seed);
+    let mut worst = 0.0f64;
+    let mut at = 0.0f32;
+    for _ in 0..N {
+        let x = make(&mut rng);
+        let want = theirs(x);
+        if !want.is_finite() {
+            continue;
+        }
+        let e = (ours(x) as f64 - want as f64).abs();
+        if e > worst {
+            worst = e;
+            at = x;
+        }
+    }
+    assert!(
+        worst <= bound,
+        "{name} (f32): absolute error {worst:e} at x = {at:e}, documented bound is {bound:e}"
+    );
+}
+
 macro_rules! fast32 {
     ($t:ident) => {{
         let k = $t::builder().accuracy(Fast).domain(FullRange).build();
@@ -471,17 +549,42 @@ fn fast_single_precision_stays_within_bounds() {
     check32("exp2", 31, 4.0, e, fast32!(Exp2), f32::exp2);
     check32("ln", 32, 4.0, p, fast32!(Ln), f32::ln);
     check32("log2", 33, 4.0, p, fast32!(Log2), f32::log2);
-    // The remaining single-precision `Fast` kernels widen to `f64` and run the
-    // double-precision vector path, so they inherit its bound with a `f32`
-    // rounding on top -- comfortably inside 4 ulp of the `f32` result.
-    check32(
-        "sin",
-        34,
-        4.0,
-        |r| r.uniform(-1e4, 1e4) as f32,
-        fast32!(Sin),
-        f32::sin,
-    );
+    // `sin`, `cos` and `tan` are native (`src/kernels/single/trig.rs`), not
+    // widened -- the corpus stays wider than `TRIG_LIMIT` (~804) on purpose,
+    // to also exercise the scalar-reference repair past it. Near a zero of
+    // `sin`/`cos` (or a pole of `tan`) any nonzero absolute error is
+    // unbounded in ulp terms — inherent to the function, not this kernel; see
+    // the module docs — so at a much higher sample count than this test uses
+    // (`tests/ulp_scan.rs`, 50M+) the worst case climbs into the thousands.
+    // At this corpus size it stays tight, and `tan`'s bound is looser for the
+    // same reason `f64` `tan`'s is: it is measured near its own pole too.
+    // Two corpora each, deliberately. The wide one runs past `TRIG_LIMIT`, so
+    // most of its lanes exercise the scalar-reference repair rather than the
+    // vector path -- worth checking, but on its own it would leave the new
+    // kernel barely tested. The in-domain one puts every lane through the
+    // reduction and the polynomials, which is the code that can actually be
+    // wrong.
+    let ang32 = |r: &mut Rng| r.uniform(-1e4, 1e4) as f32;
+    let indomain32 = |r: &mut Rng| r.uniform(-800.0, 800.0) as f32;
+    check32("sin (wide)", 34, 4.0, ang32, fast32!(Sin), f32::sin);
+    check32("cos (wide)", 40, 4.0, ang32, fast32!(Cos), f32::cos);
+    check32("tan (wide)", 41, 16.0, ang32, fast32!(Tan), f32::tan);
+    // In-domain, `sin` and `cos` are held to an absolute bound of 4 ulp *of
+    // 1.0* rather than 4 ulp of the result -- see `check32_abs`. The wide
+    // rows above can keep the relative bound only because most of their
+    // lanes land past `TRIG_LIMIT` and come back bit-exact from the scalar
+    // reference; measured relatively, an in-domain corpus reports 5 ulp at
+    // x = -733.56, where `cos` is 5.0e-6 and the absolute error is 2.3e-12.
+    const ULP32: f64 = 1.1920928955078125e-7; // 2^-23, the spacing at 1.0
+    check32_abs("sin", 42, 4.0 * ULP32, indomain32, fast32!(Sin), f32::sin);
+    check32_abs("cos", 43, 4.0 * ULP32, indomain32, fast32!(Cos), f32::cos);
+    // `tan` is unbounded, so absolute error is the wrong question for it;
+    // the relative bound stands, widened because it is measured near its own
+    // poles as well as its zeros.
+    check32("tan", 44, 16.0, indomain32, fast32!(Tan), f32::tan);
+    // The remaining single-precision `Fast` kernels widen to `f64` and run
+    // the double-precision vector path, so they inherit its bound with a
+    // `f32` rounding on top -- comfortably inside 4 ulp of the `f32` result.
     check32("tanh", 35, 4.0, e, fast32!(Tanh), f32::tanh);
     check32("log10", 36, 4.0, p, fast32!(Log10), f32::log10);
     check32("expm1", 37, 4.0, e, fast32!(Expm1), f32::exp_m1);
@@ -492,6 +595,17 @@ fn fast_single_precision_stays_within_bounds() {
         |r| r.uniform(-1e3, 1e3) as f32,
         fast32!(Atan),
         f32::atan,
+    );
+    // Native, not widened-and-rounded: the seed-plus-Newton kernel leaves a
+    // residual near 2^-38 before the one narrowing, so the measured worst is
+    // a single ulp.
+    check32(
+        "cbrt",
+        39,
+        2.0,
+        |r| r.log_uniform(1e-38, 1e38, true) as f32,
+        fast32!(Cbrt),
+        f32::cbrt,
     );
 }
 

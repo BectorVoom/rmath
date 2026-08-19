@@ -204,7 +204,8 @@ fn ieee_helpers_f32() {
     check1!("ilogbf", Ilogb::new(), |x| ilogbf(x) as f32, c, same32);
     check2!("fdimf", Fdim::new(), fdimf, c, same32);
     check2!("fmaxf", Fmax::new(), fmaxf, c, same32);
-    check2!("fminf", Fmin::new(), fminf, c, |a, b| same32(a, b) || (a == 0.0 && b == 0.0));
+    check2!("fminf", Fmin::new(), fminf, c, |a, b| same32(a, b)
+        || (a == 0.0 && b == 0.0));
 }
 
 #[test]
