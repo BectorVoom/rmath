@@ -179,3 +179,73 @@ fn fast_results_are_width_independent() {
         assert_eq!(f.eval(f64x8::splat(x)).to_array()[0].to_bits(), s.to_bits());
     }
 }
+
+/// The configuration is still free for the functions added alongside the
+/// special-function set, including the one with a new arity.
+#[test]
+fn special_function_objects_are_zero_sized() {
+    assert_eq!(size_of_val(&Erf::new()), 0);
+    assert_eq!(size_of_val(&Erfc::new()), 0);
+    assert_eq!(size_of_val(&Exp10::new()), 0);
+    assert_eq!(size_of_val(&J0::new()), 0);
+    assert_eq!(size_of_val(&Jn::new()), 0);
+    assert_eq!(size_of_val(&Remquo::new()), 0);
+    assert_eq!(size_of_val(&Modf::new()), 0);
+    assert_eq!(size_of_val(&LGammaR::new()), 0);
+    assert_eq!(
+        size_of_val(&Ilogb::builder().accuracy(Fast).domain(Finite).build()),
+        0
+    );
+}
+
+/// `Finite` must agree with `FullRange` wherever the domain holds. This is the
+/// property that makes the second axis reviewable: if it did not hold, a
+/// caller who established the guarantee would still get a different answer.
+#[test]
+fn finite_agrees_with_full_range_for_the_special_functions() {
+    let mut rng = Rng(0x5EED_0BAD_F00D_1234);
+
+    let checked = Erf::new();
+    let unchecked = Erf::builder().domain(Finite).build();
+    for _ in 0..200_000 {
+        let x = rng.uniform(-5.9, 5.9);
+        assert_eq!(
+            checked.eval(x).to_bits(),
+            unchecked.eval(x).to_bits(),
+            "erf({x:e})"
+        );
+    }
+
+    let checked = Erfc::new();
+    let unchecked = Erfc::builder().domain(Finite).build();
+    for _ in 0..200_000 {
+        let x = rng.uniform(-5.9, 25.8);
+        assert_eq!(
+            checked.eval(x).to_bits(),
+            unchecked.eval(x).to_bits(),
+            "erfc({x:e})"
+        );
+    }
+
+    let checked = Exp10::new();
+    let unchecked = Exp10::builder().domain(Finite).build();
+    for _ in 0..200_000 {
+        let x = rng.uniform(-255.0, 255.0);
+        assert_eq!(
+            checked.eval(x).to_bits(),
+            unchecked.eval(x).to_bits(),
+            "exp10({x:e})"
+        );
+    }
+
+    let checked = J0::new();
+    let unchecked = J0::builder().domain(Finite).build();
+    for _ in 0..200_000 {
+        let x = rng.uniform(-60.0, 60.0);
+        assert_eq!(
+            checked.eval(x).to_bits(),
+            unchecked.eval(x).to_bits(),
+            "j0({x:e})"
+        );
+    }
+}

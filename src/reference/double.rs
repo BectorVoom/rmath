@@ -28,7 +28,15 @@
 //! lanes only, so correctness at the edges never depends on the vector code
 //! getting the hard cases right.
 
-use crate::tables::double::{exp as et, log as lt, pow as pt};
+pub mod bessel;
+pub mod erf_parts;
+pub mod erfc_parts;
+
+pub use bessel::{j0, j1, jn, y0, y1, yn};
+pub use erf_parts::erf;
+pub use erfc_parts::erfc;
+
+use crate::tables::double::{exp as et, exp10 as x10t, log as lt, pow as pt};
 
 /// The sign and exponent bits, as glibc's `top12`.
 #[inline(always)]
@@ -208,6 +216,80 @@ fn exp2_specialcase(tmp: f64, sbits: u64, ki: u64) -> f64 {
         y = (hi + lo) - 1.0;
     }
     P_M1022 * y
+}
+
+// ---------------------------------------------------------------------------
+// exp10
+// ---------------------------------------------------------------------------
+
+/// `10^x`, bit-identical to glibc's `__exp10`.
+///
+/// glibc 2.39 replaced the old `exp(x * log(10))` composition with this: the
+/// same 128-entry table `exp` and `exp2` share, reduced against `log10(2)/128`
+/// and corrected by a degree-4 polynomial. Like [`exp2`] and unlike [`exp`],
+/// it ships with **no** `_fma` variant, so what runs is `mulsd` and `addsd`
+/// throughout — using `mul_add` anywhere below would be more accurate and
+/// would break bit-exactness.
+pub fn exp10(x: f64) -> f64 {
+    let ix = x.to_bits();
+    let mut abstop = ((ix >> 52) & 0x7ff) as u32;
+
+    if abstop.wrapping_sub(x10t::SMALL_TOP) >= x10t::THRESH {
+        if abstop.wrapping_sub(x10t::SMALL_TOP) >= 0x8000_0000 {
+            // |x| < 0x1p-57, where 10^x rounds to 1 + x. Also x == 0.
+            return x + 1.0;
+        }
+        if abstop == 0x7ff {
+            return if ix == f64::NEG_INFINITY.to_bits() {
+                0.0
+            } else {
+                x + 1.0 // +inf, or NaN (propagating the payload)
+            };
+        }
+        if x >= x10t::OFLOW_BOUND {
+            return f64::INFINITY;
+        }
+        if x < x10t::UFLOW_BOUND {
+            return 0.0;
+        }
+        // Large but representable: fall through, then take `specialcase`.
+        abstop = 0;
+    }
+
+    let (tmp, sbits, ki) = exp10_core(x);
+    if abstop == 0 {
+        // glibc's `e_exp10.c: special_case` is `e_exp2.c: specialcase` with
+        // the same two arms and the same constants, so it is the same code
+        // here rather than a second transcription of it.
+        return exp2_specialcase(tmp, sbits, ki);
+    }
+    let scale = f64::from_bits(sbits);
+    scale * tmp + scale
+}
+
+/// The shared main path of `exp10`.
+#[inline(always)]
+fn exp10_core(x: f64) -> (f64, u64, u64) {
+    let z = x10t::INVLOG10_2N * x;
+    let kd_s = z + et::SHIFT;
+    let ki = kd_s.to_bits();
+    let kd = kd_s - et::SHIFT;
+
+    // Two separate roundings, matching the compiled library: `r` is rounded
+    // after the high part and again after the low part.
+    let r = x10t::NEGLOG10_2HIN * kd + x;
+    let r = x10t::NEGLOG10_2LON * kd + r;
+
+    let idx = ((ki & 127) * 2) as usize;
+    let tail = f64::from_bits(et::TAB[idx]);
+    let sbits = et::TAB[idx + 1].wrapping_add(ki << 45);
+
+    let r2 = r * r;
+    let p = x10t::C0 + r * x10t::C1;
+    let y = x10t::C2 + r * x10t::C3;
+    let y = y + r2 * x10t::C4;
+    let y = p + r2 * y;
+    (tail + y * r, sbits, ki)
 }
 
 // ---------------------------------------------------------------------------

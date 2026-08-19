@@ -457,6 +457,25 @@ pub fn map_lanes_pair<V: Simd>(x: V, f: impl Fn(V::Elem) -> (V::Elem, V::Elem)) 
     (V::from_array(a), V::from_array(b))
 }
 
+/// [`map_lanes_pair`] for a two-argument function returning two values.
+#[inline(always)]
+pub fn map_lanes2_pair<V: Simd>(
+    x: V,
+    y: V,
+    f: impl Fn(V::Elem, V::Elem) -> (V::Elem, V::Elem),
+) -> (V, V) {
+    let xs = x.to_array();
+    let ys = y.to_array();
+    let mut a = V::Floats::filled_default();
+    let mut b = V::Floats::filled_default();
+    for i in 0..V::LANES {
+        let (p, q) = f(xs.as_slice()[i], ys.as_slice()[i]);
+        a.as_mut_slice()[i] = p;
+        b.as_mut_slice()[i] = q;
+    }
+    (V::from_array(a), V::from_array(b))
+}
+
 mod private {
     pub trait Sealed {}
     impl Sealed for f64 {}

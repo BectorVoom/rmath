@@ -23,6 +23,15 @@ mod libm {
     unsafe extern "C" {
         pub safe fn tgamma(x: f64) -> f64;
         pub safe fn lgamma(x: f64) -> f64;
+        pub safe fn erf(x: f64) -> f64;
+        pub safe fn erfc(x: f64) -> f64;
+        pub safe fn exp10(x: f64) -> f64;
+        pub safe fn j0(x: f64) -> f64;
+        pub safe fn j1(x: f64) -> f64;
+        pub safe fn y0(x: f64) -> f64;
+        pub safe fn y1(x: f64) -> f64;
+        pub safe fn j0f(x: f32) -> f32;
+        pub safe fn y0f(x: f32) -> f32;
     }
 }
 
@@ -483,5 +492,90 @@ fn fast_single_precision_stays_within_bounds() {
         |r| r.uniform(-1e3, 1e3) as f32,
         fast32!(Atan),
         f32::atan,
+    );
+}
+
+/// The bounds for the kernels added alongside the special functions.
+///
+/// `erf`, `erfc` and `exp10` are the interesting ones: their `Fast` paths are
+/// the *same* double-double arithmetic the bit-exact ones use, with only the
+/// rounding test and the accurate fallback dropped. So the error is not
+/// "a few ulps" but a fraction of one — they are correctly rounded on all but
+/// about one input in thirty thousand, and the miss is by a single step.
+#[test]
+fn fast_special_functions_stay_within_bounds() {
+    let near = |r: &mut Rng| r.uniform(-6.0, 6.0);
+    check("erf", 0x0E2F_0001, 1.0, near, fast!(Erf), |x| libm::erf(x));
+    check(
+        "erfc",
+        0x0E2F_0002,
+        1.0,
+        |r| r.uniform(-6.0, 27.0),
+        fast!(Erfc),
+        |x| libm::erfc(x),
+    );
+    check(
+        "exp10",
+        0x0E2F_0003,
+        2.0,
+        |r| r.uniform(-300.0, 300.0),
+        fast!(Exp10),
+        |x| libm::exp10(x),
+    );
+}
+
+/// The Bessel kernels' `Fast` path replaces the platform's trigonometry with
+/// [`rmath::Fast`]'s, and that dominates: `j0(x)` for large `x` is
+/// `cos(x - pi/4)` scaled, so an error in the reduced angle is an error of the
+/// same relative size in the answer — and near a zero of `j0` it is very much
+/// larger, because the zero is where the value is small and the derivative is
+/// not. So this is an *absolute* bound on `[0, 60]` rather than a relative
+/// one, which is the only bound that means anything near a zero.
+#[test]
+fn fast_bessel_stays_within_bounds() {
+    let f = J0::builder().accuracy(Fast).domain(FullRange).build();
+    let g = J1::builder().accuracy(Fast).domain(FullRange).build();
+    let p = Y0::builder().accuracy(Fast).domain(FullRange).build();
+    let q = Y1::builder().accuracy(Fast).domain(FullRange).build();
+    let mut worst = 0.0f64;
+    for i in 1..200_000u64 {
+        let x = i as f64 * (60.0 / 200_000.0);
+        for (ours, theirs) in [
+            (f.eval(x), libm::j0(x)),
+            (g.eval(x), libm::j1(x)),
+            (p.eval(x), libm::y0(x)),
+            (q.eval(x), libm::y1(x)),
+        ] {
+            if theirs.is_finite() {
+                worst = worst.max((ours - theirs).abs());
+            }
+        }
+    }
+    assert!(
+        worst < 1e-12,
+        "fast Bessel: absolute error {worst:e} on [0, 60]"
+    );
+}
+
+/// Single precision under `Fast` takes the *double* Bessel kernel and rounds
+/// once, so it is not a cheaper approximation of `j0f` — it is a better one.
+/// glibc's own bound for `j0f` is 9 ulps; this asserts that the widened path
+/// beats it, which is the whole reason that configuration is offered.
+#[test]
+fn fast_single_precision_bessel_beats_the_platform() {
+    let f = J0::builder().accuracy(Fast).domain(FullRange).build();
+    let p = Y0::builder().accuracy(Fast).domain(FullRange).build();
+    let mut worst = 0.0f64;
+    for i in 1..200_000u32 {
+        let x = i as f32 * (60.0 / 200_000.0);
+        let d = (f64::from(f.eval(x)) - f64::from(libm::j0f(x))).abs();
+        worst = worst.max(d);
+        let d = (f64::from(p.eval(x)) - f64::from(libm::y0f(x))).abs();
+        worst = worst.max(d);
+    }
+    // 9 ulps of a value of order 1 in f32 is about 1.1e-6.
+    assert!(
+        worst < 1.1e-6,
+        "fast j0f/y0f: absolute error {worst:e} on [0, 60]"
     );
 }

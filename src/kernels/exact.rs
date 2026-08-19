@@ -24,7 +24,7 @@
 //! them branch-free, which is what lets LLVM vectorise them anyway.
 
 use crate::policy::{Accuracy, Domain};
-use crate::simd::{Lanes, Real, Simd, Uint, map_lanes_pair, map_lanes2};
+use crate::simd::{Lanes, Mask, Real, Simd, Uint, map_lanes_pair, map_lanes2};
 
 /// `2^k` as an element, for `k` in `-(EXP_BIAS - 1) ..= EXP_BIAS`.
 ///
@@ -421,3 +421,318 @@ fn reduce<E: Real>(x: E, y: E) -> (E, bool) {
 /// Re-exported here so the delegating kernels have one obvious place to reach
 /// for, rather than each importing from [`crate::simd`].
 pub use crate::simd::map_lanes as lanewise;
+
+// ---------------------------------------------------------------------------
+// The IEEE-754 numeric helpers: rint, scalbn, fdim, fmax, fmin, ilogb
+// ---------------------------------------------------------------------------
+
+unary_vector! {
+    /// `x` rounded to the nearest integer, ties to even.
+    ///
+    /// C's `rint` rounds in the *current* mode; Rust evaluates in
+    /// round-to-nearest-even and offers no way to leave it, so that is the
+    /// mode this reproduces — one instruction per vector, and the only mode
+    /// reachable from safe Rust. Unlike [`round`] it breaks ties to even, and
+    /// unlike `nearbyint` it is allowed to raise the inexact flag, which
+    /// nothing here observes.
+    rint, |x| x.round_ties_even()
+}
+
+/// `x * 2^n`, with `n` carried in float lanes.
+///
+/// The C library defines `scalbn` and `ldexp` to compute the same thing on
+/// every target where `FLT_RADIX` is 2, which is every target this crate
+/// builds for, and glibc makes the second a literal alias of the first. So
+/// this is [`ldexp`] under its other name rather than a second algorithm, and
+/// the two are the same code — not merely the same results.
+pub mod scalbn {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    #[inline(always)]
+    pub fn scalar<E: Real>(x: E, n: E) -> E {
+        ldexp::scalar(x, n)
+    }
+
+    /// `scalbn(x, n)` for a vector of lanes.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V, n: V) -> V {
+        ldexp::eval::<V, A, D>(x, n)
+    }
+}
+
+/// The positive difference: `x - y` if `x > y`, and `+0` otherwise.
+pub mod fdim {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    #[inline(always)]
+    pub fn scalar<E: Real>(x: E, y: E) -> E {
+        if is_nan(x) || is_nan(y) {
+            return x + y; // propagate a payload rather than a fresh NaN
+        }
+        if x > y { x - y } else { E::ZERO }
+    }
+
+    /// `fdim(x, y)` for a vector of lanes.
+    ///
+    /// Branch-free: the difference is computed unconditionally and then
+    /// selected. Testing the *arguments* for NaN rather than the difference is
+    /// what keeps `fdim(inf, inf)` at `+0` — the difference is NaN there, but
+    /// neither argument is.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V, y: V) -> V {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        let nan = x.is_nan().or(y.is_nan());
+        let quiet = V::select(nan, x + y, V::splat(V::Elem::ZERO));
+        V::select(x.gt_mask(y), x - y, quiet)
+    }
+}
+
+/// The larger of `x` and `y`, ignoring NaN.
+pub mod fmax {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    #[inline(always)]
+    pub fn scalar<E: Real>(x: E, y: E) -> E {
+        if x >= y || (!is_nan(x) && is_nan(y)) {
+            x
+        } else {
+            y
+        }
+    }
+
+    /// `fmax(x, y)` for a vector of lanes.
+    ///
+    /// C's `fmax`, not IEEE-754-2019's `maximum`: a NaN argument is *ignored*
+    /// rather than propagated, so `fmax(NaN, 1.0)` is `1.0`. Equal arguments
+    /// return the first, which pins down `fmax(+0, -0)` as `+0` and
+    /// `fmax(-0, +0)` as `-0` — C leaves that unspecified, and this is what
+    /// glibc does.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V, y: V) -> V {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        V::select(x.ge_mask(y).or(x.is_nan().not().and(y.is_nan())), x, y)
+    }
+}
+
+/// The smaller of `x` and `y`, ignoring NaN.
+pub mod fmin {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    #[inline(always)]
+    pub fn scalar<E: Real>(x: E, y: E) -> E {
+        if x <= y || (!is_nan(x) && is_nan(y)) {
+            x
+        } else {
+            y
+        }
+    }
+
+    /// `fmin(x, y)` for a vector of lanes. See [`fmax`] for the NaN and
+    /// signed-zero conventions.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V, y: V) -> V {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        V::select(x.le_mask(y).or(x.is_nan().not().and(y.is_nan())), x, y)
+    }
+}
+
+/// The binary exponent of `x`, as an integer in float lanes.
+///
+/// `ilogb(x) == floor(log2(|x|))` for a finite non-zero `x`, computed by
+/// reading the exponent field rather than by taking a logarithm, so it is
+/// exact. Subnormals report their *true* exponent, not the stored one.
+///
+/// # The three sentinels
+///
+/// C specifies `ilogb(0)`, `ilogb(NaN)` and `ilogb(+-inf)` as the macros
+/// `FP_ILOGB0`, `FP_ILOGBNAN` and `INT_MAX`. glibc on this target makes the
+/// first two `INT_MIN`, and that is what comes back here.
+///
+/// Since the result travels in a float lane — for the same reason [`ldexp`]'s
+/// exponent argument does — `INT_MIN` is exact in both precisions (it is
+/// `-2^31`), but `INT_MAX` is not representable in `f32` and arrives as
+/// `2147483648.0`. Anything that needs the exact `i32` should compare against
+/// the sentinel before converting.
+pub mod ilogb {
+    use super::*;
+
+    /// `FP_ILOGB0` and `FP_ILOGBNAN` on this target: `INT_MIN`.
+    pub const ILOGB0: f64 = i32::MIN as f64;
+    /// What C requires for `ilogb(+-inf)`: `INT_MAX`.
+    pub const ILOGB_INF: f64 = i32::MAX as f64;
+
+    /// The scalar form, correct for every input.
+    pub fn scalar<E: Real>(x: E) -> E {
+        let a = x.abs();
+        if a == E::ZERO || is_nan(x) {
+            return E::of_f64(ILOGB0);
+        }
+        if a == E::INFINITY {
+            return E::of_f64(ILOGB_INF);
+        }
+        if a < E::MIN_POSITIVE {
+            // Subnormal: normalise by an exact power of two and correct.
+            let n = a * E::TWO_POW_MANT;
+            let raw = (n.bits() >> E::MANT_BITS).as_u32() as i32;
+            return E::of_f64((raw - E::EXP_BIAS - E::MANT_BITS as i32) as f64);
+        }
+        let raw = (a.bits() >> E::MANT_BITS).as_u32() as i32;
+        E::of_f64((raw - E::EXP_BIAS) as f64)
+    }
+
+    /// `ilogb(x)` for a vector of lanes.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        crate::simd::map_lanes(x, scalar)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// modf and remquo
+// ---------------------------------------------------------------------------
+
+/// Split `x` into its fractional and integral parts, both with `x`'s sign.
+pub mod modf {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    ///
+    /// The vector kernel at one lane, so the two cannot drift apart.
+    #[inline(always)]
+    pub fn scalar<E: Real>(x: E) -> (E, E) {
+        eval::<E, crate::policy::BitExact, crate::policy::FullRange>(x)
+    }
+
+    /// `modf(x)` for a vector of lanes, returning `(fraction, integral)`.
+    ///
+    /// Branch-free. The two subtleties are both about signs: the fractional
+    /// part takes `x`'s sign explicitly, so `modf(-0.0)` gives `(-0.0, -0.0)`
+    /// rather than the `+0.0` a bare subtraction produces; and an infinite `x`
+    /// is selected out, because `inf - inf` is NaN where C requires `(±0, ±inf)`.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> (V, V) {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        let int = x.trunc();
+        let frac = (x - int).copysign(x);
+        let inf = x.abs().eq_mask(V::splat(V::Elem::INFINITY));
+        (
+            V::select(inf, V::splat(V::Elem::ZERO).copysign(x), frac),
+            int,
+        )
+    }
+}
+
+/// `x` reduced modulo `y`, together with the low bits of the quotient.
+///
+/// Returns `(remainder, quotient)`, where the remainder is exactly
+/// [`remainder`]'s and the quotient carries the sign of `x/y` and the low
+/// three bits of `|x/y|` rounded to nearest. C passes the quotient through an
+/// `int *`; here it comes back in a float lane, like [`frexp`]'s exponent, and
+/// it is always a small exact integer in `-7..=7`.
+pub mod remquo {
+    use super::*;
+
+    /// The scalar form, correct for every input.
+    ///
+    /// A transcription of glibc's `s_remquo.c`, whose shape is: reduce modulo
+    /// `8y` once with [`fmod`], then subtract off `4y`, `2y` and `y` in turn,
+    /// counting as it goes. Every step is exact — Sterbenz again — so this
+    /// agrees with the platform by construction rather than by measurement.
+    pub fn scalar<E: Real>(x: E, y: E) -> (E, E) {
+        let sx = x.bits() & sign_bit::<E>();
+        let qs = sx ^ (y.bits() & sign_bit::<E>());
+        let negq = qs != E::Uint::ZERO;
+
+        // Invalid: y == 0, x not finite, or either argument NaN. Spelled as a
+        // division so the platform's own invalid NaN comes back.
+        let ax = x.abs();
+        let ay = y.abs();
+        if ay == E::ZERO || is_nan(x) || is_nan(y) || ax == E::INFINITY {
+            #[allow(clippy::eq_op)]
+            let nan = (x * y) / (x * y);
+            return (nan, E::ZERO);
+        }
+
+        // Reduce to `|x| < 8|y|`, but only when `8y` cannot overflow.
+        let mut r = if biased_exp(y) <= max_biased_exp::<E>() - 3 {
+            fmod::scalar(x, y * E::of_f64(8.0))
+        } else {
+            x
+        };
+
+        if ax == ay {
+            return (E::ZERO.copysign(x), if negq { -E::ONE } else { E::ONE });
+        }
+
+        r = r.abs();
+        let mut q = 0i32;
+        if biased_exp(y) <= max_biased_exp::<E>() - 2 && r >= ay * E::of_f64(4.0) {
+            r = r - ay * E::of_f64(4.0);
+            q += 4;
+        }
+        if biased_exp(y) < max_biased_exp::<E>() && r >= ay + ay {
+            r = r - (ay + ay);
+            q += 2;
+        }
+
+        if biased_exp(y) == 0 {
+            // `y` is subnormal, where halving it would be inexact; double the
+            // remainder instead, which cannot overflow because `r < 2|y|`.
+            if r + r > ay {
+                r = r - ay;
+                q += 1;
+                if r + r >= ay {
+                    r = r - ay;
+                    q += 1;
+                }
+            }
+        } else {
+            let half = ay * E::HALF;
+            if r > half {
+                r = r - ay;
+                q += 1;
+                if r >= half {
+                    r = r - ay;
+                    q += 1;
+                }
+            }
+        }
+
+        if r == E::ZERO {
+            r = E::ZERO;
+        }
+        let r = if sx != E::Uint::ZERO { -r } else { r };
+        (r, E::of_f64(if negq { -q as f64 } else { q as f64 }))
+    }
+
+    /// `remquo(x, y)` for a vector of lanes.
+    #[inline(always)]
+    pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V, y: V) -> (V, V) {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        crate::simd::map_lanes2_pair(x, y, scalar)
+    }
+
+    /// The stored exponent field of `x`, as glibc's threshold comparisons read
+    /// it. Zero for a subnormal.
+    #[inline(always)]
+    fn biased_exp<E: Real>(x: E) -> u32 {
+        (x.abs().bits() >> E::MANT_BITS).as_u32()
+    }
+
+    /// The largest exponent field a finite number has: `2 * EXP_BIAS`.
+    #[inline(always)]
+    fn max_biased_exp<E: Real>() -> u32 {
+        (1u32 << E::EXP_BITS) - 2
+    }
+
+    /// The sign bit, as a mask.
+    #[inline(always)]
+    fn sign_bit<E: Real>() -> E::Uint {
+        (-E::ZERO).bits()
+    }
+}

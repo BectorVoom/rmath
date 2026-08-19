@@ -36,6 +36,24 @@ math_fn! {
 }
 
 math_fn! {
+    /// `10^x`.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let f = Exp10::new();
+    /// assert_eq!(f.eval(3.0_f64), 1000.0);
+    /// assert_eq!(f.eval(3.0_f32), 1000.0);
+    /// ```
+    name: Exp10,
+    builder: Exp10Builder,
+    free: exp10,
+    k64: crate::kernels::double::exp10,
+    k32: crate::kernels::single::exp10,
+    /// `10^x`, bit-exact and safe on any input.
+}
+
+math_fn! {
     /// Natural logarithm.
     name: Ln,
     builder: LnBuilder,
@@ -43,6 +61,57 @@ math_fn! {
     k64: crate::kernels::double::ln,
     k32: crate::kernels::single::ln,
     /// `ln(x)`, bit-exact and safe on any input.
+}
+
+// ---------------------------------------------------------------------------
+// The error function.
+// ---------------------------------------------------------------------------
+
+math_fn! {
+    /// The error function, `2/sqrt(pi) * integral of e^(-t^2) from 0 to x`.
+    ///
+    /// Unusually for this crate, [`crate::policy::BitExact`] here is not a
+    /// claim about *this* platform: the result is correctly rounded, so it
+    /// agrees with any correctly-rounded `erf` anywhere. See
+    /// [`crate::kernels::double::erf`].
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let f = Erf::new();
+    /// assert_eq!(f.eval(0.0_f64), 0.0);
+    /// assert_eq!(f.eval(f64::INFINITY), 1.0);
+    /// ```
+    name: Erf,
+    builder: ErfBuilder,
+    free: erf,
+    k64: crate::kernels::double::erf,
+    k32: crate::kernels::single::erf,
+    /// `erf(x)`, correctly rounded and safe on any input.
+}
+
+math_fn! {
+    /// The complementary error function, `1 - erf(x)`.
+    ///
+    /// Computed as its own function, not as `1 - erf(x)`: that subtraction
+    /// cancels away every significant digit for `x` above about 1, and returns
+    /// exactly zero well before `erfc` does. Correctly rounded; see
+    /// [`crate::kernels::double::erfc`].
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let f = Erfc::new();
+    /// assert_eq!(f.eval(0.0_f64), 1.0);
+    /// // 1.0 - Erf::new().eval(20.0) is 0; the true value is not.
+    /// assert!(f.eval(20.0_f64) > 0.0);
+    /// ```
+    name: Erfc,
+    builder: ErfcBuilder,
+    free: erfc,
+    k64: crate::kernels::double::erfc,
+    k32: crate::kernels::single::erfc,
+    /// `erfc(x)`, correctly rounded and safe on any input.
 }
 
 math_fn! {
@@ -432,4 +501,225 @@ math_fn! {
     k64: crate::kernels::double::gamma::tgamma,
     k32: crate::kernels::single::tgamma,
     /// `Gamma(x)`, safe on any input.
+}
+
+// ---------------------------------------------------------------------------
+// The IEEE-754 numeric helpers.
+//
+// Exact like the block above, and precision-generic for the same reason: there
+// is nothing to approximate in any of them.
+// ---------------------------------------------------------------------------
+
+math_fn! {
+    /// `x` rounded to the nearest integer, ties to even.
+    ///
+    /// The ties rule is the difference from [`Round`], and it is the one
+    /// hardware implements.
+    name: Rint,
+    builder: RintBuilder,
+    free: rint,
+    k64: crate::kernels::exact::rint,
+    k32: crate::kernels::exact::rint,
+    /// `rint(x)`, exact.
+}
+
+math_fn2! {
+    /// `x * 2^n`. [`Ldexp`] under its other name.
+    name: Scalbn,
+    builder: ScalbnBuilder,
+    free: scalbn,
+    k64: crate::kernels::exact::scalbn,
+    k32: crate::kernels::exact::scalbn,
+    /// `scalbn(x, n)`, exact.
+}
+
+math_fn2! {
+    /// The positive difference: `x - y` if `x > y`, else `+0`.
+    name: Fdim,
+    builder: FdimBuilder,
+    free: fdim,
+    k64: crate::kernels::exact::fdim,
+    k32: crate::kernels::exact::fdim,
+    /// `fdim(x, y)`, exact.
+}
+
+math_fn2! {
+    /// The larger of `x` and `y`, ignoring NaN.
+    ///
+    /// C's `fmax`: a NaN argument is discarded rather than propagated. See
+    /// [`crate::kernels::exact::fmax`] for the signed-zero convention.
+    name: Fmax,
+    builder: FmaxBuilder,
+    free: fmax,
+    k64: crate::kernels::exact::fmax,
+    k32: crate::kernels::exact::fmax,
+    /// `fmax(x, y)`, exact.
+}
+
+math_fn2! {
+    /// The smaller of `x` and `y`, ignoring NaN.
+    name: Fmin,
+    builder: FminBuilder,
+    free: fmin,
+    k64: crate::kernels::exact::fmin,
+    k32: crate::kernels::exact::fmin,
+    /// `fmin(x, y)`, exact.
+}
+
+math_fn! {
+    /// The binary exponent of `x`, as an integer in float lanes.
+    ///
+    /// See [`crate::kernels::exact::ilogb`] for the three sentinel values and
+    /// what they cost in `f32`.
+    name: Ilogb,
+    builder: IlogbBuilder,
+    free: ilogb,
+    k64: crate::kernels::exact::ilogb,
+    k32: crate::kernels::exact::ilogb,
+    /// `ilogb(x)`, exact.
+}
+
+math_fn_pair! {
+    /// Split `x` into its fractional and integral parts.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let (frac, int) = Modf::new().eval(-3.75_f64);
+    /// assert_eq!((frac, int), (-0.75, -3.0));
+    /// ```
+    name: Modf,
+    builder: ModfBuilder,
+    free: modf,
+    k64: crate::kernels::exact::modf,
+    k32: crate::kernels::exact::modf,
+    /// `modf(x)`, returning `(fraction, integral)`. Exact.
+}
+
+math_fn2_pair! {
+    /// `x` reduced modulo `y`, with the low bits of the quotient.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let (rem, quo) = Remquo::new().eval(9.0_f64, 4.0_f64);
+    /// assert_eq!((rem, quo), (1.0, 2.0));
+    /// ```
+    name: Remquo,
+    builder: RemquoBuilder,
+    free: remquo,
+    k64: crate::kernels::exact::remquo,
+    k32: crate::kernels::exact::remquo,
+    /// `remquo(x, y)`, returning `(remainder, quotient)`. Exact.
+}
+
+math_fn_pair! {
+    /// `ln|Gamma(x)|` together with the sign of `Gamma(x)`.
+    ///
+    /// C's `lgamma_r`, the reentrant form: the sign comes back as a second
+    /// result rather than in the global `signgam`. Both policy axes are no-ops
+    /// — see [`crate::kernels::double::gamma`] for why the value makes an
+    /// accuracy claim rather than a bit-exactness one. The *sign* is exact.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let (v, s) = LGammaR::new().eval(-0.5_f64);
+    /// assert_eq!(s, -1.0);                 // Gamma(-0.5) < 0
+    /// assert!((v - 1.2655121234846454).abs() < 1e-14);
+    /// ```
+    name: LGammaR,
+    builder: LGammaRBuilder,
+    free: lgamma_r,
+    k64: crate::kernels::double::gamma::lgamma_r,
+    k32: crate::kernels::single::lgamma_r,
+    /// `(ln|Gamma(x)|, sign(Gamma(x)))`, safe on any input.
+}
+
+// ---------------------------------------------------------------------------
+// The Bessel family.
+//
+// Ports of fdlibm, which is what glibc still runs for these. See
+// `crate::kernels::double::bessel` for which parts vectorise and which do not.
+// ---------------------------------------------------------------------------
+
+math_fn! {
+    /// Bessel function of the first kind, order 0.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// assert_eq!(J0::new().eval(0.0_f64), 1.0);
+    /// ```
+    name: J0,
+    builder: J0Builder,
+    free: j0,
+    k64: crate::kernels::double::bessel::j0,
+    k32: crate::kernels::single::bessel::j0,
+    /// `j0(x)`, bit-exact and safe on any input.
+}
+
+math_fn! {
+    /// Bessel function of the first kind, order 1.
+    name: J1,
+    builder: J1Builder,
+    free: j1,
+    k64: crate::kernels::double::bessel::j1,
+    k32: crate::kernels::single::bessel::j1,
+    /// `j1(x)`, bit-exact and safe on any input.
+}
+
+math_fn! {
+    /// Bessel function of the second kind, order 0.
+    ///
+    /// Defined on the positive reals: `y0(0)` is `-inf` and `y0(x)` is NaN for
+    /// `x < 0`.
+    name: Y0,
+    builder: Y0Builder,
+    free: y0,
+    k64: crate::kernels::double::bessel::y0,
+    k32: crate::kernels::single::bessel::y0,
+    /// `y0(x)`, bit-exact and safe on any input.
+}
+
+math_fn! {
+    /// Bessel function of the second kind, order 1.
+    name: Y1,
+    builder: Y1Builder,
+    free: y1,
+    k64: crate::kernels::double::bessel::y1,
+    k32: crate::kernels::single::bessel::y1,
+    /// `y1(x)`, bit-exact and safe on any input.
+}
+
+math_fn2! {
+    /// Bessel function of the first kind, order `n`.
+    ///
+    /// Argument order follows C: `jn(n, x)`, with the order in the first
+    /// vector. It travels in a float lane for the same reason
+    /// [`Ldexp`]'s exponent does, and is read by truncation towards zero.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// assert_eq!(Jn::new().eval(0.0_f64, 0.0_f64), 1.0);   // jn(0, 0) = j0(0)
+    /// assert_eq!(Jn::new().eval(2.0_f64, 0.0_f64), 0.0);
+    /// ```
+    name: Jn,
+    builder: JnBuilder,
+    free: jn,
+    k64: crate::kernels::double::bessel::jn,
+    k32: crate::kernels::single::bessel::jn,
+    /// `jn(n, x)`, bit-exact and safe on any input.
+}
+
+math_fn2! {
+    /// Bessel function of the second kind, order `n`. See [`Jn`] for the
+    /// argument order.
+    name: Yn,
+    builder: YnBuilder,
+    free: yn,
+    k64: crate::kernels::double::bessel::yn,
+    k32: crate::kernels::single::bessel::yn,
+    /// `yn(n, x)`, bit-exact and safe on any input.
 }

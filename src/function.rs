@@ -18,16 +18,17 @@
 //!
 //! # Arity
 //!
-//! Three traits, because three shapes of signature exist and collapsing them
+//! Four traits, because four shapes of signature exist and collapsing them
 //! into one would mean a tuple argument that every unary call site pays for:
 //!
 //! | trait | shape | examples |
 //! |---|---|---|
 //! | [`Function`] | `f(x)` | `exp`, `ln`, `sin`, `floor` |
 //! | [`Function2`] | `f(x, y)` | `pow`, `atan2`, `hypot`, `fmod` |
-//! | [`FunctionPair`] | `f(x) -> (a, b)` | `sincos`, `frexp` |
+//! | [`FunctionPair`] | `f(x) -> (a, b)` | `sincos`, `frexp`, `modf` |
+//! | [`Function2Pair`] | `f(x, y) -> (a, b)` | `remquo` |
 //!
-//! All three are generic over the element type, so `Pow` implements
+//! All four are generic over the element type, so `Pow` implements
 //! `Function2<f64>` and `Function2<f32>` and one object serves both.
 
 use crate::policy::{BitExact, FullRange};
@@ -192,6 +193,39 @@ pub trait FunctionPair<E: Real = f64>: Copy {
                 let (a, b) = self.eval(gather::<E::Widest>(src, i, n));
                 scatter(a, first, i, n);
                 scatter(b, second, i, n);
+            }
+        });
+    }
+}
+
+/// What every two-argument function object returning two values implements.
+///
+/// One member — `remquo` — and it exists rather than being folded into
+/// [`FunctionPair`] because the second argument is genuinely a second vector,
+/// not a configuration: `remquo(x, y)` reduces `x` modulo `y` and reports the
+/// low bits of the quotient, and both operands vary per lane.
+pub trait Function2Pair<E: Real = f64>: Copy {
+    /// Apply to one vector of lanes.
+    fn eval<V: Simd<Elem = E>>(&self, x: V, y: V) -> (V, V);
+
+    /// Apply to whole buffers, writing the two results to separate outputs.
+    ///
+    /// # Panics
+    /// If the four slices do not all have the same length.
+    #[inline]
+    fn eval_slice(&self, a: &[E], b: &[E], first: &mut [E], second: &mut [E]) {
+        assert_eq!(a.len(), b.len(), "eval_slice: length mismatch");
+        assert_eq!(a.len(), first.len(), "eval_slice: length mismatch");
+        assert_eq!(a.len(), second.len(), "eval_slice: length mismatch");
+        strided::<E>(a.len(), |i, n| {
+            if n == 1 {
+                let (p, q) = self.eval::<E>(a[i], b[i]);
+                first[i] = p;
+                second[i] = q;
+            } else {
+                let (p, q) = self.eval(gather::<E::Widest>(a, i, n), gather::<E::Widest>(b, i, n));
+                scatter(p, first, i, n);
+                scatter(q, second, i, n);
             }
         });
     }
@@ -405,6 +439,49 @@ macro_rules! math_fn_pair {
             $Name<BitExact, FullRange>: FunctionPair<V::Elem>,
         {
             <$Name<BitExact, FullRange> as FunctionPair<V::Elem>>::eval(&$Name::new(), x)
+        }
+    };
+}
+
+/// Generate a two-argument, two-result function object, its builder, and a
+/// free function.
+macro_rules! math_fn2_pair {
+    (
+        $(#[$fn_doc:meta])*
+        name: $Name:ident,
+        builder: $Builder:ident,
+        free: $free:ident,
+        k64: $($k64:ident)::+,
+        k32: $($k32:ident)::+,
+        $(#[$free_doc:meta])*
+    ) => {
+        object! { $(#[$fn_doc])* $Name, $Builder }
+
+        impl<A: $crate::policy::Accuracy, D: $crate::policy::Domain> Function2Pair<f64>
+            for $Name<A, D>
+        {
+            #[inline(always)]
+            fn eval<V: Simd<Elem = f64>>(&self, x: V, y: V) -> (V, V) {
+                $($k64)::+::eval::<V, A, D>(x, y)
+            }
+        }
+
+        impl<A: $crate::policy::Accuracy, D: $crate::policy::Domain> Function2Pair<f32>
+            for $Name<A, D>
+        {
+            #[inline(always)]
+            fn eval<V: Simd<Elem = f32>>(&self, x: V, y: V) -> (V, V) {
+                $($k32)::+::eval::<V, A, D>(x, y)
+            }
+        }
+
+        $(#[$free_doc])*
+        #[inline(always)]
+        pub fn $free<V: Simd>(x: V, y: V) -> (V, V)
+        where
+            $Name<BitExact, FullRange>: Function2Pair<V::Elem>,
+        {
+            <$Name<BitExact, FullRange> as Function2Pair<V::Elem>>::eval(&$Name::new(), x, y)
         }
     };
 }

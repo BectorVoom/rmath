@@ -21,7 +21,14 @@
 //! `f32` result, and `tests/exhaustive.rs` checks that over *every* one of the
 //! 2^32 inputs rather than a sample.
 
+pub mod bessel;
+pub mod erf_parts;
+
+pub use bessel::{j0, j1, jn, y0, y1, yn};
+pub use erf_parts::{erf, erfc};
+
 use crate::tables::single::exp as et;
+use crate::tables::single::exp10 as x10t;
 use crate::tables::single::log as lt;
 use crate::tables::single::log2 as l2t;
 
@@ -121,6 +128,57 @@ fn exp2_core(xd: f64) -> f64 {
     let r2 = r * r;
     let y = r.mul_add(et::C2, 1.0);
     let y = r2.mul_add(z, y);
+    y * s
+}
+
+// ---------------------------------------------------------------------------
+// exp10f
+// ---------------------------------------------------------------------------
+
+/// `10^x`, bit-identical to the platform's `exp10f`.
+///
+/// `exp2f` with one constant changed: the same 32-entry table, the same three
+/// scaled coefficients, and a reduction scale of `N*log2(10)` rather than `N`.
+/// Unlike [`exp`] it uses **no** fused multiply-adds — glibc ships no FMA
+/// variant of `exp10f`, and the compiled routine is `mulsd`/`addsd`
+/// throughout.
+pub fn exp10(x: f32) -> f32 {
+    let abstop = (x.to_bits() >> 19) & 0xfff;
+    if abstop >= x10t::BIG_TOP13 {
+        // |x| >= 38, or NaN.
+        if x.to_bits() == f32::NEG_INFINITY.to_bits() {
+            return 0.0;
+        }
+        if abstop >= x10t::INF_TOP13 {
+            return x + x; // +inf, or NaN (propagating the payload)
+        }
+        if x > x10t::OFLOW_BOUND {
+            return f32::INFINITY;
+        }
+        if x < x10t::UFLOW_BOUND {
+            return 0.0;
+        }
+        // Large but representable: fall through to the main path.
+    }
+    exp10_core(x as f64) as f32
+}
+
+/// The shared main path of `exp10f`, in double precision.
+#[inline(always)]
+fn exp10_core(xd: f64) -> f64 {
+    let z = x10t::INVLN10N * xd;
+    let kd_s = z + et::SHIFT;
+    let ki = kd_s.to_bits();
+    let kd = kd_s - et::SHIFT;
+    let r = z - kd;
+
+    let t = et::TAB[(ki % 32) as usize].wrapping_add(ki << 47);
+    let s = f64::from_bits(t);
+
+    let z = et::CS0 * r + et::CS1;
+    let r2 = r * r;
+    let y = et::CS2 * r + 1.0;
+    let y = z * r2 + y;
     y * s
 }
 

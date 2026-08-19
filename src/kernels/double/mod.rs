@@ -1,7 +1,12 @@
 //! Double-precision kernels.
 
+pub mod bessel;
 pub mod cbrt;
+pub mod dd;
+pub mod erf;
+pub mod erfc;
 pub mod exp;
+pub mod exp10;
 pub mod exp2;
 pub mod expm1;
 pub mod gamma;

@@ -109,6 +109,102 @@ fn sin_pi<V: Simd<Elem = f64>>(x: V) -> V {
     V::select(even, signed, -signed)
 }
 
+/// `ln|Gamma(x)|` together with the sign of `Gamma(x)`.
+///
+/// The value is [`lgamma`]'s, with [`lgamma`]'s accuracy contract. The *sign*
+/// is exact and is not derived from it: `Gamma` alternates sign on the
+/// negative half-line, so the sign is decided from the parity of `floor(-x)`
+/// and costs one rounding and one integer test.
+///
+/// The conventions at the awkward points are glibc's, and they are not all
+/// what the parity rule alone would give:
+///
+/// * `+0` reports `+1`, `-0` reports `-1`.
+/// * every negative integer — a pole, where the value is `+inf` — reports
+///   `-1`, including the odd ones the parity rule would call `+1`.
+/// * `-inf` reports `+1`, though its sign bit is set.
+/// * NaN reports `+1`.
+pub mod lgamma_r {
+    use super::*;
+    use crate::simd::{Real, Uint, map_lanes};
+
+    /// The cutoff above which glibc's `lgamma_r` reports `+1` whatever the
+    /// sign of `x`: `bits(x) << 1 >= HUGE_F64` means
+    /// `|x| >= 0x1.006df1bfac84ep+1015`, or a NaN or infinity.
+    ///
+    /// Every `|x| >= 2^52` is an integer and therefore a pole, so the sign it
+    /// reports there is a convention rather than a fact about `Gamma`. glibc
+    /// changes that convention at this one threshold — below it a negative
+    /// pole reports `-1`, at or above it `+1` — and matching the platform
+    /// means matching the quirk.
+    pub const HUGE_F64: u64 = 0xfeae_a9b2_4f16_a34c;
+
+    /// The same cutoff for `f32`, where glibc draws it at infinity instead:
+    /// every finite negative pole reports `-1`.
+    pub const HUGE_F32: u32 = 0xff00_0000;
+
+    /// The sign of `Gamma(x)`, as `+1.0` or `-1.0`. Exact for every input.
+    ///
+    /// `huge` is the precision's [`HUGE_F64`] / [`HUGE_F32`] threshold.
+    #[inline(always)]
+    pub fn sign_of<E: Real>(x: E, huge: E::Uint) -> E {
+        let t = x.bits();
+        if t << 1 >= huge {
+            // Huge magnitudes, both infinities, and NaN.
+            return E::ONE;
+        }
+        let negative = t >> (E::MANT_BITS + E::EXP_BITS) != <E::Uint as Uint>::ZERO;
+        let fx = E::of_f64(x.to_f64().floor());
+        if fx == x {
+            // An integer: a pole for `x <= 0`, where the reported sign is
+            // just the sign bit — so `-0.0` reports `-1` and `+0.0` reports
+            // `+1` — and `+1` for every positive integer.
+            return if x <= E::ZERO && negative {
+                -E::ONE
+            } else {
+                E::ONE
+            };
+        }
+        if x.abs() < E::HALF {
+            // `Gamma` has no zero crossing inside `(-1/2, 1/2)`, so the sign
+            // bit decides on its own.
+            return if negative { -E::ONE } else { E::ONE };
+        }
+        if !negative {
+            return E::ONE;
+        }
+        // `Gamma` alternates on the negative half-line: negative on
+        // `(-1, 0)`, positive on `(-2, -1)`, and so on. `floor(x)` names the
+        // interval and its parity names the sign.
+        if (fx.to_f64() as i64) & 1 == 0 {
+            E::ONE
+        } else {
+            -E::ONE
+        }
+    }
+
+    /// The sign of `Gamma(x)` for `f64`.
+    #[inline(always)]
+    pub fn sign(x: f64) -> f64 {
+        sign_of(x, HUGE_F64)
+    }
+
+    /// The sign of `Gamma(x)` for `f32`.
+    #[inline(always)]
+    pub fn sign_f32(x: f32) -> f32 {
+        sign_of(x, HUGE_F32)
+    }
+
+    /// `(lgamma(x), sign(Gamma(x)))` for a vector of lanes.
+    ///
+    /// Both policy axes are no-ops, as they are for [`lgamma`].
+    #[inline(always)]
+    pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> (V, V) {
+        let _ = (A::BIT_EXACT, D::CHECKED);
+        (lgamma::fast(x), map_lanes(x, sign))
+    }
+}
+
 /// The natural logarithm of the absolute value of Gamma.
 pub mod lgamma {
     use super::*;
@@ -135,7 +231,44 @@ pub mod lgamma {
 
         // lgamma(x) = ln(pi) - ln|sin(pi x)| - lgamma(1 - x).
         let reflected = V::splat(LN_PI) - ln::eval::<V, Fast, Finite>(sin_pi(x).abs()) - lg;
-        V::select(neg, reflected, lg)
+        let main = V::select(neg, reflected, lg);
+        crate::simd::patch_lanes(x, main, edge_lanes(x), edge)
+    }
+
+    /// The lanes the main path must not be trusted with.
+    ///
+    /// Both routes above reach for `ln` under [`Finite`], whose domain is the
+    /// positive *normals* — the recurrence takes `ln(x)` directly for
+    /// `0 < x < 1`, and the reflection takes `ln|sin(pi x)|`. So a subnormal
+    /// argument, a zero, and a negative integer (where the sine is zero) all
+    /// leave that domain, as do the infinities and NaN. They are recomputed
+    /// here rather than defended against inside the loops, which would cost
+    /// every lane a test to serve inputs that have closed forms anyway.
+    #[inline(always)]
+    fn edge_lanes<V: Simd<Elem = f64>>(x: V) -> V::Mask {
+        use crate::simd::Mask;
+        crate::kernels::not_normal(x).or(x.lt_mask(V::splat(0.0)).and(x.eq_mask(x.trunc())))
+    }
+
+    /// Those lanes, in closed form.
+    fn edge(x: f64) -> f64 {
+        if x.is_nan() {
+            return x + x;
+        }
+        // Both infinities: `lgamma` is even enough at the ends for C to
+        // require `+inf` for either.
+        if x.abs() == f64::INFINITY {
+            return f64::INFINITY;
+        }
+        // The poles: zero of either sign, and every negative integer. Note
+        // that every `x <= -2^52` is an integer, so the whole tail is poles.
+        if x == 0.0 || (x < 0.0 && x == x.trunc()) {
+            return f64::INFINITY;
+        }
+        // Subnormal, of either sign: `Gamma(x) = 1/x - gamma + O(x)`, and at
+        // this magnitude the correction is more than 250 orders of magnitude
+        // below the leading term, so `ln|Gamma(x)|` is `-ln|x|` rounded once.
+        -crate::reference::double::ln(x.abs())
     }
 
     /// `lgamma(y)` for `y > 0`.

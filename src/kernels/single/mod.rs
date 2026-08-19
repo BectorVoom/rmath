@@ -132,7 +132,11 @@ macro_rules! delegating2 {
     };
 }
 
+pub mod bessel;
+pub mod erf;
+pub mod erfc;
 pub mod exp;
+pub mod exp10;
 pub mod exp2;
 pub mod ln;
 pub mod log2;
@@ -174,6 +178,26 @@ delegating! { /// `ln(1 + x)`.
 log1p, crate::reference::single::log1p, double::logx::log1p }
 delegating! { /// `e^x - 1`.
 expm1, crate::reference::single::expm1, double::expm1 }
+/// Log-Gamma with the sign of `Gamma`.
+///
+/// The value takes the double-precision route and rounds once, like
+/// [`lgamma`]; the sign is computed on the `f32` argument directly, because it
+/// is exact at either precision and widening first would be work for nothing.
+pub mod lgamma_r {
+    use crate::policy::{Accuracy, Domain};
+    use crate::simd::{Simd, map_lanes};
+
+    /// `(lgamma(x), sign(Gamma(x)))` for a vector of `f32` lanes.
+    #[inline(always)]
+    pub fn eval<V: Simd<Elem = f32>, A: Accuracy, D: Domain>(x: V) -> (V, V) {
+        let v = V::narrow(crate::kernels::double::gamma::lgamma::eval::<V::Wide, A, D>(x.widen()));
+        (
+            v,
+            map_lanes(x, crate::kernels::double::gamma::lgamma_r::sign_f32),
+        )
+    }
+}
+
 via_double_raw! { /// Log-Gamma.
 lgamma, double::gamma::lgamma }
 via_double_raw! { /// Gamma.

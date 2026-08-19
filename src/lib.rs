@@ -81,6 +81,15 @@
 //! subnormals, specials, and random bit patterns — and fails loudly rather
 //! than silently degrading if the host differs.
 //!
+//! # The rest of `libm`
+//!
+//! Beyond the elementary functions, the crate covers what a numerical
+//! workload actually reaches for: the error functions `erf` and `erfc`, the
+//! Bessel family `j0`, `j1`, `jn`, `y0`, `y1`, `yn`, `exp10`, the multi-value
+//! decompositions `modf`, `remquo` and `lgamma_r`, and the IEEE-754 helpers
+//! `fdim`, `fmin`, `fmax`, `ilogb`, `scalbn` and `rint`. All in both
+//! precisions, all under the same two policy axes.
+//!
 //! # Both precisions
 //!
 //! `f64` and `f32`, with the vector widths the backend provides: `f64x2`,
@@ -108,18 +117,32 @@
 //!
 //! # What each function actually gives you
 //!
-//! Three kinds of kernel, and the difference is worth knowing before you pick
-//! a policy:
+//! Five kinds of kernel, and the difference is worth knowing before you pick a
+//! policy:
 //!
 //! | kind | `BitExact` | `Fast` |
 //! |---|---|---|
-//! | **Exact** — `floor`, `ceil`, `round`, `trunc`, `copysign`, `fmod`, `remainder`, `frexp`, `ldexp`, `nextafter`, `sqrt` | vectorised; exact by construction, on every platform | same code |
-//! | **Ported** — `exp`, `exp2`, `expm1`, `ln`, `log2`, `pow`, `cbrt`, `sinh`, `cosh`, `tanh` | vectorised; replays the platform schedule | separate table-free vector path |
-//! | **Delegating** — `sin`, `cos`, `sincos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `asinh`, `acosh`, `atanh`, `log10`, `log1p`, `hypot` | one lane at a time; bit-exact, but no faster than the call it replaces | vectorised, with a measured ulp bound |
+//! | **Exact** — `floor`, `ceil`, `round`, `rint`, `trunc`, `copysign`, `fmod`, `remainder`, `remquo`, `modf`, `frexp`, `ldexp`, `scalbn`, `ilogb`, `fdim`, `fmin`, `fmax`, `nextafter`, `sqrt` | vectorised; exact by construction, on every platform | same code |
+//! | **Correctly rounded** — `erf`, `erfc` | vectorised; the *nearest representable value*, which is stronger than matching this platform | same arithmetic without the rounding test; below 0.51 ulp |
+//! | **Ported** — `exp`, `exp2`, `exp10`, `expm1`, `ln`, `log2`, `pow`, `cbrt`, `sinh`, `cosh`, `tanh` | vectorised; replays the platform schedule | separate table-free vector path |
+//! | **Delegating** — `sin`, `cos`, `sincos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `asinh`, `acosh`, `atanh`, `log10`, `log1p`, `hypot`, `jn`, `yn` | one lane at a time; bit-exact, but no faster than the call it replaces | vectorised, with a measured ulp bound |
+//! | **Mixed** — `j0`, `j1`, `y0`, `y1` | vectorised below `\|x\| = 2`; delegating above it, where the cost is the platform's trigonometry | fully vectorised, 2.4x to 3.0x |
 //!
 //! The exact functions need no apology: IEEE-754 pins their results down
 //! completely, so every correct implementation is bit-identical and both
 //! policy axes are genuine no-ops.
+//!
+//! The correctly-rounded pair is the strongest guarantee in the crate, and it
+//! is worth being precise about why. glibc computes `erf` and `erfc` with
+//! CORE-MATH's routines, which return the representable value nearest the true
+//! result on *every* input. Correct rounding is a property of the answer, not
+//! of the route to it, so any two correctly-rounded implementations agree —
+//! which makes `BitExact` here a claim about mathematics rather than about
+//! this platform's `libm`. It is reached the way CORE-MATH reaches it: a
+//! double-double fast path with a proven error bound, a test asking whether
+//! that bound settles the last bit, and a scalar accurate path for the one
+//! input in thirty thousand where it does not. The fast path vectorises; the
+//! accurate path is the rare-lane repair every kernel here already has.
 //!
 //! The delegating ones are the honest part. glibc implements those families
 //! with the IBM Accurate Portable Math Library routines, whose operation
@@ -131,10 +154,21 @@
 //! [`Fast`] is where their vector path lives, and it is a large win: 20x for
 //! the trigonometric family on this machine.
 //!
-//! `lgamma` and `tgamma` are a fourth case. Rust has no `f64::tgamma`, so
-//! there is no call for `BitExact` to be bit-exact *to*; both policies run one
-//! vectorised implementation, documented by its measured error. See
-//! [`kernels::double::gamma`].
+//! `j0`, `j1`, `y0` and `y1` are the mixed case, and they are mixed for that
+//! same reason. Below `|x| = 2` they are rational functions of `x^2` and
+//! vectorise completely. Above it they are `sqrt(2/(pi x))` times a
+//! combination of `sin x`, `cos x` and `cos 2x` — three delegated calls, where
+//! the scalar routine gets away with two by sharing one argument reduction. So
+//! under `BitExact` a vector with any lane at or above 2 goes to the scalar
+//! routine, because a "vectorised" version of that branch measures *slower*
+//! than the call it replaces. `jn` and `yn` are delegating outright: they
+//! choose between three algorithms on `n` against `x`, and one of them runs a
+//! continued fraction whose length is decided at run time.
+//!
+//! `lgamma`, `lgamma_r` and `tgamma` are a case of their own. Rust has no
+//! `f64::tgamma`, so there is no call for `BitExact` to be bit-exact *to*;
+//! both policies run one vectorised implementation, documented by its measured
+//! error. See [`kernels::double::gamma`]. `lgamma_r`'s *sign* is exact.
 //!
 //! # Accuracy of `Fast`
 //!
@@ -142,7 +176,11 @@
 //! therefore kept honest by the build: most kernels are within 4 ulp, the
 //! inverse trigonometric and inverse hyperbolic ones within 8, and `pow`
 //! within 40 because `y` multiplies the error in `log2 x` as well as its
-//! value. Each kernel's module documentation states its own bound.
+//! value. `erf` and `erfc` are the exception in the other direction — their
+//! `Fast` path is the *same* double-double arithmetic as the bit-exact one
+//! with only the rounding test removed, so it is below 0.51 ulp, which is to
+//! say correctly rounded on all but about one input in thirty thousand. Each
+//! kernel's module documentation states its own bound.
 //!
 //! # Requires `std`
 //!
@@ -182,17 +220,28 @@ pub use function::{
     ldexp, lgamma, ln, log1p, log2, log10, nextafter, pow, remainder, round, sin, sincos, sinh,
     sqrt, tan, tanh, tgamma, trunc,
 };
+pub use function::{
+    Erf, ErfBuilder, Erfc, ErfcBuilder, Exp10, Exp10Builder, Fdim, FdimBuilder, Fmax, FmaxBuilder,
+    Fmin, FminBuilder, Function2Pair, Ilogb, IlogbBuilder, LGammaR, LGammaRBuilder, Modf,
+    ModfBuilder, Remquo, RemquoBuilder, Rint, RintBuilder, Scalbn, ScalbnBuilder, erf, erfc, exp10,
+    fdim, fmax, fmin, ilogb, lgamma_r, modf, remquo, rint, scalbn,
+};
+pub use function::{
+    J0, J0Builder, J1, J1Builder, Jn, JnBuilder, Y0, Y0Builder, Y1, Y1Builder, Yn, YnBuilder, j0,
+    j1, jn, y0, y1, yn,
+};
 pub use policy::{Accuracy, BitExact, Domain, Fast, Finite, FullRange};
 pub use simd::{Real, Simd};
 
 /// Everything needed to configure and call a function.
 pub mod prelude {
     pub use crate::function::{
-        Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Ceil, CopySign, Cos, Cosh, Exp, Exp2,
-        Expm1, Floor, Fmod, Frexp, Hypot, LGamma, Ldexp, Ln, Log1p, Log2, Log10, NextAfter, Pow,
-        Remainder, Round, Sin, SinCos, Sinh, Sqrt, TGamma, Tan, Tanh, Trunc,
+        Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Ceil, CopySign, Cos, Cosh, Erf, Erfc,
+        Exp, Exp2, Exp10, Expm1, Fdim, Floor, Fmax, Fmin, Fmod, Frexp, Hypot, Ilogb, J0, J1, Jn,
+        LGamma, LGammaR, Ldexp, Ln, Log1p, Log2, Log10, Modf, NextAfter, Pow, Remainder, Remquo,
+        Rint, Round, Scalbn, Sin, SinCos, Sinh, Sqrt, TGamma, Tan, Tanh, Trunc, Y0, Y1, Yn,
     };
-    pub use crate::function::{Function, Function2, FunctionPair};
+    pub use crate::function::{Function, Function2, Function2Pair, FunctionPair};
     pub use crate::policy::{BitExact, Fast, Finite, FullRange};
     pub use crate::simd::{Real, Simd};
 }

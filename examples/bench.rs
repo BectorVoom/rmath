@@ -31,6 +31,22 @@
 use rmath::prelude::*;
 use std::time::Instant;
 
+/// The platform's own routines, for the functions `std` does not expose.
+mod libm {
+    unsafe extern "C" {
+        pub safe fn erf(x: f64) -> f64;
+        pub safe fn erfc(x: f64) -> f64;
+        pub safe fn exp10(x: f64) -> f64;
+        pub safe fn j0(x: f64) -> f64;
+        pub safe fn j1(x: f64) -> f64;
+        pub safe fn y0(x: f64) -> f64;
+        pub safe fn y1(x: f64) -> f64;
+        pub safe fn erff(x: f32) -> f32;
+        pub safe fn erfcf(x: f32) -> f32;
+        pub safe fn exp10f(x: f32) -> f32;
+    }
+}
+
 const N: usize = 1 << 20;
 const REPS: usize = 8;
 
@@ -157,6 +173,23 @@ fn main() {
     row!("asinh", &hypargs, &mut dst, f64::asinh, Asinh);
     row!("acosh", &posargs, &mut dst, f64::acosh, Acosh);
     row!("atanh", &unitargs, &mut dst, f64::atanh, Atanh);
+
+    header();
+    // `erf`'s argument is interesting only on about [-6, 6]; outside it the
+    // answer is +-1 and every implementation short-circuits.
+    let erfargs: Vec<f64> = (0..N).map(|_| rng.uniform(-6.0, 6.0)).collect();
+    // `erfc`'s tail is the half that matters, so the corpus leans into it.
+    let erfcargs: Vec<f64> = (0..N).map(|_| rng.uniform(-6.0, 25.0)).collect();
+    let besselargs: Vec<f64> = (0..N).map(|_| rng.uniform(0.0, 60.0)).collect();
+    row!("exp10", &expargs, &mut dst, |x| libm::exp10(x), Exp10);
+    row!("erf", &erfargs, &mut dst, |x| libm::erf(x), Erf);
+    row!("erfc", &erfcargs, &mut dst, |x| libm::erfc(x), Erfc);
+
+    header();
+    row!("j0", &besselargs, &mut dst, |x| libm::j0(x), J0);
+    row!("j1", &besselargs, &mut dst, |x| libm::j1(x), J1);
+    row!("y0", &besselargs, &mut dst, |x| libm::y0(x), Y0);
+    row!("y1", &besselargs, &mut dst, |x| libm::y1(x), Y1);
 
     header();
     row!("floor", &expargs, &mut dst, f64::floor, Floor);
@@ -313,4 +346,9 @@ fn single_precision() {
     row32!("sqrtf", &p, f32::sqrt, Sqrt);
     row32!("cbrtf", &p, f32::cbrt, Cbrt);
     row32!("tanhf", &e, f32::tanh, Tanh);
+    let erf32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 6.0) as f32).collect();
+    let erfc32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 10.0) as f32).collect();
+    row32!("exp10f", &e, |x| libm::exp10f(x), Exp10);
+    row32!("erff", &erf32, |x| libm::erff(x), Erf);
+    row32!("erfcf", &erfc32, |x| libm::erfcf(x), Erfc);
 }

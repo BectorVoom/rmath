@@ -7,7 +7,10 @@
 //! and widening to `f64xN` first is what makes it vectorised rather than a
 //! scalar loop.
 
+pub mod bessel;
+pub mod erf;
 pub mod exp;
+pub mod exp10;
 pub mod log;
 pub mod log2;
 pub mod poly;

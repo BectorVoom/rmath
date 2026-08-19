@@ -16,6 +16,25 @@
 //!    correctness at the edges never depends on the vector code getting the
 //!    hard cases right.
 //!
+//! # Ported, delegated, or correctly rounded
+//!
+//! Three cases now, because `erf` and `erfc` are a third. glibc computes them
+//! with CORE-MATH's routines, which are *correctly rounded* — they return the
+//! representable value nearest the true result on every input. That makes them
+//! the one family here whose reference is not a claim about this platform: any
+//! correctly-rounded implementation returns the same bits, so
+//! [`double::erf_parts`] and [`double::erfc_parts`] are bit-exact to glibc and
+//! to every other correct `erf` anywhere. See those modules for how correct
+//! rounding is actually reached — a double-double fast path, a test asking
+//! whether its error bound settles the last bit, and an accurate path for the
+//! rare input where it does not.
+//!
+//! The Bessel family is a plain port, of Sun's fdlibm — which is still what
+//! glibc runs for it, verified by finding fdlibm's own constants in the
+//! installed `libm.so` where `erf`'s and `lgamma`'s are no longer there. Those
+//! routines call the platform's `sin`, `cos` and `log`, so they inherit the
+//! delegation described below for the trigonometric part.
+//!
 //! # Ported, or delegated
 //!
 //! Most of these are faithful ports of the routine the platform's C library

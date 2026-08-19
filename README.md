@@ -28,23 +28,48 @@ f.eval_slice(&src, &mut out);       // widest vectors, scalar tail
 
 ## What is covered
 
-Around forty functions, in four groups that differ in what they can promise.
+Around sixty functions, in six groups that differ in what they can promise.
 The distinction is not bookkeeping — it decides whether the default policy is
 faster than the call it replaces, so it is stated up front rather than buried.
 
 | group | functions | `BitExact` | `Fast` |
 |---|---|---|---|
-| **Exact** | `floor` `ceil` `round` `trunc` `copysign` `fmod` `remainder` `frexp` `ldexp` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
-| **Ported** | `exp` `exp2` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` | vectorised, replays the platform schedule | separate table-free vector path |
-| **Delegating** | `sin` `cos` `sincos` `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
-| **Own** | `lgamma` `tgamma` | — | one implementation, measured bound |
+| **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
+| **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
+| **Delegating** | `sin` `cos` `sincos` `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
 correct implementation is bit-identical, on any platform, forever; both policy
 axes are genuine no-ops.
 
+**Correctly rounded** is the strongest guarantee here, and stronger than
+"bit-exact" as the rest of this README uses the term. glibc computes `erf` and
+`erfc` with CORE-MATH's routines, which return the representable value
+*nearest the true result* for every input. That is a property of the answer,
+not of the route to it, so any two correctly-rounded implementations agree —
+which makes `BitExact` for this pair a claim about mathematics rather than
+about the host's `libm`. It is reached the way CORE-MATH reaches it: a
+double-double fast path with a proven error bound, a test asking whether the
+bound settles the last bit, and a scalar accurate path for the roughly one
+input in thirty thousand where it does not. The fast path vectorises; the
+accurate path is the rare-lane repair every kernel here already has. **4x**,
+bit-exact, with no policy to opt into.
+
 **Ported** is the crate's headline case: the vector code replays the platform
 routine's operation schedule, so it is both bit-exact and several times faster.
+
+**Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
+by their shape. Below `|x| = 2` they are rational functions of `x^2` and
+vectorise completely. Above it they are `sqrt(2/(pi x))` times a combination of
+`sin x`, `cos x` and `cos 2x` — three delegated calls, where the scalar routine
+gets away with two by sharing one argument reduction. So under `BitExact` a
+vector with any lane at or above 2 is handed to the scalar routine: a
+"vectorised" version of that branch measures *slower* than the call it
+replaces, and shipping it would have been a loss dressed up as an
+optimisation. `Fast` vectorises both branches.
 
 **Delegating** is the honest part. glibc implements those families with the IBM
 Accurate Portable Math Library routines, whose schedule turns on tables of
@@ -53,11 +78,17 @@ the compiler chooses and the C source does not show. That has not been
 reproduced here, so under `BitExact` those kernels call the platform routine
 per lane — still bit-exact, so substituting `rmath` cannot change your result,
 but no faster than what it replaces. `Fast` is where their vector path lives,
-and it is worth a lot: **20x** for the trigonometric family.
+and it is worth a lot: **20x** for the trigonometric family. `jn` and `yn` are
+here for a different reason: they choose between three algorithms on `n`
+against `x`, and one of them runs a continued fraction whose length is decided
+at run time, so there is no vector shape to give them.
 
-**Own** is `lgamma` and `tgamma`. Rust has no `f64::tgamma`, so there is no
-call for `BitExact` to be bit-exact *to*; both policies run one vectorised
-implementation, described by its measured error.
+**Own** is the Gamma family. Rust has no `f64::tgamma`, so there is no call for
+`BitExact` to be bit-exact *to*; both policies run one vectorised
+implementation, described by its measured error. `lgamma_r`'s *sign* output is
+exact and is checked against the platform bit for bit, including glibc's
+conventions at the poles — which are not the ones the parity rule alone would
+give.
 
 ## Both precisions
 
@@ -161,6 +192,35 @@ call it replaces.
 | `hypot` |  3.26 ns | 0.92x | 4.61x  | — |
 | `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
 
+### Special functions — bit-exact *and* several times faster
+
+`erf` and `erfc` are the clearest case the crate makes: correctly rounded, so
+the result is not merely "the same as glibc here" but the same as any correct
+implementation anywhere, and four times the throughput under the default
+policy. `erfc`'s baseline is high because glibc computes it in double-double
+with a run-time rounding test — the same work this crate does, one lane at a
+time.
+
+| function | scalar | `BitExact` | + `Finite` | `Fast` | + `Finite` |
+|---|--:|--:|--:|--:|--:|
+| `erf`   | 22.11 ns | **3.93x** | 4.36x | 4.14x | **4.94x** |
+| `erfc`  | 60.59 ns | **3.98x** | 4.14x | 4.32x | **4.29x** |
+| `exp10` |  2.21 ns | **1.88x** | 2.13x | 3.29x | **3.58x** |
+
+### Bessel — parity by default, 2.4x to 3.1x under `Fast`
+
+| function | scalar | `BitExact` | `Fast` | + `Finite` |
+|---|--:|--:|--:|--:|
+| `j0` | 37.89 ns | 0.95x | 3.07x | **3.19x** |
+| `j1` | 37.84 ns | 0.95x | 3.05x | **3.00x** |
+| `y0` | 38.02 ns | **1.10x** | 2.45x | 2.44x |
+| `y1` | 37.79 ns | **1.11x** | 2.35x | **2.40x** |
+
+The `BitExact` column is the point of the design rather than a disappointment:
+it is what an honest vectorisation of a function whose cost is delegated
+trigonometry looks like. `Fast` replaces that trigonometry with rmath's own
+and the vector reappears.
+
 ### Single precision
 
 | function | scalar | `BitExact` | `Fast` |
@@ -172,6 +232,9 @@ call it replaces.
 | `sqrtf` | 0.13 ns | 1.10x | 1.11x |
 | `cbrtf` | 2.49 ns | 0.96x | 0.96x |
 | `tanhf` | 2.82 ns | 0.93x | 1.99x |
+| `exp10f`| 2.14 ns | **1.38x** | 1.31x |
+| `erff`  | 6.06 ns | **1.51x** | 1.52x |
+| `erfcf` | 7.02 ns | **1.39x** | 1.39x |
 
 Several of those deserve comment rather than burial:
 
@@ -262,6 +325,7 @@ instruction. The benchmark prints a warning if you did not.
 | `src/function.rs` | the builder machinery |
 | `src/function_defs.rs` | the catalogue: one `math_fn!` block per function |
 | `tools/gen_tables.py` | regenerates the ported tables from upstream C |
+| `tools/gen_special_tables.py` | regenerates the `erf`, `erfc` and Bessel tables from glibc's C |
 | `tools/gen_poly.py` | regenerates the `Fast` coefficients by Remez, at 200 bits |
 
 Four properties fall out of that split:
@@ -292,7 +356,8 @@ Four properties fall out of that split:
    `src/lib.rs`.
 4. Add the corpus and the assertion: `tests/bit_exact.rs` for a port,
    `tests/delegating.rs` for a delegating kernel, `tests/accuracy.rs` for the
-   `Fast` bound, `tests/single.rs` for `f32`.
+   `Fast` bound, `tests/single.rs` for `f32`, `tests/glibc.rs` if `std` has no
+   method to compare against.
 
 ## Testing
 
@@ -302,6 +367,7 @@ Four properties fall out of that split:
 | `tests/delegating.rs` | `BitExact` really is bit-exact for the delegating kernels too — a kernel that quietly took its `Fast` path would still look fine to an accuracy test |
 | `tests/single.rs` | every `f32` function against the platform; `--ignored` runs all 2^32 inputs per function |
 | `tests/accuracy.rs` | the `Fast` ulp bounds this file quotes, so loosening one fails the build |
+| `tests/glibc.rs` | the functions `std` has no method for — `erf`, `erfc`, the Bessel family, `exp10`, `remquo`, `modf`, `ilogb`, `fdim`, `fmin`, `fmax`, `rint`, `scalbn`, `lgamma_r` — against the platform `libm` through `extern "C"`, at every width; `--ignored` runs all 2^32 `f32` inputs |
 | `tests/policy.rs` | `Finite` agrees with `FullRange` inside the domain, and the builder is zero-cost |
 
 ```sh
@@ -311,12 +377,12 @@ cargo test --release -- --ignored     # the exhaustive f32 sweeps, ~90 s
 
 ## Status
 
-Covered: the exact, ported, delegating and Gamma groups listed at the top —
-around forty functions, in both precisions.
+Covered: the exact, correctly-rounded, ported, mixed, delegating and Gamma
+groups listed at the top — around sixty functions, in both precisions.
 
 Known limitations, in rough order of how much they would be missed:
 
-- **Fourteen functions are delegating, not ported.** Their `BitExact` path is
+- **Sixteen functions are delegating, not ported.** Their `BitExact` path is
   correct but not fast. The trigonometric family is what is most worth porting
   next, and it is the largest remaining job: glibc uses the IBM Accurate
   Portable Math Library routines there, with a 440-entry table and a separate
@@ -334,6 +400,18 @@ Known limitations, in rough order of how much they would be missed:
   18 the recurrence reaches `[1, 2]` directly and it is within 16.
 - **No native single-precision `cbrt`**, so `cbrtf` delegates under both
   policies rather than offering a `Fast` path.
+- **The single-precision Bessel functions are scalar under `BitExact`.** glibc
+  repairs them near each zero with one of 64 tabulated polynomials, and beyond
+  the 64th zero with an asymptotic form behind a 192-bit Payne-Hanek
+  reduction; which of the three runs is decided *after* the rational fit, on
+  how small its bracket came out. Blending that would cost every lane more than
+  the scalar call it replaces. `Fast` widens to the double-precision vector
+  kernel, which is both faster and — since glibc's own bound for `j0f` is 9
+  ulps — more accurate, just not identical.
+- **`jn` and `yn` are scalar under both policies.** The backward recurrence
+  runs a continued fraction whose length is decided at run time by iterating
+  until a convergent exceeds `1e9`; a vector would run the longest lane's loop
+  for every lane.
 - **Requires `std`**, for exactly two operations: `mul_add` and `sqrt`, neither
   of which is in `core`. Supporting `no_std` needs a correctly-rounded software
   FMA — evaluating `a * b + c` instead would break every guarantee above.
@@ -348,4 +426,9 @@ single-precision counterparts are ported from
 (MIT OR Apache-2.0 WITH LLVM-exception), the same code glibc uses; `cbrt` is
 ported from [`libm`](https://github.com/rust-lang/compiler-builtins) (MIT),
 itself a port of core-math's `cbrt.c`, Copyright (c) 2021-2022 Alexei Sibidanov.
-The `Fast` coefficients are this crate's own, generated by `tools/gen_poly.py`.
+`erf` and `erfc` are ported from glibc's copies of the
+[CORE-MATH](https://core-math.gitlabpages.inria.fr/) routines, Copyright (c)
+2022-2025 Alexei Sibidanov, Paul Zimmermann, Tom Hubrecht and Claude-Pierre
+Jeannerod (MIT); the Bessel family from glibc's fdlibm, Copyright (c) 1993 Sun
+Microsystems, Inc. The `Fast` coefficients are this crate's own, generated by
+`tools/gen_poly.py`.
