@@ -253,6 +253,20 @@ def build(single: bool) -> str:
     w(emit_array("EXPM1", c, "`(exp(r) - 1)/r` as a polynomial in `r`, on `|r| <= ln(2)/2`.", e, single))
     w("")
 
+    if single:
+        # tanh(x)/x on |x| <= 1, as a polynomial in x^2 -- direct, not via an
+        # identity, because `tanh` has no cancellation problem to route around
+        # here: unlike the f64 kernel's `expm1`-based form (chosen to avoid
+        # cancelling near 0 in *that* identity), a minimax fit of `tanh(x)/x`
+        # itself never subtracts two close quantities, so single precision's
+        # native `tanhf` needs nothing more elaborate than this for |x| <= 1.
+        # Beyond that interval it switches to `1 - 2/(exp(2x)+1)`, which is
+        # well-conditioned in its own right once `x >= 1`.
+        f = lambda s: (M.tanh(M.sqrt(s)) / M.sqrt(s)) if s > 0 else mpf(1)
+        c, e = remez(f, mpf(0), mpf(1), 6, relative(f))
+        w(emit_array("TANH", c, "`tanh(x)/x` as a polynomial in `x^2`, on `|x| <= 1`.", e, single))
+        w("")
+
     # atanh(s)/s as a polynomial in s^2. Three callers reduce to this:
     # log1p(x) = 2 atanh(x/(2+x)), atanh itself, and the logarithm kernels,
     # which fold the significand to [1/sqrt2, sqrt2) and take s = (m-1)/(m+1).
@@ -268,6 +282,39 @@ def build(single: bool) -> str:
                  "`atanh(s)/s` as a polynomial in `s^2`, on `|s| <= (sqrt2-1)/(sqrt2+1)`.",
                  e, single))
     w("")
+
+    if single:
+        # The same series with the factor 2 and the base-2 scale folded in, for
+        # the single-precision `Fast` log2: log2(m) = s * P(s^2) with
+        # s = (m-1)/(m+1), so the kernel spends no rounding on the scale.
+        f = lambda t: 2 / M.log(2) * (
+            (M.atanh(M.sqrt(t)) / M.sqrt(t)) if t > 0 else mpf(1))
+        c, e = remez(f, mpf(0), s_max ** 2 * mpf(1.02), d_atanh, relative(f))
+        w(emit_array(
+            "LOG2_ATANH", c,
+            "`2 log2(e) atanh(s)/s` as a polynomial in `s^2`, on the interval\n"
+            "of [`ATANH`], so that `log2(m) = s * P(s^2)`.",
+            e, single))
+        w("")
+    else:
+        # The far tail of the same series: atanh(s)/s = 1 + s^2/3 + s^4 R(s^2),
+        # fitted with its first *two* terms removed so a kernel can carry both
+        # in double-double and single-round only this correction, which is at
+        # most `s^4/5 ~ 2e-4` of the whole. `Fast` `pow` is the caller, and the
+        # reason: `y` multiplies the error in `log2 x`, so the error of
+        # *computing* the logarithm has to be pushed below one part in 2^53 of
+        # the logarithm itself, not of the result.
+        f = lambda t: (
+            ((M.atanh(M.sqrt(t)) / M.sqrt(t)) - 1 - t / 3) / (t * t)
+            if t > 0 else mpf(1) / 5)
+        c, e = remez(f, mpf(0), s_max ** 2 * mpf(1.02), d_atanh - 2, relative(f))
+        w(emit_array(
+            "ATANH_TAIL", c,
+            "`(atanh(s)/s - 1 - s^2/3) / s^4` as a polynomial in `s^2`, on the\n"
+            "interval of [`ATANH`]: the series without its first two terms, for\n"
+            "a caller that carries both of them in double-double.",
+            e, single))
+        w("")
 
     # Gamma on [1, 2], where both Gamma functions are reduced to.
     #
@@ -297,8 +344,21 @@ def build(single: bool) -> str:
     # Argument-reduction constants. `PIO2` splits pi/2 across three doubles
     # whose low `trailing` significand bits are zero, so `n * PIO2[i]` is exact
     # for every integer `|n| < 2^trailing` -- that exactness is the whole point
-    # of a Cody-Waite reduction, and it is what bounds the kernel's domain.
-    trailing = 20 if not single else 12
+    # of a Cody-Waite reduction. But exactness of the *multiply* is not the
+    # same as accuracy of the *reduction*: what the split actually knows about
+    # pi/2 is `keep*3` bits, and the reduced argument's absolute error is
+    # `n * pi/2 * 2^-(keep*3)` at the domain edge. For `f64` (`trailing=20`,
+    # `keep=33`) that is 99 bits against a 53-bit mantissa -- headroom to
+    # spare. Naively reusing `trailing=12` for `f32` leaves only 36 bits
+    # against a 24-bit mantissa, and at `n` near `2^12` the reduced argument's
+    # error (~1e-7) is *comparable to `f32`'s own ulp* -- harmless for a
+    # typical result, but it is exactly the error `tests/ulp_scan.rs` caught
+    # as a multi-million-ulp "failure" near a zero of `sin`/`cos`, where any
+    # nonzero absolute error is unbounded in relative terms. `trailing=9`
+    # keeps `n * pi/2 * 2^-(keep*3)` under `2^-32` -- fifty times below `f32`
+    # ulp even at the domain edge -- at the cost of a narrower `TRIG_LIMIT`
+    # (about 804 instead of 6434).
+    trailing = 20 if not single else 9
     keep = (53 - trailing) if not single else (24 - trailing)
     pio2 = []
     rest = mpi / 2
@@ -344,6 +404,27 @@ def build(single: bool) -> str:
     w("/// `log2(e)`, for the exponent reduction.")
     w(f"pub const LOG2E: {ty} = {rust_lit(1 / M.log(2), single)};")
     w("")
+    if not single:
+        # The residues are far below the working precision, so they only
+        # matter to a kernel that carries its products in double-double --
+        # `Fast` `pow`'s logarithm. Each is rounded once from the 200-bit
+        # difference.
+        log2e_lo = 1 / M.log(2) - mpf(float(1 / M.log(2)))
+        w("/// The residue of [`LOG2E`]: `log2(e) - LOG2E`, rounded once, so that")
+        w("/// `LOG2E + LOG2E_LO` is `log2(e)` to roughly twice the working")
+        w("/// precision.")
+        w(f"pub const LOG2E_LO: {ty} = {rust_lit(log2e_lo, single)};")
+        w("")
+        third = 1 / (3 * M.log(2))
+        third_lo = third - mpf(float(third))
+        w("/// `log2(e)/3` and its residue, the scale of the `s^3` term of the")
+        w("/// base-2 logarithm's `atanh` series, split like [`LOG2E`] /")
+        w("/// [`LOG2E_LO`] and for the same caller.")
+        w(f"pub const THIRD_LOG2E: {ty} = {rust_lit(third, single)};")
+        w("")
+        w("/// See [`THIRD_LOG2E`].")
+        w(f"pub const THIRD_LOG2E_LO: {ty} = {rust_lit(third_lo, single)};")
+        w("")
 
     # Stirling's series for `lgamma`, used above the cutoff below. The terms
     # are `B(2n) / (2n (2n-1))`, exact rationals, so they are computed rather

@@ -41,7 +41,9 @@ pub mod asin {
         dispatch::<V, A, D>(x, reference::asin, fast, |x| outside(x, 1.0))
     }
 
-    /// Measured error: below 2 ulp over `|x| < 1`.
+    /// Measured error: at most 3 ulp over `|x| < 1`, stably at the fold
+    /// boundary below rather than growing with the sample count (checked to
+    /// 100M samples in `tests/ulp_scan.rs`); asserted at 4.
     #[inline(always)]
     fn fast<V: Simd<Elem = f64>>(x: V) -> V {
         let a = x.abs();
@@ -68,7 +70,8 @@ pub mod acos {
         dispatch::<V, A, D>(x, reference::acos, fast, |x| outside(x, 1.0))
     }
 
-    /// Measured error: below 2 ulp over `|x| < 1`.
+    /// Measured error: at most 2 ulp over `|x| < 1` (checked to 100M samples
+    /// in `tests/ulp_scan.rs`); asserted at 4.
     ///
     /// Not written as `pi/2 - asin(x)`: near `x = 1`, `acos` is small and that
     /// subtraction cancels, losing exactly the digits the caller wanted. The

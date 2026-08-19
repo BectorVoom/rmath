@@ -117,8 +117,10 @@ math_fn! {
 math_fn! {
     /// Cube root.
     ///
-    /// The accuracy axis is accepted but has no effect; see
-    /// [`crate::kernels::double::cbrt`].
+    /// For `f64` the accuracy axis is accepted but has no effect; see
+    /// [`crate::kernels::double::cbrt`]. For `f32`, `Fast` runs a native
+    /// seed-plus-Newton kernel measured within 1 ulp; see
+    /// [`crate::kernels::single::cbrt`].
     name: Cbrt,
     builder: CbrtBuilder,
     free: cbrt,

@@ -67,14 +67,47 @@ fn bit_exact<V: Simd<Elem = f32>>(x: V) -> V {
     V::narrow(y.mul_add(r2, p))
 }
 
-/// The `Fast` path is the ported one.
+/// The table-free path.
 ///
-/// Unusually, there is nothing to trade here. The port is already a
-/// double-precision table lookup and a degree-4 polynomial over widened lanes,
-/// and the table-free alternative — widening further into the double-precision
-/// `Fast` logarithm — measured *slower* as well as less accurate. So `Fast`
-/// runs the bit-exact schedule, and is bit-exact as a side effect.
+/// The same reduction as [`super::ln`]'s `Fast` path — split off the exponent,
+/// fold the mantissa about `sqrt(2)`, take `s = (m - 1)/(m + 1)` — but the
+/// series carries the base-2 scale inside its generated coefficients, and the
+/// exponent needs no `ln 2` multiply at all: `log2(x) = e + s P(s²)`, with `e`
+/// exact and the final add fused. All single precision, no widening and no
+/// gather.
+///
+/// Measured error: below 2 ulp over the positive normals.
 #[inline(always)]
 fn fast<V: Simd<Elem = f32>>(x: V) -> V {
-    bit_exact(x)
+    /// `sqrt(2)`, the point the mantissa is folded about.
+    const SQRT2: f32 = core::f32::consts::SQRT_2;
+    use crate::tables::single::poly::LOG2_ATANH as P;
+
+    let ix = x.to_bits();
+    let mut mant = V::Bits::filled_default();
+    let mut es = V::Floats::filled_default();
+    for i in 0..V::LANES {
+        let b = ix.as_slice()[i];
+        // Fold the mantissa into [sqrt(1/2), sqrt(2)) by borrowing a power of
+        // two, which keeps `s` small enough for a short series.
+        let e = ((b >> 23) & 0xff) as i32 - 127;
+        let m = (b & 0x007f_ffff) | 0x3f80_0000;
+        let (m, e) = if f32::from_bits(m) < SQRT2 {
+            (m, e)
+        } else {
+            (m - (1 << 23), e + 1)
+        };
+        mant.as_mut_slice()[i] = m;
+        es.as_mut_slice()[i] = e as f32;
+    }
+    let m = V::from_bits(mant);
+    let e = V::from_array(es);
+
+    let s = (m - V::splat(1.0)) / (m + V::splat(1.0));
+    let s2 = s * s;
+    let s4 = s2 * s2;
+    let lo = s2.mul_add(V::splat(P[1]), V::splat(P[0]));
+    let hi = s2.mul_add(V::splat(P[3]), V::splat(P[2]));
+    let poly = s4.mul_add(hi, lo);
+    s.mul_add(poly, e)
 }

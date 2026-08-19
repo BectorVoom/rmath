@@ -7,7 +7,9 @@
 //!   takes a degree-13 series, evaluated by Estrin's scheme to keep the
 //!   dependency chain short. The point is not fewer operations — it is more
 //!   arithmetic and *no gather*, and the gather is the part that does not
-//!   vectorise.
+//!   vectorise. The series carries no leading 1 — see `fast` below — so the
+//!   final combine with `scale` is one true FMA rather than a separate
+//!   rounding.
 //!
 //! `Finite` means `|x| < 512`. Outside that, results are wrong, not merely
 //! imprecise; note that `exp` overflows at 709.78, so the safe range is set
@@ -105,6 +107,12 @@ const F: [f64; 12] = [
 ];
 
 /// The table-free path.
+///
+/// The series is evaluated *without* its leading 1 — `poly` below is
+/// `e^r - 1`, not `e^r` — for the same reason as [`super::exp2`]'s fast path:
+/// it lets the final combine with `scale` be one true FMA,
+/// `scale.mul_add(poly, scale)`, instead of rounding `1 + poly` and then
+/// rounding `scale * (that)` separately.
 #[inline(always)]
 fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(t::SHIFT);
@@ -120,7 +128,6 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let r4 = r2 * r2;
     let r8 = r4 * r4;
 
-    let c01 = V::splat(1.0) + r; // c0 = c1 = 1
     let c23 = r.mul_add(V::splat(F[1]), V::splat(F[0]));
     let c45 = r.mul_add(V::splat(F[3]), V::splat(F[2]));
     let c67 = r.mul_add(V::splat(F[5]), V::splat(F[4]));
@@ -128,12 +135,12 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let cab = r.mul_add(V::splat(F[9]), V::splat(F[8]));
     let ccd = r.mul_add(V::splat(F[11]), V::splat(F[10]));
 
-    let lo = r2.mul_add(c23, c01);
+    let lo = r2.mul_add(c23, r); // r itself is the degree-1 term (c0 = c1 = 1)
     let mid = r2.mul_add(c67, c45);
     let hi = r2.mul_add(cab, c89);
     let lo = r4.mul_add(mid, lo);
     let hi = r4.mul_add(ccd, hi);
-    let p = r8.mul_add(hi, lo);
+    let poly = r8.mul_add(hi, lo);
 
     // 2^kd, built straight into the exponent field. Pure integer arithmetic,
     // no memory: this is what the table path cannot do.
@@ -144,5 +151,6 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
         let k = (ki.as_slice()[i] & 0x000f_ffff_ffff_ffff).wrapping_sub(1u64 << 51);
         scale_bits.as_mut_slice()[i] = k.wrapping_add(1023) << 52;
     }
-    V::from_bits(scale_bits) * p
+    let scale = V::from_bits(scale_bits);
+    scale.mul_add(poly, scale)
 }

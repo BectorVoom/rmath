@@ -14,8 +14,11 @@
 //! for the exponential's.
 //!
 //! Under `Fast` there is no table at all — the point of that policy is to
-//! avoid the gather — and the price is the accuracy this function is most
-//! sensitive to.
+//! avoid the gather — but the double-double discipline stays, because this is
+//! the function most sensitive to losing it: the table-free logarithm carries
+//! its division residue, its scale constants and its first two series terms
+//! exactly (`log2_dd` below), which is what keeps the amplified error within
+//! a few ulp instead of a few dozen.
 
 use crate::kernels::double::exp2;
 use crate::kernels::{dispatch2, log_poly, log_split, not_normal, not_positive_normal};
@@ -89,8 +92,12 @@ fn bit_exact<V: Simd<Elem = f64>>(x: V, y: V) -> (V, V::Mask) {
 }
 
 /// `log(x)` to more than double precision, as an unevaluated `hi + lo`.
+///
+/// `pub(crate)` for the same reason as [`pow_exp`]: `tgamma`'s Stirling path
+/// needs `ln(z)` to the same precision this table gives `pow`, not the
+/// single rounded `f64` a plain `ln` call would hand back.
 #[inline(always)]
-fn pow_log<V: Simd<Elem = f64>>(x: V) -> (V, V) {
+pub(crate) fn pow_log<V: Simd<Elem = f64>>(x: V) -> (V, V) {
     let ix = x.to_bits();
 
     let mut invc_a = V::Floats::filled_default();
@@ -191,18 +198,84 @@ fn log2_extended<V: Simd<Elem = f64>>(x: V) -> (V, V) {
     (hi, (e - hi) + lm)
 }
 
-/// Measured error: below 16 ulp for `|y log2 x| < 32`, below 40 ulp over the
-/// whole vector domain.
+/// `log2(x)` as an unevaluated `hi + lo`, without a table, accurate to
+/// roughly twice the working precision — the error of *computing* it, not
+/// just of representing it, pushed below `2^-53` of the logarithm.
 ///
-/// Looser than every other kernel here, and structurally so: `y` multiplies
-/// the error in `log2 x` as well as its value. The pair below removes the
-/// error of *representing* the logarithm but not of computing it, so the
-/// residue grows with `|y log2 x|`. Closing that is exactly what the
-/// `BitExact` path's table does — at the cost of the gather this policy exists
-/// to avoid.
+/// What [`log2_extended`] leaves on the table, in the order it matters:
+/// the division `s = (m-1)/(m+1)` rounds, the multiply by `log2(e)` rounds,
+/// and the polynomial's first terms are far larger than the accuracy wanted
+/// of the whole result. Each is carried exactly here: the division's residue
+/// is recomputed with an FMA (`slo`), the scale is `LOG2E + LOG2E_LO`, and
+/// the series' first two terms — `2s` and `2s³/3`, everything down to one
+/// part in five thousand of the logarithm — are split off into double-double
+/// products, so the single-rounded polynomial ([`p::ATANH_TAIL`]) only ever
+/// computes the `s⁵` tail. `Fast` `pow` is the one caller that needs this —
+/// `y` multiplies the error in `log2 x` along with its value, so every term
+/// here comes back multiplied by up to `|y ln m| ~ 700`.
+#[inline(always)]
+fn log2_dd<V: Simd<Elem = f64>>(x: V) -> (V, V) {
+    let (e, m) = crate::kernels::log_split_m(x);
+    let one = V::splat(1.0);
+    let chi = V::splat(p::LOG2E);
+
+    let u = m - one; // exact: m is within [1/sqrt2, sqrt2)
+    let d = m + one; // rounds; the residue is recovered below
+    // Fast2Sum with the larger operand first, chosen branch-free per lane.
+    let dlo = V::select(m.ge_mask(one), (m - d) + one, (one - d) + m);
+    let s = u / d;
+    // The division's residue: s_true = s + slo to second order.
+    let slo = ((-s).mul_add(d, u) - s * dlo) / d;
+
+    // Leading term 2 s log2(e) in double-double; 2s is exact.
+    let t = s + s;
+    let ph = t * chi;
+    let pl = t.mul_add(chi, -ph) + (slo + slo).mul_add(chi, t * V::splat(p::LOG2E_LO));
+
+    // The s³ term, also in double-double — including the cube itself. This is
+    // not gilding: `2s³/3` is one percent of the result, so rounding `s²` and
+    // the product even once each leaves a few units in `2^-53` of the
+    // logarithm, and those were the largest residue this function had left.
+    let s2 = s * s;
+    let s2l = s.mul_add(s, -s2) + (slo + slo) * s;
+    let g = t * s2;
+    let gl = t.mul_add(s2, -g) + t * s2l;
+    let c3 = V::splat(p::THIRD_LOG2E);
+    let qh = g * c3;
+    let ql = g.mul_add(c3, -qh) + gl.mul_add(c3, g * V::splat(p::THIRD_LOG2E_LO));
+
+    // What remains of the series starts at s⁵ — at most `s⁴/5 ~ 2e-4` of the
+    // result, so its three roundings cost under 0.001 ulp of it.
+    let rest = (g * s2) * (crate::kernels::horner(s2, &p::ATANH_TAIL) * chi);
+
+    // Chained Fast2Sums, each with its precondition met: `|qh| <= 0.01 |ph|`,
+    // `|rest| <= 2e-4 |v1|`, then `e` an integer against `|v| < 1/2`. The
+    // tail terms must land in `hi`, not `lo` — the caller treats `lo` as a
+    // first-order correction, so it has to stay at rounding scale.
+    let v1 = ph + qh;
+    let r1 = (ph - v1) + qh;
+    let v = v1 + rest;
+    let r2 = (v1 - v) + rest;
+    let vlo = (r1 + r2) + (pl + ql);
+    let hi = e + v;
+    (hi, ((e - hi) + v) + vlo)
+}
+
+/// Measured error: at most 4 ulp over every corpus in `tests/accuracy.rs`,
+/// including one pinned near the `|y log2 x| < 1020` edge of the vector
+/// domain; the asserted bound is 8.
+///
+/// The structural hazard here is that `y` multiplies the error in `log2 x`
+/// along with its value, which is why the logarithm comes from [`log2_dd`]:
+/// with the error of computing it below `2^-53` of the logarithm itself, the
+/// amplified contribution stays under an ulp of the result even at the domain
+/// edge, and what dominates is the `Fast` exponential's own bound. The extra
+/// division and handful of FMAs cost about a tenth of this kernel's speedup
+/// against [`log2_extended`]; before them it measured 40 ulp, the loosest in
+/// the crate.
 #[inline(always)]
 fn fast<V: Simd<Elem = f64>>(x: V, y: V) -> V {
-    let (lhi, llo) = log2_extended(x);
+    let (lhi, llo) = log2_dd(x);
 
     let ph = y * lhi;
     let pl = y.mul_add(lhi, -ph) + y * llo;

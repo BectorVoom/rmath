@@ -78,7 +78,9 @@ fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
 ///
 /// The same shape as [`crate::kernels::double::exp`]'s: reduce to an integer
 /// power of two plus a small remainder, then a degree-13 series by Estrin, so
-/// the dependency chain is six levels deep rather than thirteen.
+/// the dependency chain is six levels deep rather than thirteen. As there,
+/// the series carries no leading 1 — `poly` is `10^r - 1` — so the final
+/// combine with `scale` is one true FMA rather than a separate rounding.
 #[inline(always)]
 fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let shift = V::splat(et::SHIFT);
@@ -95,7 +97,7 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let r4 = r2 * r2;
     let r8 = r4 * r4;
 
-    let c01 = r.mul_add(V::splat(g[0]), V::splat(1.0));
+    let c1 = r * V::splat(g[0]);
     let c23 = r.mul_add(V::splat(g[2]), V::splat(g[1]));
     let c45 = r.mul_add(V::splat(g[4]), V::splat(g[3]));
     let c67 = r.mul_add(V::splat(g[6]), V::splat(g[5]));
@@ -103,12 +105,12 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     let cab = r.mul_add(V::splat(g[10]), V::splat(g[9]));
     let ccd = r.mul_add(V::splat(g[12]), V::splat(g[11]));
 
-    let lo = r2.mul_add(c23, c01);
+    let lo = r2.mul_add(c23, c1);
     let mid = r2.mul_add(c67, c45);
     let hi = r2.mul_add(cab, c89);
     let lo = r4.mul_add(mid, lo);
     let hi = r4.mul_add(ccd, hi);
-    let p = r8.mul_add(hi, lo);
+    let poly = r8.mul_add(hi, lo);
 
     let ki = kd_s.to_bits();
     let mut scale_bits = V::Bits::filled_default();
@@ -116,5 +118,6 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
         let k = (ki.as_slice()[i] & 0x000f_ffff_ffff_ffff).wrapping_sub(1u64 << 51);
         scale_bits.as_mut_slice()[i] = k.wrapping_add(1023) << 52;
     }
-    V::from_bits(scale_bits) * p
+    let scale = V::from_bits(scale_bits);
+    scale.mul_add(poly, scale)
 }

@@ -75,6 +75,19 @@ pub const EXPM1: [f32; 7] = [
     f32::from_bits(0x39500ce3), // +1.98412263858559293e-04
 ];
 
+/// `tanh(x)/x` as a polynomial in `x^2`, on `|x| <= 1`.
+///
+/// Maximum relative error of the polynomial alone: 4.977e-08
+pub const TANH: [f32; 7] = [
+    f32::from_bits(0x3f7fffff), // +9.99999950248699365e-01
+    f32::from_bits(0xbeaaaa05), // -3.33328391196682228e-01
+    f32::from_bits(0x3e087339), // +1.33252036131358748e-01
+    f32::from_bits(0xbd5af5bd), // -5.34570096779486484e-02
+    f32::from_bits(0x3ca63718), // +2.02899420508130361e-02
+    f32::from_bits(0xbbcb456e), // -6.20334482333381732e-03
+    f32::from_bits(0x3a887289), // +1.04101111315830380e-03
+];
+
 /// `atanh(s)/s` as a polynomial in `s^2`, on `|s| <= (sqrt2-1)/(sqrt2+1)`.
 ///
 /// Maximum relative error of the polynomial alone: 7.473e-10
@@ -83,6 +96,17 @@ pub const ATANH: [f32; 4] = [
     f32::from_bits(0x3eaaaac5), // +3.33334126312691881e-01
     f32::from_bits(0x3e4caa65), // +1.99868757030028432e-01
     f32::from_bits(0x3e195cf0), // +1.49768596366803036e-01
+];
+
+/// `2 log2(e) atanh(s)/s` as a polynomial in `s^2`, on the interval
+/// of [`ATANH`], so that `log2(m) = s * P(s^2)`.
+///
+/// Maximum relative error of the polynomial alone: 7.473e-10
+pub const LOG2_ATANH: [f32; 4] = [
+    f32::from_bits(0x4038aa3b), // +2.88539007962304250e+00
+    f32::from_bits(0x3f763875), // +9.61798981980751866e-01
+    f32::from_bits(0x3f13a291), // +5.76699329191726284e-01
+    f32::from_bits(0x3edd4190), // +4.32140822518575163e-01
 ];
 
 /// `lgamma(1 + t) / (t(t - 1))` on `t` in `[0, 1]`.
@@ -120,16 +144,16 @@ pub const GAMMA: [f32; 11] = [
     f32::from_bits(0x3c89d334), // +1.68243426043282740e-02
 ];
 
-/// `pi/2`, split so that `n * PIO2[i]` is exact for `|n| < 2^12`.
+/// `pi/2`, split so that `n * PIO2[i]` is exact for `|n| < 2^9`.
 ///
 /// Each part carries only its leading significand bits, with the low
-/// 12 cleared; together they give `pi/2` to about 36 bits, which
+/// 9 cleared; together they give `pi/2` to about 45 bits, which
 /// is what keeps the reduced argument accurate when the quadrant count
 /// is large.
 pub const PIO2: [f32; 3] = [
-    f32::from_bits(0x3fc90000), // +1.57031250000000000e+00
-    f32::from_bits(0x39fda000), // +4.83751296997070312e-04
-    f32::from_bits(0x33a22000), // +7.54953362047672272e-08
+    f32::from_bits(0x3fc90e00), // +1.57073974609375000e+00
+    f32::from_bits(0x386d5000), // +5.65797090530395508e-05
+    f32::from_bits(0x30885a00), // +9.92088189377682284e-10
 ];
 
 /// `2/pi`, for choosing the quadrant.
@@ -140,13 +164,13 @@ pub const TWO_OVER_PI: f32 = f32::from_bits(0x3f22f983);
 /// Beyond it the quadrant count exceeds what the split can multiply
 /// exactly, so the kernels hand those lanes to the scalar reference
 /// under `FullRange` -- and are simply wrong under `Finite`.
-pub const TRIG_LIMIT: f32 = f32::from_bits(0x45c90fdb);
+pub const TRIG_LIMIT: f32 = f32::from_bits(0x44490fdb);
 
 /// `ln(2)`, split so that `k * LN2[i]` is exact for any `k` a reduction
 /// to `|r| <= ln(2)/2` can produce.
 pub const LN2: [f32; 2] = [
-    f32::from_bits(0x3f317000), // +6.93115234375000000e-01
-    f32::from_bits(0x3805f000), // +3.19331884384155273e-05
+    f32::from_bits(0x3f317200), // +6.93145751953125000e-01
+    f32::from_bits(0x35bfbe00), // +1.42859062179923058e-06
 ];
 
 /// `log2(e)`, for the exponent reduction.

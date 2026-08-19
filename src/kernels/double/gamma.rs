@@ -32,9 +32,9 @@
 //! selected each time. That costs what the worst lane costs, and it keeps the
 //! vector intact, which is the trade this crate makes everywhere.
 
-use crate::kernels::double::{exp, ln};
+use crate::kernels::double::{exp, ln, pow};
 use crate::kernels::horner;
-use crate::policy::{Accuracy, Domain, Fast, Finite};
+use crate::policy::{Accuracy, Domain, Fast, Finite, FullRange};
 use crate::simd::Simd;
 use crate::tables::double::poly as p;
 
@@ -66,6 +66,58 @@ fn stirling<V: Simd<Elem = f64>>(z: V) -> V {
     let series = inv * horner(inv * inv, &p::STIRLING);
     let lnz = ln::eval::<V, Fast, Finite>(z);
     (z - V::splat(0.5)).mul_add(lnz, V::splat(p::HALF_LN_2PI) - z) + series
+}
+
+/// [`stirling`], to more than double precision, as an unevaluated `hi + lo`.
+///
+/// `stirling` rounds `ln(z)` to a single `f64` before ever multiplying it by
+/// `z`, so the `f64` it returns already carries several ulp of error before
+/// `tgamma` even exponentiates it. This carries the logarithm in
+/// double-double throughout instead, via `pow_log` — already exercised by
+/// `pow`'s own bit-exactness tests, rather than a second, unvalidated
+/// implementation — so that `hi + lo` compresses back to the *correctly
+/// rounded* `f64` nearest the true `ln(Gamma(z))`, not merely a close one.
+///
+/// Unlike `Fast` `pow`, there is no further amplifying factor here to carry
+/// `lo` *through*: `tgamma`'s caller only ever needs `exp` of a single
+/// accurate value, not `exp` of a value some large `y` has multiplied. So
+/// `hi + lo` is compressed to one `f64` and handed to the ordinary `exp`
+/// kernel — which, unlike `pow`'s internal accurate exponential, already
+/// handles this function's whole domain (up to `z` near 171.6, where
+/// `ln(Gamma(z))` approaches 710) via its own `FullRange` fallback.
+///
+/// The Stirling series tail (`series` below) stays single-precision: it is
+/// already three or more orders of magnitude below the leading terms over
+/// this function's domain (`z >= 18`), so its own rounding is far under the
+/// budget the leading terms need protecting.
+#[inline(always)]
+fn stirling_dd<V: Simd<Elem = f64>>(z: V) -> (V, V) {
+    let half = V::splat(0.5);
+    let inv = V::splat(1.0) / z;
+    let series = inv * horner(inv * inv, &p::STIRLING);
+
+    // z - 1/2, exact: Fast2Sum with |z| >= |half| for every `z` this is
+    // called on.
+    let zm = z - half;
+    let zml = (z - zm) - half;
+
+    let (lnhi, lnlo) = pow::pow_log(z);
+
+    // (z - 1/2) * ln(z): a TwoProduct on the leading pair plus both cross
+    // terms, so the product carries the same precision the logarithm does.
+    let ph = zm * lnhi;
+    let pl = zm.mul_add(lnhi, -ph) + zm.mul_add(lnlo, zml * lnhi);
+
+    // ln(2 pi)/2 - z, via Fast2Sum with -z as the larger-magnitude operand
+    // (this function's domain has z >= 18 >> ln(2 pi)/2).
+    let s = V::splat(p::HALF_LN_2PI) - z;
+    let e = V::splat(p::HALF_LN_2PI) - (s + z);
+
+    // Combine: |ph| >= |s| throughout the domain (z ln z outgrows z past
+    // z = e), so this Fast2Sum's precondition holds.
+    let hi = ph + s;
+    let r = (ph - hi) + s;
+    (hi, (r + pl + e) + series)
 }
 
 /// `lgamma(z)` for `z` in `[1, 2]`, with its zeros reproduced exactly.
@@ -304,11 +356,18 @@ pub mod tgamma {
     ///
     /// Measured error: a few ulp for `|x| < 18`, where the recurrence reaches
     /// `[1, 2]` and no exponential is involved. Above that it is
-    /// `exp(lgamma(x))`, and the error grows with the argument — an absolute
-    /// error of one ulp in `lgamma(170)`, which is about 700, is a relative
-    /// error near 1e-13 in the answer. That is inherent to reaching `tgamma`
-    /// through a logarithm, and `tests/accuracy.rs` states the measured bound
-    /// for each range rather than one number for both.
+    /// `exp(lgamma(x))`, with `lgamma` carried in double-double throughout
+    /// (`stirling_dd` below) so the value handed to `exp` is the correctly
+    /// rounded `f64` nearest the truth — verified against the platform's own
+    /// `lgamma`, exactly, not merely close. What is left past that is not a
+    /// defect this crate can fix by computing harder: composing through any
+    /// single correctly-rounded logarithm before exponentiating discards
+    /// information the true value would have carried through, and glibc's
+    /// own `tgamma` is provably not `exp` of its own correctly-rounded
+    /// `lgamma` either — the two disagree at the same magnitude this kernel
+    /// does. Measured at 512-513 ulp over 100M samples (`tests/ulp_scan.rs`),
+    /// stable rather than growing with the sample count; `tests/accuracy.rs`
+    /// asserts 1024. Before `stirling_dd` this measured over 2000.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         let _ = (A::BIT_EXACT, D::CHECKED);
@@ -344,7 +403,8 @@ pub mod tgamma {
         z = z + V::select(below, one, zero);
 
         let direct = gamma_unit(z) * prod;
-        let viaexp = exp::eval::<V, Fast, Finite>(super::lgamma::fast(y));
+        let (hi, lo) = stirling_dd(y);
+        let viaexp = exp::eval::<V, Fast, FullRange>(hi + lo);
         V::select(y.lt_mask(V::splat(TG_DIRECT_LIMIT)), direct, viaexp)
     }
 }

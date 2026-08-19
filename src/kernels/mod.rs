@@ -140,15 +140,13 @@ pub(crate) fn pow2<V: Simd>(k: V) -> V {
     V::from_bits(bits)
 }
 
-/// Split `x` into `(e, s)` with `x = 2^e * m`, `m` in `[1/sqrt2, sqrt2)` and
-/// `s = (m - 1) / (m + 1)`.
+/// Split `x` into `(e, m)` with `x = 2^e * m` and `m` in `[1/sqrt2, sqrt2)`.
 ///
-/// The reduction every `Fast` logarithm shares: `ln(m) = 2 atanh(s)`, and
-/// folding the significand about `sqrt2` is what keeps `|s|` below 0.1716 so
-/// one short polynomial covers it. Only the exponent surgery is per-lane; the
-/// division and everything after is whole-vector.
+/// The per-lane half of [`log_split`], on its own for the one caller — `Fast`
+/// `pow` — that needs the folded significand itself, to correct the rounding
+/// of `s = (m - 1) / (m + 1)` that every other logarithm can afford to ignore.
 #[inline(always)]
-pub(crate) fn log_split<V: Simd<Elem = f64>>(x: V) -> (V, V) {
+pub(crate) fn log_split_m<V: Simd<Elem = f64>>(x: V) -> (V, V) {
     use crate::simd::Lanes;
     let ix = x.to_bits();
     let mut mant = V::Bits::filled_default();
@@ -167,9 +165,21 @@ pub(crate) fn log_split<V: Simd<Elem = f64>>(x: V) -> (V, V) {
         mant.as_mut_slice()[i] = m;
         es.as_mut_slice()[i] = e as f64;
     }
-    let m = V::from_bits(mant);
+    (V::from_array(es), V::from_bits(mant))
+}
+
+/// Split `x` into `(e, s)` with `x = 2^e * m`, `m` in `[1/sqrt2, sqrt2)` and
+/// `s = (m - 1) / (m + 1)`.
+///
+/// The reduction every `Fast` logarithm shares: `ln(m) = 2 atanh(s)`, and
+/// folding the significand about `sqrt2` is what keeps `|s|` below 0.1716 so
+/// one short polynomial covers it. Only the exponent surgery is per-lane; the
+/// division and everything after is whole-vector.
+#[inline(always)]
+pub(crate) fn log_split<V: Simd<Elem = f64>>(x: V) -> (V, V) {
+    let (e, m) = log_split_m(x);
     let one = V::splat(1.0);
-    (V::from_array(es), (m - one) / (m + one))
+    (e, (m - one) / (m + one))
 }
 
 /// `ln(m)` from the `s` of [`log_split`].

@@ -12,7 +12,12 @@
 //!
 //! * **Delegating** — everything else. `BitExact` evaluates the platform's own
 //!   `f32` routine lane by lane; `Fast` widens and takes the double-precision
-//!   vector path, which is where the speed is.
+//!   vector path, which is where the speed is. Three exceptions: [`cbrt`],
+//!   [`tanh`] and [`trig`]'s `Fast` paths are native rather than widened —
+//!   `cbrt` and `tanh` because widening measured slower than the scalar call
+//!   it would replace, `trig` because the reduction and polynomials have no
+//!   per-lane work to begin with, so widening would cost a round trip for
+//!   nothing the native path needs.
 //!
 //! # Why not compute everything in double and round once
 //!
@@ -65,29 +70,6 @@ macro_rules! via_double_raw {
     };
 }
 
-/// A kernel that delegates under *both* policies.
-///
-/// For the functions where the widened `f64` route is slower than the `f32`
-/// routine it would replace, so there is no vector path worth offering. The
-/// accuracy axis is accepted and has no effect, as it does for
-/// [`crate::kernels::double::cbrt`].
-macro_rules! delegating_only {
-    ($(#[$doc:meta])* $name:ident, $reference:path) => {
-        $(#[$doc])*
-        pub mod $name {
-            use $crate::policy::{Accuracy, Domain};
-            use $crate::simd::{Simd, map_lanes};
-
-            #[doc = concat!("`", stringify!($name), "(x)` for a vector of `f32` lanes.")]
-            #[inline(always)]
-            pub fn eval<V: Simd<Elem = f32>, A: Accuracy, D: Domain>(x: V) -> V {
-                let _ = (A::BIT_EXACT, D::CHECKED);
-                map_lanes(x, $reference)
-            }
-        }
-    };
-}
-
 /// A kernel whose bit-exact path is the scalar reference, lane by lane.
 ///
 /// For the functions where the platform's `float` routine is neither correctly
@@ -133,6 +115,7 @@ macro_rules! delegating2 {
 }
 
 pub mod bessel;
+pub mod cbrt;
 pub mod erf;
 pub mod erfc;
 pub mod exp;
@@ -140,20 +123,8 @@ pub mod exp10;
 pub mod exp2;
 pub mod ln;
 pub mod log2;
-
-delegating_only! {
-    /// Cube root.
-    ///
-    /// Both policies delegate. The double-precision `cbrt` kernel is an
-    /// expensive one — two Newton steps with a double-double residual — and
-    /// widening `f32` lanes into it measured at half the speed of the
-    /// platform's `cbrtf`, so there is no configuration here worth offering
-    /// over the call it would replace. A native single-precision approximation
-    /// would be a real `Fast` path; there is not one yet.
-    cbrt, crate::reference::single::cbrt
-}
-delegating! { /// Tangent.
-tan, crate::reference::single::tan, double::trig::tan }
+pub mod tanh;
+pub mod trig;
 delegating! { /// Arc sine.
 asin, crate::reference::single::asin, double::invtrig::asin }
 delegating! { /// Arc cosine.
@@ -164,8 +135,6 @@ delegating! { /// Hyperbolic sine.
 sinh, crate::reference::single::sinh, double::hyper::sinh }
 delegating! { /// Hyperbolic cosine.
 cosh, crate::reference::single::cosh, double::hyper::cosh }
-delegating! { /// Hyperbolic tangent.
-tanh, crate::reference::single::tanh, double::hyper::tanh }
 delegating! { /// Inverse hyperbolic sine.
 asinh, crate::reference::single::asinh, double::hyper::asinh }
 delegating! { /// Inverse hyperbolic cosine.
@@ -207,28 +176,10 @@ atan2, crate::reference::single::atan2, double::invtrig::atan2 }
 delegating2! { /// `sqrt(x^2 + y^2)`.
 hypot, crate::reference::single::hypot, double::hypot }
 
-delegating! { /// Sine. `sinf` is not correctly rounded on this platform.
-sin, crate::reference::single::sin, double::trig::sin }
-delegating! { /// Cosine. `cosf` is not correctly rounded on this platform.
-cos, crate::reference::single::cos, double::trig::cos }
 delegating2! { /// `x^y`.
 pow, crate::reference::single::pow, double::pow }
 
-/// Sine and cosine of the same argument.
-pub mod sincos {
-    use crate::policy::{Accuracy, Domain};
-    use crate::simd::{Simd, map_lanes_pair};
-
-    /// `(sin(x), cos(x))` for a vector of `f32` lanes.
-    #[inline(always)]
-    pub fn eval<V: Simd<Elem = f32>, A: Accuracy, D: Domain>(x: V) -> (V, V) {
-        if A::BIT_EXACT {
-            return map_lanes_pair(x, crate::reference::single::sincos);
-        }
-        let (s, c) = crate::kernels::double::trig::sincos::eval::<V::Wide, A, D>(x.widen());
-        (V::narrow(s), V::narrow(c))
-    }
-}
+pub use trig::{cos, sin, sincos, tan};
 
 /// `2^(k/32)` per lane, gathered from the shared 32-entry table.
 ///

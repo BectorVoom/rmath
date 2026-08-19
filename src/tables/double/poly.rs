@@ -116,6 +116,21 @@ pub const ATANH: [f64; 9] = [
     f64::from_bits(0x3fb10486a28a5703), // +6.64753100230335708e-02
 ];
 
+/// `(atanh(s)/s - 1 - s^2/3) / s^4` as a polynomial in `s^2`, on the
+/// interval of [`ATANH`]: the series without its first two terms, for
+/// a caller that carries both of them in double-double.
+///
+/// Maximum relative error of the polynomial alone: 7.805e-16
+pub const ATANH_TAIL: [f64; 7] = [
+    f64::from_bits(0x3fc999999999999f), // +2.00000000000000150e-01
+    f64::from_bits(0x3fc249249248dcf4), // +1.42857142856633978e-01
+    f64::from_bits(0x3fbc71c71d9b56ad), // +1.11111111381741082e-01
+    f64::from_bits(0x3fb745d08cdb4236), // +9.09090370071304610e-02
+    f64::from_bits(0x3fb3b190ab7f7b45), // +7.69281786628939895e-02
+    f64::from_bits(0x3fb100e2e259e907), // +6.64197733512176119e-02
+    f64::from_bits(0x3fb08f8e8ce61159), // +6.46905035010311297e-02
+];
+
 /// `lgamma(1 + t) / (t(t - 1))` on `t` in `[0, 1]`.
 /// The two zeros are factored out, so the kernel reproduces them exactly.
 ///
@@ -210,6 +225,19 @@ pub const LN2: [f64; 2] = [
 
 /// `log2(e)`, for the exponent reduction.
 pub const LOG2E: f64 = f64::from_bits(0x3ff71547652b82fe);
+
+/// The residue of [`LOG2E`]: `log2(e) - LOG2E`, rounded once, so that
+/// `LOG2E + LOG2E_LO` is `log2(e)` to roughly twice the working
+/// precision.
+pub const LOG2E_LO: f64 = f64::from_bits(0x3c7777d0ffda0d24);
+
+/// `log2(e)/3` and its residue, the scale of the `s^3` term of the
+/// base-2 logarithm's `atanh` series, split like [`LOG2E`] /
+/// [`LOG2E_LO`] and for the same caller.
+pub const THIRD_LOG2E: f64 = f64::from_bits(0x3fdec709dc3a03fd);
+
+/// See [`THIRD_LOG2E`].
+pub const THIRD_LOG2E_LO: f64 = f64::from_bits(0x3c7d27f05548af0c);
 
 /// Stirling series coefficients for `lgamma`: `B(2n) / (2n(2n-1))`.
 ///

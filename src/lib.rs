@@ -173,10 +173,13 @@
 //! # Accuracy of `Fast`
 //!
 //! Measured against the platform, asserted in `tests/accuracy.rs`, and
-//! therefore kept honest by the build: most kernels are within 4 ulp, the
-//! inverse trigonometric and inverse hyperbolic ones within 8, and `pow`
-//! within 40 because `y` multiplies the error in `log2 x` as well as its
-//! value. `erf` and `erfc` are the exception in the other direction — their
+//! therefore kept honest by the build: most kernels — including the whole
+//! inverse trigonometric family, `asin` through `atan2` — are within 4 ulp.
+//! `asinh` and `pow` are within 8: `pow` earns its place in that group by
+//! carrying its table-free logarithm in double-double, since `y` multiplies
+//! the error in `log2 x` as well as its value; both measure comfortably
+//! inside it (`pow` at 5 ulp, `asinh` at 4) rather than sitting at the edge.
+//! `erf` and `erfc` are the exception in the other direction — their
 //! `Fast` path is the *same* double-double arithmetic as the bit-exact one
 //! with only the rounding test removed, so it is below 0.51 ulp, which is to
 //! say correctly rounded on all but about one input in thirty thousand. Each
