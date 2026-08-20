@@ -463,6 +463,57 @@ fn corpus_atan2(seed: u64) -> (Vec<f64>, Vec<f64>) {
     (ys, xs)
 }
 
+/// `asin`/`acos`'s bands: the tiny cutoffs (`2^-26` for `asin`, `2^-55` for
+/// `acos`), the Taylor/table boundary (`0.125`), the six `asncs.x` band
+/// thresholds (`0.25`, `0.5`, `0.75`, `0.921875`, `0.953125`, `0.96875`),
+/// and `1.0` — the exact bit patterns `src/reference/double/invtrig.rs` and
+/// `src/kernels/double/invtrig.rs::bit_exact` branch on. The near-1 band gets
+/// dense treatment: it is where the `t24`/`t27` Dekker-split bug lived (see
+/// `ROADMAP.md`'s A4 entry), a 1-ulp error that random sampling would not
+/// reliably find.
+fn corpus_asincos(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3e50_0000_0000_0000), // 2^-26, asin's tiny cutoff
+        f64::from_bits(0x3c88_0000_0000_0000), // 2^-55, acos's tiny cutoff
+        0.125,                                 // Taylor / table boundary
+        0.25,                                  // bands 1a / 1b
+        0.5,                                   // bands 1b / 2
+        0.75,                                  // bands 2 / 3
+        0.921875,                              // bands 3 / 4
+        0.953125,                              // bands 4 / 5
+        0.96875,                               // band 5 / near-1
+        1.0,
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-1.0, 1.0)); // ordinary use
+    }
+    // The near-1 band, dense: within it the answer's ulp is far finer than
+    // the inputs', so a split mistake like the t24/t27 one shows up here or
+    // nowhere.
+    for _ in 0..400_000 {
+        v.push(rng.uniform(0.96875, 1.0));
+        v.push(-rng.uniform(0.96875, 1.0));
+    }
+    // The last 2^28 ulps below 1, where the original 1-ulp gap lived.
+    for _ in 0..200_000 {
+        let b = 0x3ff0_0000_0000_0000 - 1 - rng.next() % (1u64 << 28);
+        v.push(f64::from_bits(b));
+        v.push(f64::from_bits(b | (1u64 << 63)));
+    }
+    for _ in 0..200_000 {
+        v.push(rng.log_uniform(1e-320, 1.0, true)); // tiny-|x| bands
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -625,6 +676,27 @@ fn reference_atan2_matches_platform_libm() {
     assert_reference2("atan2", &ys, &xs, reference::atan2, f64::atan2);
 }
 
+#[test]
+fn reference_asin_matches_platform_libm() {
+    assert_reference(
+        "asin",
+        &corpus_asincos(0x9E37_79B9_7F4A_7C18),
+        reference::asin,
+        f64::asin,
+    );
+}
+
+#[test]
+fn reference_acos_matches_platform_libm() {
+    assert_reference(
+        "acos",
+        &corpus_asincos(0x1234_5678_9ABC_DEF3),
+        reference::acos,
+        f64::acos,
+    );
+}
+
+#[test]
 /// `reference::sincos` must agree with `reference::sin`/`cos` taken
 /// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
 /// are genuinely different computations, so this is not redundant with the
@@ -709,6 +781,18 @@ fn atan2_bit_exact_at_every_width() {
 }
 
 #[test]
+fn asin_bit_exact_at_every_width() {
+    let vals = corpus_asincos(0x0BAD_C0DE_DEAD_BEE1);
+    check_all_widths!("asin", &vals, f64::asin, Asin::new());
+}
+
+#[test]
+fn acos_bit_exact_at_every_width() {
+    let vals = corpus_asincos(0xFEED_FACE_CAFE_B0B1);
+    check_all_widths!("acos", &vals, f64::acos, Acos::new());
+}
+
+#[test]
 fn sin_bit_exact_at_every_width() {
     let vals = corpus_trig(0x0BAD_C0DE_DEAD_C0DE);
     check_all_widths!("sin", &vals, f64::sin, Sin::new());
@@ -720,6 +804,7 @@ fn cos_bit_exact_at_every_width() {
     check_all_widths!("cos", &vals, f64::cos, Cos::new());
 }
 
+#[test]
 /// `sincos` must agree with `sin`/`cos` taken separately at every width — the
 /// pair object cannot go through `check_all_widths!` directly (it returns two
 /// values), so each half is compared through a shim that keeps only that
@@ -791,6 +876,11 @@ fn special_lanes_do_not_leak_into_neighbours() {
         check_all_widths!("exp2/mixed", &lanes, f64::exp2, Exp2::new());
         check_all_widths!("ln/mixed", &lanes, f64::ln, Ln::new());
         check_all_widths!("cbrt/mixed", &lanes, f64::cbrt, Cbrt::new());
+        // For asin/acos, the out-of-domain lanes (|x| > 1) must come out as
+        // the canonical NaN from the vector path itself, without touching
+        // their neighbours or being repaired.
+        check_all_widths!("asin/mixed", &lanes, f64::asin, Asin::new());
+        check_all_widths!("acos/mixed", &lanes, f64::acos, Acos::new());
     }
 }
 

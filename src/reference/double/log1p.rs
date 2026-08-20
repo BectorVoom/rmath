@@ -102,7 +102,11 @@ pub fn log1p(x: f64) -> f64 {
         let uu = 1.0 + x;
         let huw = (uu.to_bits() >> 32) as i32;
         k = (huw >> 20) - 1023;
-        c = if k > 0 { 1.0 - (uu - x) } else { x - (uu - 1.0) };
+        c = if k > 0 {
+            1.0 - (uu - x)
+        } else {
+            x - (uu - 1.0)
+        };
         c /= uu;
         u = uu;
         hu = huw as u32;
@@ -173,6 +177,9 @@ fn log1p_tail(f: f64, hu: u32, k: i32, c: f64) -> f64 {
         // `kf*LN2_HI - (...)` is one fused `vfmsub231sd`; `kf*LN2_LO + c` is
         // one fused `vfmadd231sd`. Both matter: this is the branch that
         // dominates large-`|x|` inputs.
-        kf.mul_add(LN2_HI, -((hfsq - (s * (hfsq + r) + kf.mul_add(LN2_LO, c))) - f))
+        kf.mul_add(
+            LN2_HI,
+            -((hfsq - (s * (hfsq + r) + kf.mul_add(LN2_LO, c))) - f),
+        )
     }
 }

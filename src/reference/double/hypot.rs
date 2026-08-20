@@ -46,10 +46,7 @@ fn kernel(ax: f64, ay: f64) -> f64 {
 /// `hypot(x, y)`, the platform's.
 pub fn hypot(x: f64, y: f64) -> f64 {
     if !x.is_finite() || !y.is_finite() {
-        if (x.is_infinite() || y.is_infinite())
-            && !is_signaling_nan(x)
-            && !is_signaling_nan(y)
-        {
+        if (x.is_infinite() || y.is_infinite()) && !is_signaling_nan(x) && !is_signaling_nan(y) {
             return f64::INFINITY;
         }
         return x + y;

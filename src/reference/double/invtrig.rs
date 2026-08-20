@@ -26,8 +26,8 @@
 
 use crate::kernels::double::dd::{a_mul, two_sum};
 use crate::tables::double::asincos_data as ac;
-use crate::tables::double::atan2_data as at2;
 use crate::tables::double::atan_data as at;
+use crate::tables::double::atan2_data as at2;
 
 /// `2^52`: added to round a small positive double to the nearest integer in
 /// round-to-nearest mode, then subtracted back off. Exact throughout: the
@@ -289,7 +289,11 @@ pub fn atan2(y: f64, x: f64) -> f64 {
     }
 
     if x == 0.0 {
-        return if y.is_sign_positive() { at::HPI } else { at::MHPI };
+        return if y.is_sign_positive() {
+            at::HPI
+        } else {
+            at::MHPI
+        };
     }
 
     if x.is_infinite() {
@@ -317,7 +321,8 @@ pub fn atan2(y: f64, x: f64) -> f64 {
     let mut ax = x.abs();
     let mut ay = y.abs();
     const EP: i64 = 59768832;
-    let de = (((y.to_bits() >> 32) & 0x7ff00000) as i64) - (((x.to_bits() >> 32) & 0x7ff00000) as i64);
+    let de =
+        (((y.to_bits() >> 32) & 0x7ff00000) as i64) - (((x.to_bits() >> 32) & 0x7ff00000) as i64);
     if de >= EP {
         return if y > 0.0 { at::HPI } else { at::MHPI };
     } else if de <= -EP {
@@ -353,7 +358,11 @@ pub fn atan2(y: f64, x: f64) -> f64 {
 
     let z = if x > 0.0 {
         if ay < ax {
-            if u < at::B { atan2_i_taylor(u, du) } else { atan2_i_table(u, du) }
+            if u < at::B {
+                atan2_i_taylor(u, du)
+            } else {
+                atan2_i_table(u, du)
+            }
         } else if u < at::B {
             atan2_ii_taylor(u, du)
         } else {
@@ -397,7 +406,8 @@ pub fn atan2(y: f64, x: f64) -> f64 {
 #[inline(always)]
 fn near_one_root(z: f64) -> f64 {
     let k = z.to_bits() >> 32;
-    let seed = ac::INROOT[((k & 0x001fffff) >> 14) as usize] * ac::POWTWO[(511 - (k >> 21)) as usize];
+    let seed =
+        ac::INROOT[((k & 0x001fffff) >> 14) as usize] * ac::POWTWO[(511 - (k >> 21)) as usize];
     let tt = seed * seed;
     let r = (-tt).mul_add(z, 1.0);
     let poly = r.mul_add(ac::RT3, ac::RT2);
@@ -554,7 +564,11 @@ pub fn acos(x: f64) -> f64 {
         let row = asncs_row(n, degree + 4);
         let xx = x.abs() - row[0];
         let t = acos_table_t(xx, &row[..degree + 4]);
-        let y = if x > 0.0 { ac::HP0 - row[3 + degree] } else { ac::HP0 + row[3 + degree] };
+        let y = if x > 0.0 {
+            ac::HP0 - row[3 + degree]
+        } else {
+            ac::HP0 + row[3 + degree]
+        };
         let t = if x > 0.0 { ac::HP1 - t } else { ac::HP1 + t };
         return y + t;
     }
@@ -581,7 +595,14 @@ pub fn acos(x: f64) -> f64 {
             let res = res1 + cor;
             return res + res;
         } else {
-            let y = (c + ac::T24) - ac::T24;
+            // `y = (t27*c+c)-t27*c` in `e_asin.c` — the *same* Dekker split
+            // the negative arm uses, not `asin`'s `t24` shape. The first
+            // product is one fused FMA (`dla.h`'s `CN` split at `2^27`), the
+            // subtraction is separate. The initial port transcribed `asin`'s
+            // `(c + t24) - t24` here by mistake; the C source never uses
+            // `t24` in `acos` at all. This was the 8-in-3M 1-ulp gap in the
+            // near-1 positive-`x` arm (see `ROADMAP.md`'s A4 entry).
+            let y = ac::T27.mul_add(c, c) - ac::T27 * c;
             let t_plus_y = inner.mul_add(c, y);
             let z_minus_y2 = y.mul_add(-y, z);
             let cc = z_minus_y2 / t_plus_y;

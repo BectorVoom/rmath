@@ -1,15 +1,13 @@
 //! `asin`, `acos`, `atan` and `atan2`.
 //!
-//! `atan` and `atan2` have a genuine vector `BitExact` schedule now (this
-//! module's `bit_exact` submodule — the `sin`/`cos`/`sincos` treatment
-//! `src/kernels/double/trig.rs` got, applied here). `asin`/`acos` do not yet:
-//! they still run one lane at a time through
-//! [`crate::reference::double::invtrig`], which is a genuine port of the IBM
-//! Accurate Portable Math Library routines glibc runs here (schedule read
-//! from a disassembly, verified byte-exact against the platform), not a call
-//! to the platform — so `BitExact` is bit-exact for all four, but only
-//! `atan`/`atan2` are faster than the per-lane call they used to make; see
-//! [`crate::kernels`] and `ROADMAP.md`'s A4 entry. Under `Fast` all four
+//! All four have a genuine vector `BitExact` schedule now — this module's
+//! `bit_exact` submodule, the `sin`/`cos`/`sincos` treatment
+//! `src/kernels/double/trig.rs` got, applied to the whole invtrig family.
+//! Each replays the IBM Accurate Portable Math Library routine glibc runs
+//! here (schedule read from a disassembly, verified byte-exact against the
+//! platform), not a call to the platform — so `BitExact` is bit-exact for all
+//! four, and all four are faster than the per-lane call they used to make;
+//! see [`crate::kernels`] and `ROADMAP.md`'s A4 entry. Under `Fast` all four
 //! share two polynomials and a handful of exact identities, and are entirely
 //! branch-free.
 
@@ -34,13 +32,13 @@ fn asin_core<V: Simd<Elem = f64>>(t: V, s: V) -> V {
     t * horner(s, &p::ASIN)
 }
 
-/// `atan` and `atan2`'s genuine vector replay of `__atan_fma`/
-/// `__ieee754_atan2_fma`, mirroring [`crate::reference::double::invtrig`]
-/// exactly — same bands, same fusions (see that module's doc for the
-/// disassembly this was cross-checked against). `asin`/`acos` are not here
-/// yet: their eight bands share a 2568-entry table and were judged a
-/// separate follow-on rather than rushed alongside these two — see
-/// `ROADMAP.md`'s A4 entry.
+/// The whole family's genuine vector replay of `__atan_fma`/
+/// `__ieee754_atan2_fma`/`__ieee754_asin_fma`/`__ieee754_acos_fma`,
+/// mirroring [`crate::reference::double::invtrig`] exactly — same bands, same
+/// fusions (see that module's doc for the disassembly this was cross-checked
+/// against). `asin`/`acos` landed as the follow-on `ROADMAP.md`'s A4 entry
+/// planned: their eight bands share a 2568-entry table, gathered per lane
+/// below like `atan`'s own `cij` rows.
 ///
 /// Every band below is evaluated for every lane, then blended with
 /// `V::select`, the same whole-vector discipline `trig.rs` uses: `Simd` has
@@ -59,8 +57,9 @@ mod bit_exact {
     use super::*;
     use crate::kernels::double::dd::{a_mul, two_sum};
     use crate::simd::Lanes;
-    use crate::tables::double::atan2_data as at2;
+    use crate::tables::double::asincos_data as ac;
     use crate::tables::double::atan_data as at;
+    use crate::tables::double::atan2_data as at2;
 
     /// `2^52`, the round-to-nearest-integer trick constant `table_index`
     /// shares with the scalar reference.
@@ -188,7 +187,11 @@ mod bit_exact {
         let table = atan_table(u).copysign(x);
         let recip_table = atan_recip_table(u).copysign(x);
         let recip_taylor = atan_recip_taylor(u).copysign(x);
-        let sat = V::select(x.gt_mask(V::splat(0.0)), V::splat(at::HPI), V::splat(at::MHPI));
+        let sat = V::select(
+            x.gt_mask(V::splat(0.0)),
+            V::splat(at::HPI),
+            V::splat(at::MHPI),
+        );
 
         let mut r = V::select(u.ge_mask(V::splat(at::E)), sat, recip_taylor);
         r = V::select(u.lt_mask(V::splat(at::D)), recip_table, r);
@@ -247,7 +250,11 @@ mod bit_exact {
         let poly = v.mul_add(poly, c4);
         let poly = v.mul_add(poly, c3);
         let poly = v.mul_add(poly, c2);
-        let zz = if add { v.mul_add(poly, base1) } else { (-v).mul_add(poly, base1) };
+        let zz = if add {
+            v.mul_add(poly, base1)
+        } else {
+            (-v).mul_add(poly, base1)
+        };
         let t1 = if add { base + t1c } else { base - t1c };
         t1 + zz
     }
@@ -362,6 +369,342 @@ mod bit_exact {
         }
         base.or(V::from_array(extra).gt_mask(V::splat(0.5)))
     }
+
+    // -----------------------------------------------------------------
+    // asin / acos
+    // -----------------------------------------------------------------
+    //
+    // Both replay `__ieee754_asin_fma`/`__ieee754_acos_fma`'s shared schedule:
+    // a direct-Taylor band below `0.125`, the `asncs.x` table bands from
+    // `0.125` up to `0.96875` (six index formulas, five polynomial degrees),
+    // and the near-1 band with its shared reciprocal-square-root refinement.
+    // The two functions differ only in the linear combination applied to the
+    // table polynomial and in the `t24`/`t27` split of the near-1 band's `c`
+    // (see `crate::reference::double::invtrig`'s module doc for the
+    // disassembly this was cross-checked against, and `ROADMAP.md`'s A4 entry
+    // for the `t24`-vs-`t27` bug the fix records).
+
+    /// The band thresholds, as the scalar reference's `k = high32(|x|)` values
+    /// promoted to floats. `u32` sits far inside `f64`'s exact range, so the
+    /// comparisons below are exact.
+    const K_TINY: f64 = 0x3e50_0000_u32 as f64; // 2^-26, asin's A band
+    const K_ACOS_TINY: f64 = 0x3c88_0000_u32 as f64; // 2^-55, acos's A band
+    const K_TAYLOR: f64 = 0x3fc0_0000_u32 as f64; // 0.125
+    const K_TABLE: f64 = 0x3fef_0000_u32 as f64; // 0.96875
+
+    /// `high32(|x|)` — the scalar reference's `k` — as float lanes. Exactly
+    /// representable: the value is a `u32` at most, far inside `f64`'s range.
+    #[inline(always)]
+    fn high32<V: Simd<Elem = f64>>(x: V) -> V {
+        let bits = x.to_bits();
+        let mut out = V::Floats::filled_default();
+        for i in 0..V::LANES {
+            out.as_mut_slice()[i] = (bits.as_slice()[i] >> 32) as u32 as f64;
+        }
+        V::from_array(out)
+    }
+
+    /// One `asncs.x` row's 13 slots, gathered per lane from the lane's own
+    /// `k = high32(|x|)`. The six band-index formulas and five degrees of the
+    /// scalar reference's `asncs_band_index` are resolved here, per lane, into
+    /// a single `(n, d)` pair: `n` clamped to `[0, 2555]` so an out-of-band
+    /// lane (one whose result the blend discards) still reads an in-bounds
+    /// row — the same defensive role `cij_row`'s `clamp(0, 240)` plays — and
+    /// `d` chosen from the band. The 13 slots are gathered unmasked into
+    /// `x0`, `t1`, the 11 coefficient slots `c[0..11]` (= row slots 2..12)
+    /// and the trailing `outer`/`final`; the coefficient slots that lie
+    /// beyond this lane's own degree are zeroed here, so the caller's single
+    /// unrolled polynomial can fold them as no-ops no matter which band the
+    /// lane actually landed in. `outer` and `final` are read from their
+    /// per-degree positions directly, before the zeroing.
+    #[inline(always)]
+    fn asncs_row<V: Simd<Elem = f64>>(k: V) -> (V, V, [V; 11], V, V) {
+        let ka = k.to_array();
+        let mut x0 = V::Floats::filled_default();
+        let mut t1 = V::Floats::filled_default();
+        let mut c = [V::Floats::filled_default(); 11];
+        let mut outer = V::Floats::filled_default();
+        let mut fin = V::Floats::filled_default();
+        for i in 0..V::LANES {
+            let k = ka.as_slice()[i] as u32;
+            let (n, d) = if k < 0x3fe0_0000 {
+                if k < 0x3fd0_0000 {
+                    (11 * ((k & 0x000f_ffff) >> 15), 5)
+                } else {
+                    (11 * ((k & 0x000f_ffff) >> 14) + 352, 5)
+                }
+            } else if k < 0x3fe8_0000 {
+                (1056 + (((k & 0x000f_e000) >> 11) * 3), 6)
+            } else if k < 0x3fed_8000 {
+                (992 + (((k & 0x000f_e000) >> 13) * 13), 7)
+            } else if k < 0x3fee_8000 {
+                (884 + (((k & 0x000f_e000) >> 13) * 14), 8)
+            } else {
+                (768 + (((k & 0x000f_e000) >> 13) * 15), 9)
+            };
+            let n = n.min(2555) as usize;
+            x0.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n]);
+            t1.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 1]);
+            for (j, slot) in c.iter_mut().enumerate() {
+                let slot_idx = j + 2;
+                slot.as_mut_slice()[i] = if slot_idx < 2 + d {
+                    f64::from_bits(ac::ASNCS[n + slot_idx])
+                } else {
+                    0.0
+                };
+            }
+            outer.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 2 + d]);
+            fin.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 3 + d]);
+        }
+        (
+            V::from_array(x0),
+            V::from_array(t1),
+            [
+                V::from_array(c[0]),
+                V::from_array(c[1]),
+                V::from_array(c[2]),
+                V::from_array(c[3]),
+                V::from_array(c[4]),
+                V::from_array(c[5]),
+                V::from_array(c[6]),
+                V::from_array(c[7]),
+                V::from_array(c[8]),
+                V::from_array(c[9]),
+                V::from_array(c[10]),
+            ],
+            V::from_array(outer),
+            V::from_array(fin),
+        )
+    }
+
+    /// One unrolled `asncs.x` band polynomial: `p = xx^2*horner(xx, c) +
+    /// outer` and `t = xx*t1 + p`, each one fused FMA exactly as the
+    /// reference's `asncs_band` compiles, then the unfused trailing combine.
+    /// The fold runs all eleven coefficient slots on every lane; the slots
+    /// beyond a lane's own degree are zero by construction (see `asncs_row`),
+    /// so `val` is identically zero until it reaches the lane's real leading
+    /// coefficient. `final` is returned separately because `asin`'s bands
+    /// finish with the unfused `final + t` while `acos`'s apply their own
+    /// `HP0`/`HP1` combination on top. Returns `(t_plus_p, final)`.
+    #[inline(always)]
+    fn asncs_poly<V: Simd<Elem = f64>>(xx: V, t1: V, c: [V; 11], outer: V, fin: V) -> (V, V) {
+        let mut val = c[10];
+        for &ci in c[..10].iter().rev() {
+            val = xx.mul_add(val, ci);
+        }
+        let p = (xx * xx).mul_add(val, outer);
+        let t_plus_p = xx.mul_add(t1, p);
+        (t_plus_p, fin)
+    }
+
+    /// `1/sqrt(z)`'s seed and Newton refinement — the scalar reference's
+    /// `near_one_root`, including its two-rounding `r = 1 - t*t*z`.
+    #[inline(always)]
+    fn near_one_root<V: Simd<Elem = f64>>(z: V) -> V {
+        let bits = z.to_bits();
+        let mut seeds = V::Floats::filled_default();
+        for i in 0..V::LANES {
+            let k = (bits.as_slice()[i] >> 32) as u32;
+            let ir = ac::INROOT[((k & 0x001fffff) >> 14) as usize];
+            // `511 - (k >> 21)` is always in `[0, 27]` for a real near-1 lane
+            // (`z >= 2^-54`); the clamp is defensive for the lanes whose
+            // result the blend discards (`z` zero, negative or NaN).
+            let p = (511 - (k >> 21)).clamp(0, 27) as usize;
+            seeds.as_mut_slice()[i] = ir * ac::POWTWO[p];
+        }
+        let seed = V::from_array(seeds);
+        let tt = seed * seed;
+        let r = (-tt).mul_add(z, V::splat(1.0));
+        let poly = r.mul_add(V::splat(ac::RT3), V::splat(ac::RT2));
+        let poly = r.mul_add(poly, V::splat(ac::RT1));
+        let poly = r.mul_add(poly, V::splat(ac::RT0));
+        seed * poly
+    }
+
+    /// The near-1 band's shared front half — `z`, `c`, `inner` and `p` — the
+    /// parts `asin` and `acos` compute identically before diverging in how
+    /// they split `c` (the `t24`/`t27` Dekker constant) and combine the tail.
+    #[inline(always)]
+    fn near1_common<V: Simd<Elem = f64>>(u: V) -> (V, V, V, V) {
+        let z = V::splat(0.5) * (V::splat(1.0) - u);
+        let t = near_one_root(z);
+        let c = t * z;
+        let inner = (t * V::splat(0.5)).mul_add(-c, V::splat(1.5));
+        let p = z.mul_add(V::splat(ac::F6), V::splat(ac::F5));
+        let p = z.mul_add(p, V::splat(ac::F4));
+        let p = z.mul_add(p, V::splat(ac::F3));
+        let p = z.mul_add(p, V::splat(ac::F2));
+        let p = z.mul_add(p, V::splat(ac::F1));
+        (z, c, inner, p * z)
+    }
+
+    /// `asin`'s near-1 band on the magnitude; the caller applies the sign.
+    #[inline(always)]
+    fn asin_near1<V: Simd<Elem = f64>>(u: V) -> V {
+        let (z, c, inner, p) = near1_common(u);
+        let y = (c + V::splat(ac::T24)) - V::splat(ac::T24);
+        let t_plus_y = inner.mul_add(c, y);
+        let z_minus_y2 = y.mul_add(-y, z);
+        let cc = z_minus_y2 / t_plus_y;
+        let hp1_minus_2cc = cc.mul_add(V::splat(-2.0), V::splat(ac::HP1));
+        let res1 = y.mul_add(V::splat(-2.0), V::splat(ac::HP0));
+        let y_plus_cc_x2 = (y + cc) + (y + cc);
+        let cor = y_plus_cc_x2.mul_add(-p, hp1_minus_2cc);
+        res1 + cor
+    }
+
+    /// `acos`'s near-1 band, sign-aware: the positive- and negative-`x` arms
+    /// differ only in the final combine, and both end in the unfused
+    /// `res + res`. Uses the `t27` split in both arms — `e_asin.c` never uses
+    /// `t24` in `acos` (see the fix note in `crate::reference::double::
+    /// invtrig`).
+    #[inline(always)]
+    fn acos_near1<V: Simd<Elem = f64>>(x: V) -> V {
+        let u = x.abs();
+        let (z, c, inner, p) = near1_common(u);
+        let y = V::splat(ac::T27).mul_add(c, c) - V::splat(ac::T27) * c;
+        let t_plus_y = inner.mul_add(c, y);
+        let z_minus_y2 = y.mul_add(-y, z);
+        let cc = z_minus_y2 / t_plus_y;
+        let neg_cor = (V::splat(ac::HP1) - cc) - (y + cc) * p;
+        let neg_res = (V::splat(ac::HP0) - y) + neg_cor;
+        let pos_cor = cc + p * (y + cc);
+        let pos_res = y + pos_cor;
+        let r = V::select(x.lt_mask(V::splat(0.0)), neg_res, pos_res);
+        r + r
+    }
+
+    /// `asin`'s Taylor band, `|x| < 0.125`.
+    #[inline(always)]
+    fn asin_taylor<V: Simd<Elem = f64>>(x: V) -> V {
+        let x2 = x * x;
+        let t = x2.mul_add(V::splat(ac::F6), V::splat(ac::F5));
+        let t = x2.mul_add(t, V::splat(ac::F4));
+        let t = x2.mul_add(t, V::splat(ac::F3));
+        let t = x2.mul_add(t, V::splat(ac::F2));
+        let t = x2.mul_add(t, V::splat(ac::F1));
+        (x2 * x).mul_add(t, x)
+    }
+
+    /// `acos`'s Taylor band, `|x| < 0.125`: `r = HP0 - x` plus a fused
+    /// correction, the `HP1`-compensated shape that keeps the small answer
+    /// near `x = 1` from cancelling.
+    #[inline(always)]
+    fn acos_taylor<V: Simd<Elem = f64>>(x: V) -> V {
+        let x2 = x * x;
+        let t = x2.mul_add(V::splat(ac::F6), V::splat(ac::F5));
+        let t = x2.mul_add(t, V::splat(ac::F4));
+        let t = x2.mul_add(t, V::splat(ac::F3));
+        let t = x2.mul_add(t, V::splat(ac::F2));
+        let t = x2.mul_add(t, V::splat(ac::F1));
+        let r = V::splat(ac::HP0) - x;
+        let inner = (V::splat(ac::HP0) - r) - x + V::splat(ac::HP1);
+        let cor = (x2 * x).mul_add(-t, inner);
+        r + cor
+    }
+
+    /// `acos`'s table bands' trailing combine: `y = HP0 ∓ final`,
+    /// `t = HP1 ∓ t_plus_p`, `y + t` — `e_asin.c`'s `acos` bands never add
+    /// `row[3+degree]` themselves (`asin`'s do).
+    #[inline(always)]
+    fn acos_table_combine<V: Simd<Elem = f64>>(neg: V::Mask, fin: V, t: V) -> V {
+        let y = V::select(neg, V::splat(ac::HP0) + fin, V::splat(ac::HP0) - fin);
+        y + V::select(neg, V::splat(ac::HP1) + t, V::splat(ac::HP1) - t)
+    }
+
+    /// `asin`'s table bands (`0.125 <= |x| < 0.96875`): every band's row and
+    /// polynomial evaluated for every lane from one per-lane gather, the
+    /// degree resolved per lane by `asncs_row` — the whole-vector-blend
+    /// discipline this module uses throughout.
+    #[inline(always)]
+    fn asin_table<V: Simd<Elem = f64>>(u: V, k: V) -> V {
+        let (x0, t1, c, outer, fin) = asncs_row(k);
+        let (t_plus_p, fin) = asncs_poly(u - x0, t1, c, outer, fin);
+        fin + t_plus_p
+    }
+
+    /// `acos`'s table bands: the same gather and polynomial as `asin`'s,
+    /// combined by `acos_table_combine` instead of the plain unfused
+    /// `final + t`.
+    #[inline(always)]
+    fn acos_table<V: Simd<Elem = f64>>(x: V, u: V, k: V) -> V {
+        let (x0, t1, c, outer, fin) = asncs_row(k);
+        let (t_plus_p, fin) = asncs_poly(u - x0, t1, c, outer, fin);
+        acos_table_combine(x.lt_mask(V::splat(0.0)), fin, t_plus_p)
+    }
+
+    /// `asin(x)`, vectorised — a genuine replay of `__ieee754_asin_fma`'s
+    /// schedule, not a per-lane call. Lanes the reference reaches via an
+    /// early return that no band arithmetic reproduces — NaN, whose
+    /// payload-preserving `x + x` the arithmetic cannot — are left for
+    /// [`asin_needs_repair`]. `|x| == 1` is a real band (`+-pi/2`, computed
+    /// by select) and `|x| > 1` the canonical NaN the reference's wrapper
+    /// returns, so neither needs the reference. The final `.copysign(x)` is
+    /// applied *before* the out-of-domain overwrite so that only the real
+    /// bands take the input's sign (`asin(-inf)` must stay the positive
+    /// canonical NaN, not a negative one).
+    #[inline(always)]
+    pub(super) fn asin<V: Simd<Elem = f64>>(x: V) -> V {
+        let u = x.abs();
+        let k = high32(u);
+
+        let taylor = asin_taylor(x);
+        let table = asin_table(u, k);
+        let near1 = asin_near1(u);
+        let at_one = V::splat(ac::HP0).copysign(x);
+        let nan = V::splat(f64::NAN);
+
+        let r = V::select(k.lt_mask(V::splat(K_TINY)), x, taylor);
+        let r = V::select(k.lt_mask(V::splat(K_TAYLOR)), r, table);
+        let r = V::select(k.lt_mask(V::splat(K_TABLE)), r, near1);
+        let r = V::select(u.eq_mask(V::splat(1.0)), at_one, r);
+        let r = r.copysign(x);
+        let out = u.gt_mask(V::splat(1.0)).or(x.is_nan());
+        V::select(out, nan, r)
+    }
+
+    /// Lanes `asin`'s vector path leaves to the reference: NaN only. `|x| > 1`
+    /// is the canonical `f64::NAN` the reference's wrapper returns, reproduced
+    /// exactly in-vector; `|x| == 1` is a select; every other input is real
+    /// vector arithmetic replaying the reference's own schedule.
+    #[inline(always)]
+    pub(super) fn asin_needs_repair<V: Simd<Elem = f64>>(x: V) -> V::Mask {
+        x.is_nan()
+    }
+
+    /// `acos(x)`, vectorised — shares `asin`'s bands and differs only in the
+    /// linear combination applied to each (see [`acos_table`] and
+    /// [`acos_near1`]).
+    #[inline(always)]
+    pub(super) fn acos<V: Simd<Elem = f64>>(x: V) -> V {
+        let u = x.abs();
+        let k = high32(u);
+
+        let tiny = V::splat(ac::HP0);
+        let taylor = acos_taylor(x);
+        let table = acos_table(x, u, k);
+        let near1 = acos_near1(x);
+        let at_one = V::select(
+            x.lt_mask(V::splat(0.0)),
+            V::splat(2.0 * ac::HP0),
+            V::splat(0.0),
+        );
+        let nan = V::splat(f64::NAN);
+
+        let r = V::select(k.lt_mask(V::splat(K_ACOS_TINY)), tiny, taylor);
+        let r = V::select(k.lt_mask(V::splat(K_TAYLOR)), r, table);
+        let r = V::select(k.lt_mask(V::splat(K_TABLE)), r, near1);
+        let r = V::select(u.eq_mask(V::splat(1.0)), at_one, r);
+        let out = u.gt_mask(V::splat(1.0)).or(x.is_nan());
+        V::select(out, nan, r)
+    }
+
+    /// Lanes `acos`'s vector path leaves to the reference: NaN only, as for
+    /// [`asin_needs_repair`].
+    #[inline(always)]
+    pub(super) fn acos_needs_repair<V: Simd<Elem = f64>>(x: V) -> V::Mask {
+        x.is_nan()
+    }
 }
 
 /// Arc sine.
@@ -369,12 +712,25 @@ pub mod asin {
     use super::*;
 
     /// `asin(x)` for a vector of lanes.
+    ///
+    /// Under `BitExact` the vector path is a genuine schedule replay
+    /// (`bit_exact::asin`), with a NaN repair for the payload-preserving
+    /// `x + x` the reference returns for a NaN input; `|x| >= 1` is handled
+    /// in-vector (`+-pi/2` at exactly 1, the canonical NaN beyond). Under
+    /// `Fast`, `outside(x, 1.0)` also catches `|x| == 1` and sends it to the
+    /// reference — one extra scalar lane on an input that is rare in bulk
+    /// data, buying not having to reason about `sqrt(0)` in the folded
+    /// branch.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-        // `outside(x, 1.0)` also catches |x| == 1 and sends it to the
-        // reference. That is one extra scalar lane on an input that is rare in
-        // bulk data, and it buys not having to reason about `sqrt(0)` in the
-        // folded branch.
+        if A::BIT_EXACT {
+            let y = bit_exact::asin(x);
+            return if D::CHECKED {
+                patch_lanes(x, y, bit_exact::asin_needs_repair(x), reference::asin)
+            } else {
+                y
+            };
+        }
         dispatch::<V, A, D>(x, reference::asin, fast, |x| outside(x, 1.0))
     }
 
@@ -402,8 +758,22 @@ pub mod acos {
     use super::*;
 
     /// `acos(x)` for a vector of lanes.
+    ///
+    /// Under `BitExact` the vector path is a genuine schedule replay
+    /// (`bit_exact::acos`), with a NaN repair as for [`asin::eval`]; `|x| >= 1`
+    /// is handled in-vector (`0` or `2*pi` at exactly 1, the canonical NaN
+    /// beyond). Under `Fast`, `outside(x, 1.0)` also catches `|x| == 1` and
+    /// sends it to the reference, as in [`asin::eval`].
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
+        if A::BIT_EXACT {
+            let y = bit_exact::acos(x);
+            return if D::CHECKED {
+                patch_lanes(x, y, bit_exact::acos_needs_repair(x), reference::acos)
+            } else {
+                y
+            };
+        }
         dispatch::<V, A, D>(x, reference::acos, fast, |x| outside(x, 1.0))
     }
 
@@ -494,7 +864,13 @@ pub mod atan2 {
         if A::BIT_EXACT {
             let z = bit_exact::atan2(y, x);
             return if D::CHECKED {
-                patch_lanes2(y, x, z, bit_exact::atan2_needs_repair(y, x), reference::atan2)
+                patch_lanes2(
+                    y,
+                    x,
+                    z,
+                    bit_exact::atan2_needs_repair(y, x),
+                    reference::atan2,
+                )
             } else {
                 z
             };
