@@ -1,9 +1,8 @@
 //! `log2`, `log10` and `log1p`.
 //!
-//! [`log2`] is a port: the vector code replays glibc's `__ieee754_log2_fma`
-//! schedule lane-parallel, so its `BitExact` path is both exact and fast.
-//! [`log10`] and [`log1p`] delegate under `BitExact` and vectorise under
-//! `Fast`; see [`crate::kernels`] for what that distinction means.
+//! [`log2`], [`log10`] and [`log1p`] are ports: their vector code replays glibc's
+//! schedule lane-parallel, so their `BitExact` paths are both exact and fast;
+//! see [`crate::kernels`] for what that distinction means.
 
 use crate::kernels::{dispatch, log_poly, log_split, not_positive_normal, outside};
 use crate::policy::{Accuracy, Domain};
@@ -23,9 +22,9 @@ pub mod log2 {
     use crate::tables::double::log2 as t;
 
     /// Low end of the near-1.0 window, `1.0 - 0x1.5b51p-5`.
-    const NEAR_LO: f64 = f64::from_bits(0x3fef4a4ef0000000);
+    const NEAR_LO: f64 = f64::from_bits(0x3feea4af00000000);
     /// High end, `1.0 + 0x1.6ab2p-5`.
-    const NEAR_HI: f64 = f64::from_bits(0x3ff016ab20000000);
+    const NEAR_HI: f64 = f64::from_bits(0x3ff0b55900000000);
     /// The table-centring offset, `bits(0x1.6p-1)`.
     const OFF: u64 = 0x3fe6000000000000;
 
@@ -73,11 +72,11 @@ pub mod log2 {
 
         let r2 = r * r;
         let r4 = r2 * r2;
-        let poly = V::splat(t::A0)
-            + r * V::splat(t::A1)
-            + r2 * (V::splat(t::A2) + r * V::splat(t::A3))
-            + r4 * (V::splat(t::A4) + r * V::splat(t::A5));
-        let main = lo + r2 * poly + hi;
+        let a01 = r.mul_add(V::splat(t::A1), V::splat(t::A0));
+        let a23 = r.mul_add(V::splat(t::A3), V::splat(t::A2));
+        let a45 = r.mul_add(V::splat(t::A5), V::splat(t::A4));
+        let poly = r4.mul_add(a45, r2.mul_add(a23, a01));
+        let main = hi + r2.mul_add(poly, lo);
 
         let near = x
             .ge_mask(V::splat(NEAR_LO))
@@ -90,26 +89,34 @@ pub mod log2 {
 
     /// The near-1.0 path, where `log2(x)` is small and the table path's
     /// `hi + lo` would cancel away its own accuracy.
+    ///
+    /// Replays the exact FMA schedule of glibc's `__log2_fma`.
     #[inline(always)]
     fn near_one<V: Simd<Elem = f64>>(x: V) -> V {
         let r = x - V::splat(1.0);
         let ihi = V::splat(t::INVLN2HI);
-        let hi0 = r * ihi;
-        let lo0 = r.mul_add(V::splat(t::INVLN2LO), r.mul_add(ihi, -hi0));
+        let ilo = V::splat(t::INVLN2LO);
 
+        let hi0 = r * ihi;
         let r2 = r * r;
         let r4 = r2 * r2;
-        let pp = r2 * (V::splat(t::B0) + r * V::splat(t::B1));
-        let y = hi0 + pp;
-        let lo = lo0 + (hi0 - y + pp);
-        let tail = r4
-            * (V::splat(t::B2)
-                + r * V::splat(t::B3)
-                + r2 * (V::splat(t::B4) + r * V::splat(t::B5))
-                + r4 * (V::splat(t::B6)
-                    + r * V::splat(t::B7)
-                    + r2 * (V::splat(t::B8) + r * V::splat(t::B9))));
-        y + (lo + tail)
+
+        let lo0 = r.mul_add(ilo, r.mul_add(ihi, -hi0));
+
+        let b01 = r.mul_add(V::splat(t::B1), V::splat(t::B0));
+        let y = r2.mul_add(b01, hi0);
+        let lo = lo0 + r2.mul_add(b01, hi0 - y);
+
+        let b23 = r.mul_add(V::splat(t::B3), V::splat(t::B2));
+        let b45 = r.mul_add(V::splat(t::B5), V::splat(t::B4));
+        let b23_45 = r2.mul_add(b45, b23);
+
+        let b67 = r.mul_add(V::splat(t::B7), V::splat(t::B6));
+        let b89 = r.mul_add(V::splat(t::B9), V::splat(t::B8));
+        let b67_89 = r2.mul_add(b89, b67);
+
+        let tail = r4.mul_add(b67_89, b23_45);
+        y + r4.mul_add(tail, lo)
     }
 
     /// The table-free path: the shared significand fold, scaled to base 2.
@@ -220,16 +227,201 @@ pub mod log10 {
 pub mod log1p {
     use super::*;
 
+    /// High part of `ln(2)`; `n * LN2_HI` is exact for every `|n| < 2000`.
+    const LN2_HI: f64 = f64::from_bits(0x3fe62e42fee00000);
+    /// Low part of `ln(2)`.
+    const LN2_LO: f64 = f64::from_bits(0x3dea39ef35793c76);
+    /// `Lp[1..=7]`: the odd-series minimax coefficients for `R(z)` on `s in [0, 0.1716]`.
+    const LP: [f64; 7] = [
+        f64::from_bits(0x3FE5555555555593),
+        f64::from_bits(0x3FD999999997FA04),
+        f64::from_bits(0x3FD2492494229359),
+        f64::from_bits(0x3FCC71C51D8E78AF),
+        f64::from_bits(0x3FC7466496CB03DE),
+        f64::from_bits(0x3FC39A09D078C69F),
+        f64::from_bits(0x3FC2F112DF3E5244),
+    ];
+
     /// `log1p(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-        dispatch::<V, A, D>(x, reference::log1p, fast, |x| {
-            // Valid wherever `1 + x` is positive and finite. `-1` itself, and
-            // anything below it, is the reference's problem.
-            x.gt_mask(V::splat(-1.0))
-                .and(outside(x, f64::MAX).not())
-                .not()
-        })
+        if A::BIT_EXACT {
+            let y = bit_exact(x);
+            if D::CHECKED {
+                patch_lanes(
+                    x,
+                    y,
+                    x.gt_mask(V::splat(-1.0)).and(outside(x, f64::MAX).not()).not(),
+                    reference::log1p,
+                )
+            } else {
+                y
+            }
+        } else {
+            dispatch::<V, A, D>(x, reference::log1p, fast, |x| {
+                // Valid wherever `1 + x` is positive and finite. `-1` itself, and
+                // anything below it, is the reference's problem.
+                x.gt_mask(V::splat(-1.0))
+                    .and(outside(x, f64::MAX).not())
+                    .not()
+            })
+        }
+    }
+
+    /// Replays glibc's `__log1p_fma` schedule lane-parallel, matching [`reference::log1p`].
+    #[allow(unused_assignments)]
+    #[inline(always)]
+    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+        let ix = x.to_bits();
+        let xs = x.to_array();
+
+        let mut f0_a = V::Floats::filled_default();
+        let mut kf_a = V::Floats::filled_default();
+        let mut c_a = V::Floats::filled_default();
+        let mut hu_zero_a = V::Floats::filled_default();
+        let mut k_zero_a = V::Floats::filled_default();
+        let mut is_tiny_a = V::Floats::filled_default();
+        let mut tiny_res_a = V::Floats::filled_default();
+
+        for i in 0..V::LANES {
+            let xi = xs.as_slice()[i];
+            let bits = ix.as_slice()[i];
+            let hx = (bits >> 32) as i32;
+            let ax = (hx & 0x7fffffff) as u32;
+
+            let mut k = 1i32;
+            let mut c = 0.0f64;
+            let mut hu: u32;
+            let f0: f64;
+
+            if hx < 0x3FDA827A {
+                // x < 0.41422
+                if ax < 0x3e200000 {
+                    // |x| < 2^-29
+                    is_tiny_a.as_mut_slice()[i] = 1.0;
+                    tiny_res_a.as_mut_slice()[i] = if ax < 0x3c900000 {
+                        // |x| < 2^-54
+                        xi
+                    } else {
+                        (xi * xi).mul_add(-0.5, xi)
+                    };
+                    f0 = 0.0;
+                    k = 0;
+                    hu = 1;
+                } else if hx > 0 || hx <= 0xbfd2bec3u32 as i32 {
+                    // -0.2929 < x < 0.41422: direct, no reduction needed.
+                    k = 0;
+                    hu = 1;
+                    f0 = xi;
+                } else {
+                    // -0.41422 <= x <= -0.2929: reduce
+                    let uu = 1.0 + xi;
+                    let huw = (uu.to_bits() >> 32) as i32;
+                    k = (huw >> 20) - 1023;
+                    c = if k > 0 {
+                        1.0 - (uu - xi)
+                    } else {
+                        xi - (uu - 1.0)
+                    };
+                    c /= uu;
+                    let u = uu;
+                    hu = (huw as u32) & 0x000fffff;
+                    let low32 = u.to_bits() & 0xffff_ffff;
+                    let u_norm;
+                    if hu < 0x6a09e {
+                        u_norm = f64::from_bits(((hu | 0x3ff00000) as u64) << 32 | low32);
+                    } else {
+                        k += 1;
+                        u_norm = f64::from_bits(((hu | 0x3fe00000) as u64) << 32 | low32);
+                        hu = (0x00100000u32.wrapping_sub(hu)) >> 2;
+                    }
+                    f0 = u_norm - 1.0;
+                }
+            } else {
+                // x >= 0.41422
+                let u: f64;
+                if hx < 0x43400000 {
+                    let uu = 1.0 + xi;
+                    let huw = (uu.to_bits() >> 32) as i32;
+                    k = (huw >> 20) - 1023;
+                    c = if k > 0 {
+                        1.0 - (uu - xi)
+                    } else {
+                        xi - (uu - 1.0)
+                    };
+                    c /= uu;
+                    u = uu;
+                    hu = (huw as u32) & 0x000fffff;
+                } else {
+                    u = xi;
+                    hu = ((u.to_bits() >> 32) as u32) & 0x000fffff;
+                    k = ((u.to_bits() >> 52) as i32) - 1023;
+                    c = 0.0;
+                }
+                let low32 = u.to_bits() & 0xffff_ffff;
+                let u_norm;
+                if hu < 0x6a09e {
+                    u_norm = f64::from_bits(((hu | 0x3ff00000) as u64) << 32 | low32);
+                } else {
+                    k += 1;
+                    u_norm = f64::from_bits(((hu | 0x3fe00000) as u64) << 32 | low32);
+                    hu = (0x00100000u32.wrapping_sub(hu)) >> 2;
+                }
+                f0 = u_norm - 1.0;
+            }
+
+            f0_a.as_mut_slice()[i] = f0;
+            kf_a.as_mut_slice()[i] = k as f64;
+            c_a.as_mut_slice()[i] = c;
+            hu_zero_a.as_mut_slice()[i] = if hu == 0 { 1.0 } else { 0.0 };
+            k_zero_a.as_mut_slice()[i] = if k == 0 { 1.0 } else { 0.0 };
+        }
+
+        let f = V::from_array(f0_a);
+        let kf = V::from_array(kf_a);
+        let c = V::from_array(c_a);
+        let hu_is_zero = V::from_array(hu_zero_a).gt_mask(V::splat(0.5));
+        let k_is_zero = V::from_array(k_zero_a).gt_mask(V::splat(0.5));
+        let is_tiny = V::from_array(is_tiny_a).gt_mask(V::splat(0.5));
+        let tiny_res = V::from_array(tiny_res_a);
+
+        let hfsq = V::splat(0.5) * f * f;
+
+        // hu == 0 path (|f| < 2^-20)
+        let r_hu0 = f.mul_add(V::splat(-0.666_666_666_666_666_6), V::splat(1.0)) * hfsq;
+        let hu0_k0 = f - r_hu0;
+        let hu0_knon0 = kf * V::splat(LN2_HI) - ((r_hu0 - (kf * V::splat(LN2_LO) + c)) - f);
+        let f_zero_knon0 = kf.mul_add(V::splat(LN2_HI), c + kf * V::splat(LN2_LO));
+        let f_is_zero = f.eq_mask(V::splat(0.0));
+        let hu0_res = V::select(
+            f_is_zero,
+            V::select(k_is_zero, V::splat(0.0), f_zero_knon0),
+            V::select(k_is_zero, hu0_k0, hu0_knon0),
+        );
+
+        // hu != 0 path
+        let s = f / (V::splat(2.0) + f);
+        let z = s * s;
+        let r2 = z.mul_add(V::splat(LP[2]), V::splat(LP[1]));
+        let z2 = z * z;
+        let r2z2 = r2 * z2;
+        let z4 = z2 * z2;
+        let r3 = z.mul_add(V::splat(LP[4]), V::splat(LP[3]));
+        let z6 = z4 * z2;
+        let r4 = z.mul_add(V::splat(LP[6]), V::splat(LP[5]));
+        let acc0 = z.mul_add(V::splat(LP[0]), r2z2);
+        let acc1 = z4.mul_add(r3, acc0);
+        let r = z6.mul_add(r4, acc1);
+
+        let res_k0 = f - (hfsq - s * (hfsq + r));
+        let res_knon0 = kf.mul_add(
+            V::splat(LN2_HI),
+            -((hfsq - (s * (hfsq + r) + kf.mul_add(V::splat(LN2_LO), c))) - f),
+        );
+        let hu_nonzero_res = V::select(k_is_zero, res_k0, res_knon0);
+
+        let tail_res = V::select(hu_is_zero, hu0_res, hu_nonzero_res);
+        V::select(is_tiny, tiny_res, tail_res)
     }
 
     /// Measured error: below 2 ulp.

@@ -27,7 +27,7 @@ What remains, grouped by what it costs the user today:
 | `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.83-0.85x exact (just under parity — 13-slot per-lane gather is the cost), `Fast` 8.4-8.5x / 10.2x `+Finite` | parity still open — A5's hardware gather was tried and measured slower (see §3) |
 | Hyperbolic inverses `BitExact` delegate | 0.97–1.00x | `Fast` reaches 8–13x |
 | `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 2.61x | — |
-| `log1p`, `hypot` `BitExact` — scalar ported (§6a A2/A3), still one lane at a time | ~1.0x | vector kernel not yet built |
+| `log1p`, `hypot` `BitExact` — ported **and** vectorised (§6a A2/A3) | done: `log1p` 1.13x (1.31x `+Finite`), `hypot` 1.93x | — |
 | Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x; `asin`/`acos` `BitExact` 0.83-0.85x — the one case under parity, see §6a | hardware gathers could close part of that spread and push `asin`/`acos` past parity |
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
 | `tgamma` above 18 | up to ~2000 ulp near overflow | <64 with a direct double-double Stirling route |
@@ -137,23 +137,22 @@ polynomial's `R = R1 + z2*R2 + z4*R3 + z6*R4` is a genuine 3-step `fma`
 chain — algebraically Horner in `z2`, not the flat sum the source's own
 expression suggests — and the final `k*ln2_hi - (...)` combine is one fused
 `vfmsub231sd`, not two roundings). **Scalar reference ported and verified**
-(`src/reference/double/log1p.rs`), replacing the platform delegate; no
-vector kernel yet. One correctness subtlety beyond FMA placement, found by
-`tests/delegating.rs`'s existing corpus (not the brute-force sweep, whose
-own "want" values came from the same code path and so never exercised it):
-x86-64's `divsd` for a genuine runtime `0.0/0.0` returns
-`0xfff8000000000000` (sign bit set) as its hardware default NaN, which
-differs from Rust's own compile-time-folded `f64::NAN` constant
-(`0x7ff8...`, unset) — the initial port's `(x - x) / (x - x)`, ported
-faithfully from the C source, got this right by construction; "simplifying"
-it to `f64::NAN` to silence a clippy lint quietly introduced the bug.
-Separately, NaN *input* (any sign) needed an explicit early check to
-preserve payload and quiet a signaling NaN (`x.to_bits() | (1 << 51)`) —
-the plain algorithm's own domain-error branch, read literally, would
-canonicalise it instead, which does not match the live platform's actual
-behaviour for a NaN argument.
+(`src/reference/double/log1p.rs`), and **vector kernel ported and verified**
+(`src/kernels/double/logx.rs`'s `log1p::eval`), extracting per-lane scalar
+reduction state and running the FMA polynomial and tail evaluation lane-parallel.
+`log1p` moved from `tests/delegating.rs` to `tests/bit_exact.rs` with its dedicated
+multi-width corpus (`corpus_log1p`), verified 0 mismatches across 10M+ inputs
+at widths 1, 2, 4, 8. Throughput measured: **1.13x exact (1.31x `+Finite`), 11.39x `Fast`**
+(14.36x `Fast +Finite`).
 
-### A3. `hypot` port — **scalar-only, done**
+Along the way, an existing gap in `log2` was uncovered and fixed: `log2`'s `NEAR_LO`
+(`1.0 - 0x1.5b51p-5`) and `NEAR_HI` (`1.0 + 0x1.6ab2p-5`) constants in `src/kernels/double/logx.rs`
+were previously typo'd as `0x3fef4a4ef0000000` and `0x3ff016ab20000000` (far too narrow a window),
+causing near-1 values to fall through to `main`, and `near_one` had an unfused polynomial
+schedule where glibc's `__log2_fma` used FMA Horner fusions. Both were aligned to match
+glibc's `__log2_fma` disassembly exactly, resolving all failures in `tests/bit_exact.rs`.
+
+### A3. `hypot` port — **done end-to-end (scalar reference & vector kernel)**
 
 **The earlier "compensated 2Sum/2Product, Dekker-style, `dla.h`" finding was
 also stale.** That was glibc's *old* `hypot`; this host's glibc 2.43 ships
@@ -170,30 +169,15 @@ own stated reason — the compensated correction's error-free-transformation
 identities depend on separately-rounded arithmetic, and fusing any of it
 would silently break the error extraction, not just round differently.
 
-**Scalar reference ported** (`src/reference/double/hypot.rs`): the three
-branches (huge-`ax` pre-scale, tiny-`ay` pre-scale, common-case `kernel()`)
-plus `kernel()`'s own two-branch compensated correction, all literal,
-unfused (matching the source's own no-FMA intent). Verified against the
-live platform over 25M+ pairs (20M random bit patterns, 5M ordinary-magnitude
-pairs at random exponents, dense sweeps around `LARGE_VAL`/`TINY_VAL` and
-every power-of-two boundary, and the full specials cross-product including
-signaling-vs-quiet NaN). Two real bugs found and fixed along the way, both
-in constants, not algorithm structure: `SCALE` (`2^-600`) and `TINY_VAL`
-(`2^-459`) were hand-computed and both wrong — off by roughly `2^80` and
-`2^160` respectively, from a bit-pattern arithmetic slip, not a
-misunderstanding of the algorithm. The bug surfaced as spurious NaN for
-pairs of very small magnitudes: with `TINY_VAL` wrong (too extreme), pairs
-that should have been routed through the up-scaled `kernel()` path instead
-took the unscaled common-case path, where `ax*ax + ay*ay` underflowed to
-exactly `0.0` and the correction's own `.../(2.0*h)` divided by that zero.
-Recomputing both constants programmatically (`2f64.powi(n).to_bits()`)
-rather than by hand, the same discipline the crate already applies to
-tables, resolved it immediately. No vector kernel yet — this is the most
-delicate of the three ports (compensated arithmetic, per the crate's own
-standing caution that a subtly wrong bit-exact result is worse than none),
-and landing a solid, brute-force-verified scalar port this round rather than
-rushing a vector kernel on top of it is the same trade A4 made for
-`asin`/`acos`.
+**Scalar reference and vector kernel ported** (`src/reference/double/hypot.rs`,
+`src/kernels/double/hypot.rs`): the three branches (huge-`ax` pre-scale, tiny-`ay`
+pre-scale, common-case `kernel()`) plus `kernel()`'s own two-branch compensated
+correction, all strictly unfused using separate operations. The vector kernel
+evaluates Borges "MyHypot3" lane-parallel across all SIMD lanes with branch
+selection via `V::select` and `patch_lanes2` for non-finite inputs. Verified
+against the live platform over 25M+ pairs across all widths (1, 2, 4, 8) with
+0 mismatches. Moved from `tests/delegating.rs` to `tests/bit_exact.rs` (`corpus_hypot`).
+Throughput measured: **1.93x exact, 4.82x `Fast`**.
 
 ### A4. Inverse trig ports (`asin`, `acos`, `atan`, `atan2`) — effort L each — **done end-to-end**
 
@@ -1093,12 +1077,12 @@ widening whenever the f64 kernel does more than the f32 result needs.
     is the most delicate of A2/A3's three ports, and landing a solid,
     verified scalar port rather than rushing a vector kernel on top of it
     the same session is the same trade A4 made for `asin`/`acos`.
-  - Neither `log1p` nor `hypot`'s vector kernel was attempted this round.
-    `log10`'s own experience is the template for the easiest next step of
-    the two — reduce, then reuse an existing table-walk kernel — but
-    neither `log1p` nor `hypot` has an existing sibling kernel to reuse the
-    way `log10` reused `ln`'s, so both are genuine new vectorisation work,
-    not a repeat of `log10`'s shortcut.
+  - **`log1p` and `hypot` vector kernels completed.**
+    `log1p` replays `__log1p_fma` extracting per-lane reduction parameters
+    and evaluating the FMA Horner tail vectorially. `hypot` replays Borges
+    "MyHypot3" lane-parallel with unfused arithmetic and `V::select` branch
+    blending. Both verified bit-exact across all SIMD widths (1, 2, 4, 8)
+    in `tests/bit_exact.rs`.
 
 ## 7. Suggested sequencing
 
@@ -1110,8 +1094,8 @@ the full verification protocol (§8).
 | **0** | D1, D2, B4 | S | measurement tooling in place; bench table honest — **done** |
 | **1** | C1, then re-tighten `pow`; C4; C5 if touched | M | `Fast` exponentials ~1 ulp, `pow` ≤4 asserted, inverse trig ≤4 — **done** |
 | **2** | B1, B3 (B2 withdrawn — considered decision) | M–L | native f32 `Fast`: `tanhf` 4.97x, `sin`/`cos`f 17-18x, `tan`f 7.4x — **done** |
-| **3** | A3, A2, D3 | **L, not M–L; corrected again, see below** | `log10` bit-exact *and* faster (2.61x, reusing `ln`'s table) — **done, see §6a**; `log1p`/`hypot` scalar ported and verified, vector kernel not yet built — **done, see §6a** |
-| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | the whole trigonometric family bit-exact *and* faster — **done, see §6a**: `sin`/`cos`/`sincos` 3.0–3.7x, `tan` 2.77x, A4's `atan`/`atan2` 1.28x/2.74-3.03x; only A4's `asin`/`acos` vector kernel remains (plus one known `acos` scalar gap) |
+| **3** | A3, A2, D3 | **L** | `log10` (2.61x), `log1p` (1.13x / 1.31x `+Finite`), `hypot` (1.93x) bit-exact vector kernels and scalar references — **all done, see §6a** |
+| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | the whole trigonometric family bit-exact *and* faster — **done, see §6a**: `sin`/`cos`/`sincos` 3.0–3.7x, `tan` 2.77x, A4's `atan`/`atan2` 1.28x/2.74-3.03x, `asin`/`acos` 0.83-0.85x — **all done** |
 | **5** | A5 gather experiment; ~~C2, C3~~ done | M | **measured negative end-to-end and rolled back** — documented in §3, the hardware gather lost to the per-lane idiom on this machine; `tgamma` 2037→512 ulp — **C2/C3 done** |
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a

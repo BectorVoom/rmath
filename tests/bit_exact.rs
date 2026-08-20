@@ -349,6 +349,7 @@ fn corpus_trig(seed: u64) -> Vec<f64> {
         f64::from_bits(0x3e400000_00000000), // cos/sincos's TINY
         f64::from_bits(0x3feb6000_00000000), // POLY: |x| < 0.855469
         f64::from_bits(0x400368fd_00000000), // MID: |x| < 2.426265
+        f64::from_bits(0x413921fb_54442d18), // TRIG_LIMIT reduction boundary (D4)
         f64::from_bits(0x419921fb_00000000), // TABLE_LIMIT / __branred handoff
     ] {
         v.extend(around(c));
@@ -571,6 +572,134 @@ fn corpus_tan(seed: u64) -> Vec<f64> {
     v
 }
 
+/// `log10`'s corpus: positive normals, branch boundaries across every exponent.
+fn corpus_log10(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for exp in 0..2047u64 {
+        let b = (exp << 52) | 0x0008_0000_0000_0000;
+        v.extend(around(f64::from_bits(b)));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.log_uniform(1e-300, 1e300, false));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(0.1, 10.0));
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
+/// `log1p`'s bands: `-1.0`, the tiny cutoffs (`2^-29`, `2^-54`), the direct
+/// band boundaries (`-0.2929`, `0.41422`), the large-argument threshold (`2^53`),
+/// and the `hu` normalization threshold (`0x6a09e`).
+fn corpus_log1p(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        -1.0,
+        -0.5,
+        -0.2929,
+        0.41422,
+        f64::from_bits(0x3fda827a_00000000), // 0.41422 boundary
+        f64::from_bits(0xbfd2bec3_00000000), // -0.2929 boundary
+        f64::from_bits(0x3e200000_00000000), // 2^-29
+        f64::from_bits(0x3c900000_00000000), // 2^-54
+        f64::from_bits(0x43400000_00000000), // 2^53
+    ] {
+        v.extend(around(c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-0.9999999, 100.0));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-0.35, 0.45)); // dense around reduction thresholds
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
+/// `hypot`'s bands: `SCALE` (`2^-600`), `LARGE_VAL` (`2^511`), `TINY_VAL`
+/// (`2^-459`), `EPS` (`2^-54`), the `kernel` branch boundary `h <= 2 ay`,
+/// and near-overflow pairs (D4).
+fn corpus_hypot(seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Rng(seed);
+    let mut ys = universal();
+    let mut xs = universal();
+    while xs.len() < ys.len() {
+        xs.push(1.0);
+    }
+    let mut push = |y: f64, x: f64| {
+        ys.push(y);
+        xs.push(x);
+    };
+    for &s in &[1.0, -1.0] {
+        for &t in &[1.0, -1.0] {
+            for c in [
+                0.0,
+                1.0,
+                f64::from_bits(0x1a70000000000000), // SCALE: 2^-600
+                f64::from_bits(0x5fe0000000000000), // LARGE_VAL: 2^511
+                f64::from_bits(0x2340000000000000), // TINY_VAL: 2^-459
+                f64::from_bits(0x3c90000000000000), // EPS: 2^-54
+                f64::MAX,
+                f64::MIN_POSITIVE,
+                1e-300,
+                1e300,
+            ] {
+                for d in [0.0, 1e-6, 1.0, 1e6, f64::MAX] {
+                    push(s * c, t * d);
+                    push(s * d, t * c);
+                }
+                for delta in -2i64..=2 {
+                    let c_adj = f64::from_bits(c.to_bits().wrapping_add(delta as u64));
+                    push(s * c_adj, t * 1.0);
+                    push(s * 1.0, t * c_adj);
+                }
+            }
+            // EPS ratio boundary: ay = ax * EPS +- 2 ulps
+            for &ax_val in &[1.0, 100.0, 1e10, 1e200, 1e-200] {
+                let ay_base = ax_val * f64::from_bits(0x3c90000000000000);
+                for delta in -2i64..=2 {
+                    let ay_val = f64::from_bits(ay_base.to_bits().wrapping_add(delta as u64));
+                    push(s * ay_val, t * ax_val);
+                    push(s * ax_val, t * ay_val);
+                }
+            }
+            // kernel branch boundary: h <= 2.0 * ay <=> ay >= ax / sqrt(3) ~= 0.57735 ax
+            for &ax_val in &[1.0f64, 10.0, 1e50, 1e-50] {
+                let ay_base: f64 = ax_val * 0.5773502691896257f64;
+                for delta in -2i64..=2 {
+                    let ay_val = f64::from_bits(ay_base.to_bits().wrapping_add(delta as u64));
+                    push(s * ay_val, t * ax_val);
+                    push(s * ax_val, t * ay_val);
+                }
+            }
+            // Near overflow: sqrt(ax^2 + ay^2) near f64::MAX (D4)
+            let half_max = f64::MAX / 2.0;
+            push(s * half_max, t * half_max);
+            let sqrt_max = 1.3407807929942597e+154; // sqrt(MAX)
+            push(s * sqrt_max, t * sqrt_max);
+        }
+    }
+    for _ in 0..800_000 {
+        let y = rng.log_uniform(1e-320, 1e308, true);
+        let x = rng.log_uniform(1e-320, 1e308, true);
+        push(y, x);
+    }
+    for _ in 0..400_000 {
+        push(f64::from_bits(rng.next()), f64::from_bits(rng.next()));
+    }
+    (ys, xs)
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -763,6 +892,32 @@ fn reference_tan_matches_platform_libm() {
     );
 }
 
+#[test]
+fn reference_log10_matches_platform_libm() {
+    assert_reference(
+        "log10",
+        &corpus_log10(0xD1B5_4A32_D192_ED04),
+        reference::log10,
+        f64::log10,
+    );
+}
+
+#[test]
+fn reference_log1p_matches_platform_libm() {
+    assert_reference(
+        "log1p",
+        &corpus_log1p(0xD1B5_4A32_D192_ED05),
+        reference::log1p,
+        f64::ln_1p,
+    );
+}
+
+#[test]
+fn reference_hypot_matches_platform_libm() {
+    let (ys, xs) = corpus_hypot(0x0BAD_C0DE_1234_5679);
+    assert_reference2("hypot", &ys, &xs, reference::hypot, f64::hypot);
+}
+
 /// `reference::sincos` must agree with `reference::sin`/`cos` taken
 /// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
 /// are genuinely different computations, so this is not redundant with the
@@ -876,6 +1031,30 @@ fn tan_bit_exact_at_every_width() {
     check_all_widths!("tan", &vals, f64::tan, Tan::new());
 }
 
+#[test]
+fn log2_bit_exact_at_every_width() {
+    let vals = corpus_log(0x5DEE_CE66_D1B5_4A34);
+    check_all_widths!("log2", &vals, f64::log2, Log2::new());
+}
+
+#[test]
+fn log10_bit_exact_at_every_width() {
+    let vals = corpus_log10(0x5DEE_CE66_D1B5_4A35);
+    check_all_widths!("log10", &vals, f64::log10, Log10::new());
+}
+
+#[test]
+fn log1p_bit_exact_at_every_width() {
+    let vals = corpus_log1p(0x5DEE_CE66_D1B5_4A36);
+    check_all_widths!("log1p", &vals, f64::ln_1p, Log1p::new());
+}
+
+#[test]
+fn hypot_bit_exact_at_every_width() {
+    let (ys, xs) = corpus_hypot(0x5DEE_CE66_D1B5_4A38);
+    check_all_widths2!("hypot", &ys, &xs, f64::hypot, Hypot::new());
+}
+
 /// `sincos` must agree with `sin`/`cos` taken separately at every width — the
 /// pair object cannot go through `check_all_widths!` directly (it returns two
 /// values), so each half is compared through a shim that keeps only that
@@ -947,6 +1126,7 @@ fn special_lanes_do_not_leak_into_neighbours() {
         check_all_widths!("exp2/mixed", &lanes, f64::exp2, Exp2::new());
         check_all_widths!("ln/mixed", &lanes, f64::ln, Ln::new());
         check_all_widths!("cbrt/mixed", &lanes, f64::cbrt, Cbrt::new());
+        check_all_widths!("log1p/mixed", &lanes, f64::ln_1p, Log1p::new());
         // For asin/acos, the out-of-domain lanes (|x| > 1) must come out as
         // the canonical NaN from the vector path itself, without touching
         // their neighbours or being repaired.

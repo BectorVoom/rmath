@@ -176,21 +176,6 @@ suite!(
     unit_corpus(12),
     f64::atanh
 );
-suite!(log2_is_bit_exact, "log2", Log2, wide_corpus(13), f64::log2);
-suite!(
-    log10_is_bit_exact,
-    "log10",
-    Log10,
-    wide_corpus(14),
-    f64::log10
-);
-suite!(
-    log1p_is_bit_exact,
-    "log1p",
-    Log1p,
-    wide_corpus(15),
-    f64::ln_1p
-);
 suite!(
     expm1_is_bit_exact,
     "expm1",
@@ -262,7 +247,6 @@ fn binary_functions_are_bit_exact() {
     let n = vals.len() / 2;
     let (xs, ys) = (&vals[..n], &vals[n..2 * n]);
     all_widths2!("pow", xs, ys, f64::powf, Pow::new());
-    all_widths2!("hypot", xs, ys, f64::hypot, Hypot::new());
 }
 
 /// `pow` over the ranges its own main path actually covers.
