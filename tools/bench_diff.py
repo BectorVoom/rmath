@@ -7,9 +7,9 @@
     python3 tools/bench_diff.py before.csv after.csv
 
 Each row is `function,metric,speedup[,ns_per_elem]`.
-Rejects comparison if metadata (corpus, size, lanes, fma) does not match
-unless `--ignore-metadata` is provided.
-Reports relative and absolute movement, sorted worst regression first.
+Rejects comparison if critical metadata (corpus, size, suite, widest_f64_lanes, widest_f32_lanes, fma)
+does not match or is missing unless `--ignore-metadata` is provided.
+Reports relative and absolute movement, gating both speedup drops and direct ns/elem increases.
 """
 
 from __future__ import annotations
@@ -52,16 +52,18 @@ def load(path: Path) -> tuple[dict[str, str], dict[tuple[str, str], Record]]:
 
 
 def check_metadata(m_before: dict[str, str], m_after: dict[str, str], ignore: bool) -> bool:
-    critical_keys = ["corpus", "size", "widest_f64_lanes", "widest_f32_lanes", "fma"]
+    critical_keys = ["corpus", "size", "suite", "widest_f64_lanes", "widest_f32_lanes", "fma"]
     mismatches = []
     for k in critical_keys:
         v_before = m_before.get(k)
         v_after = m_after.get(k)
-        if v_before is not None and v_after is not None and v_before != v_after:
+        if v_before is None or v_after is None:
+            mismatches.append((k, str(v_before), str(v_after)))
+        elif v_before != v_after:
             mismatches.append((k, v_before, v_after))
 
     if mismatches:
-        print("ERROR: Incomparable benchmark metadata:")
+        print("ERROR: Incomparable or missing benchmark metadata:")
         for k, vb, va in mismatches:
             print(f"  {k}: before='{vb}' vs after='{va}'")
         if not ignore:
@@ -100,47 +102,61 @@ def main() -> int:
     missing_after = sorted(set(before) - set(after))
 
     moved = []
+    regressions = []
     for key in keys:
         b, a = before[key], after[key]
         if b.speedup == 0:
             continue
-        delta = (a.speedup - b.speedup) / b.speedup
-        if abs(delta) >= args.threshold:
-            moved.append((delta, key, b, a))
-    moved.sort()  # worst regression (most negative delta) first
+        delta_speedup = (a.speedup - b.speedup) / b.speedup
+        delta_ns = (
+            (a.ns_per_elem - b.ns_per_elem) / b.ns_per_elem
+            if (b.ns_per_elem and a.ns_per_elem and b.ns_per_elem > 0)
+            else 0.0
+        )
+        # Movement is significant if speedup changed by threshold OR direct ns changed by threshold
+        if abs(delta_speedup) >= args.threshold or abs(delta_ns) >= args.threshold:
+            moved.append((delta_speedup, delta_ns, key, b, a))
+        # Gating: regression if speedup dropped by > threshold OR direct ns increased by > threshold
+        if delta_speedup < -args.threshold or delta_ns > args.threshold:
+            regressions.append((key, delta_speedup, delta_ns))
+
+    # Sort worst speedup regression first
+    moved.sort(key=lambda x: (x[0], -x[1]))
 
     if not moved and not missing_before and not missing_after:
         print(f"no change past {args.threshold:.0%} across {len(keys)} rows")
         return 0
 
     if moved:
-        has_ns = any(b.ns_per_elem is not None and a.ns_per_elem is not None for _, _, b, a in moved)
+        has_ns = any(b.ns_per_elem is not None and a.ns_per_elem is not None for _, _, _, b, a in moved)
         if has_ns:
             print(
-                f"{'function':<24} {'metric':<10} {'before':>8} {'after':>8} {'speedup_d':>10} {'ns_before':>10} {'ns_after':>10} {'ns_d':>8}"
+                f"{'function':<28} {'metric':<12} {'before':>8} {'after':>8} {'speedup_d':>10} {'ns_before':>10} {'ns_after':>10} {'ns_d':>8}"
             )
-            for delta, (fn, metric), b, a in moved:
+            for delta_sp, delta_ns, (fn, metric), b, a in moved:
                 nb = f"{b.ns_per_elem:.2f}" if b.ns_per_elem is not None else "-"
                 na = f"{a.ns_per_elem:.2f}" if a.ns_per_elem is not None else "-"
-                ns_d = (
-                    f"{(a.ns_per_elem - b.ns_per_elem) / b.ns_per_elem:>+7.1%}"
-                    if (b.ns_per_elem and a.ns_per_elem)
-                    else "-"
-                )
+                ns_d = f"{delta_ns:>+7.1%}" if (b.ns_per_elem and a.ns_per_elem) else "-"
                 print(
-                    f"{fn:<24} {metric:<10} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta:>+9.1%} {nb:>10} {na:>10} {ns_d:>8}"
+                    f"{fn:<28} {metric:<12} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta_sp:>+9.1%} {nb:>10} {na:>10} {ns_d:>8}"
                 )
         else:
-            print(f"{'function':<24} {'metric':<10} {'before':>8} {'after':>8} {'delta':>8}")
-            for delta, (fn, metric), b, a in moved:
-                print(f"{fn:<24} {metric:<10} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta:>+7.1%}")
+            print(f"{'function':<28} {'metric':<12} {'before':>8} {'after':>8} {'delta':>8}")
+            for delta_sp, _, (fn, metric), b, a in moved:
+                print(f"{fn:<28} {metric:<12} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta_sp:>+7.1%}")
 
     for fn, metric in missing_before:
         print(f"new row (no baseline): {fn} {metric}")
     for fn, metric in missing_after:
         print(f"row dropped: {fn} {metric}")
 
-    return 1 if any(delta < -args.threshold for delta, *_ in moved) else 0
+    if regressions:
+        print(f"\nWARNING: {len(regressions)} row(s) regressed past {args.threshold:.0%} threshold:")
+        for (fn, metric), d_sp, d_ns in regressions:
+            print(f"  {fn} ({metric}): speedup {d_sp:>+7.1%}, ns/elem {d_ns:>+7.1%}")
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":

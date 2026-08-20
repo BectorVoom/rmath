@@ -138,10 +138,7 @@ pub mod sincos {
             return (s, c);
         }
         let bad = too_large(x);
-        (
-            crate::simd::patch_lanes(x, s, bad, reference::sin),
-            crate::simd::patch_lanes(x, c, bad, reference::cos),
-        )
+        crate::simd::patch_lanes_pair(x, (s, c), bad, reference::sincos)
     }
 }
 

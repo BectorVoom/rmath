@@ -39,7 +39,6 @@
 //! decide, and two tabulated hard cases) fall back to the scalar reference for
 //! the affected lanes only.
 
-use crate::kernels::double::dd::a_mul;
 use crate::kernels::not_normal;
 use crate::policy::{Accuracy, Domain};
 use crate::reference::double::{
@@ -119,27 +118,27 @@ fn fast<V: Simd<Elem = f64>>(x: V) -> V {
     }
     let four = V::splat(4.0);
     let third = V::splat(1.0 / 3.0);
+    let one = V::splat(1.0);
 
     // Newton on f(r) = r^-3 - x: r <- r (4 - x r³) / 3, division-free and
-    // quadratic. Seed error 0.0343 -> 2.4e-3 -> 1.1e-5 -> 2.6e-10 -> 4.4e-16.
+    // quadratic. Steps 1-2 standard, steps 3-4 FMA-compensated:
     let r = V::from_bits(seed);
     let r = r * ((four - ax * (r * (r * r))) * third);
     let r = r * ((four - ax * (r * (r * r))) * third);
-    let r = r * ((four - ax * (r * (r * r))) * third);
-    let r = r * ((four - ax * (r * (r * r))) * third);
+    let r3 = r * (r * r);
+    let e = (-ax).mul_add(r3, one);
+    let r = r.mul_add(e * third, r);
+    let r3 = r * (r * r);
+    let e = (-ax).mul_add(r3, one);
+    let r = r.mul_add(e * third, r);
 
-    // cbrt(x) = x r², with r² and the final product compensated. `r` itself
-    // is accurate to about a `f64` ulp at this point — the Newton iteration
-    // above cannot refine it further in plain `f64` arithmetic — but squaring
-    // a value that carries even one ulp of relative error roughly doubles it,
-    // and a plain `ax * (r * r)` adds two more roundings on top of that. This
-    // does not fix `r`'s own residual (only carrying `r` itself in
-    // double-double through one more Newton step would), but it removes the
-    // squaring and combine's own contribution, which measurably tightens the
-    // worst case (see the module doc's measured bound).
-    let (r2h, r2l) = a_mul(r, r);
-    let (yh, yl) = a_mul(ax, r2h);
-    (yh + (yl + ax * r2l)).copysign(x)
+    // cbrt(x) = x r², with direct Newton step on f(y) = y³ - ax.
+    // 1 / (3 y²) ≈ r² / 3, giving <= 3 ulp precision across the full domain.
+    let r2 = r * r;
+    let y = ax * r2;
+    let dy = (-y).mul_add(y * y, ax);
+    let res = dy.mul_add(r2 * third, y);
+    res.copysign(x)
 }
 
 /// The `BitExact` path, lane-for-lane identical to Rust's `f64::cbrt`.

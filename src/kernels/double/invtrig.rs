@@ -86,6 +86,27 @@ mod bit_exact {
     #[inline(always)]
     fn cij_row<V: Simd<Elem = f64>>(idx: V) -> (V, V, V, V, V, V, V) {
         let idxa = idx.to_array();
+        let idx0 = idxa.as_slice()[0] as i64;
+        let mut all_same = true;
+        for i in 1..V::LANES {
+            if idxa.as_slice()[i] as i64 != idx0 {
+                all_same = false;
+                break;
+            }
+        }
+        if all_same {
+            let row = (idx0.clamp(0, 240) as usize) * 7;
+            return (
+                V::splat(f64::from_bits(at::CIJ[row])),
+                V::splat(f64::from_bits(at::CIJ[row + 1])),
+                V::splat(f64::from_bits(at::CIJ[row + 2])),
+                V::splat(f64::from_bits(at::CIJ[row + 3])),
+                V::splat(f64::from_bits(at::CIJ[row + 4])),
+                V::splat(f64::from_bits(at::CIJ[row + 5])),
+                V::splat(f64::from_bits(at::CIJ[row + 6])),
+            );
+        }
+
         let mut x0 = V::Floats::filled_default();
         let mut t1 = V::Floats::filled_default();
         let mut c2 = V::Floats::filled_default();
@@ -443,6 +464,45 @@ mod bit_exact {
     #[inline(always)]
     fn asncs_row<V: Simd<Elem = f64>>(k: V) -> (V, V, [V; 11], V, V) {
         let ka = k.to_array();
+        let k0 = ka.as_slice()[0] as u32;
+        let mut all_same = true;
+        for i in 1..V::LANES {
+            if ka.as_slice()[i] as u32 != k0 {
+                all_same = false;
+                break;
+            }
+        }
+        if all_same {
+            let (n, d) = if k0 < 0x3fe0_0000 {
+                if k0 < 0x3fd0_0000 {
+                    (11 * ((k0 & 0x000f_ffff) >> 15), 5)
+                } else {
+                    (11 * ((k0 & 0x000f_ffff) >> 14) + 352, 5)
+                }
+            } else if k0 < 0x3fe8_0000 {
+                (1056 + (((k0 & 0x000f_e000) >> 11) * 3), 6)
+            } else if k0 < 0x3fed_8000 {
+                (992 + (((k0 & 0x000f_e000) >> 13) * 13), 7)
+            } else if k0 < 0x3fee_8000 {
+                (884 + (((k0 & 0x000f_e000) >> 13) * 14), 8)
+            } else {
+                (768 + (((k0 & 0x000f_e000) >> 13) * 15), 9)
+            };
+            let n = (n.min(2555)) as usize;
+            let x0 = V::splat(f64::from_bits(ac::ASNCS[n]));
+            let t1 = V::splat(f64::from_bits(ac::ASNCS[n + 1]));
+            let mut c = [V::splat(0.0); 11];
+            for (j, slot) in c.iter_mut().enumerate() {
+                let slot_idx = j + 2;
+                if slot_idx < 2 + d {
+                    *slot = V::splat(f64::from_bits(ac::ASNCS[n + slot_idx]));
+                }
+            }
+            let outer = V::splat(f64::from_bits(ac::ASNCS[n + 2 + d]));
+            let fin = V::splat(f64::from_bits(ac::ASNCS[n + 3 + d]));
+            return (x0, t1, c, outer, fin);
+        }
+
         let mut x0 = V::Floats::filled_default();
         let mut t1 = V::Floats::filled_default();
         let mut c = [V::Floats::filled_default(); 11];
@@ -532,7 +592,7 @@ mod bit_exact {
             // `511 - (k >> 21)` is always in `[0, 27]` for a real near-1 lane
             // (`z >= 2^-54`); the clamp is defensive for the lanes whose
             // result the blend discards (`z` zero, negative or NaN).
-            let p = (511 - (k >> 21)).clamp(0, 27) as usize;
+            let p = (511i32 - (k >> 21) as i32).clamp(0, 27) as usize;
             seeds.as_mut_slice()[i] = ir * ac::POWTWO[p];
         }
         let seed = V::from_array(seeds);

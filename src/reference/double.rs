@@ -883,7 +883,7 @@ pub fn pow(x: f64, y: f64) -> f64 {
             // Subnormal x: normalise so the exponent becomes negative.
             ix = (x * P52).to_bits();
             ix &= 0x7fff_ffff_ffff_ffff;
-            ix -= 52u64 << 52;
+            ix = ix.wrapping_sub(52u64 << 52);
         }
     }
 

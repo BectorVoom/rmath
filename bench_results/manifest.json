@@ -1,0 +1,129 @@
+{
+  "commit": "4eee3e312959cf340f43b97b30d7486be89955c1",
+  "timestamp": "2026-08-20T11:35:08.723152+00:00",
+  "rustflags": "-C target-cpu=native",
+  "runs": [
+    {
+      "suite": "default",
+      "corpus": "in-domain",
+      "size": 4096,
+      "csv": "bench_results/default_in-domain_4096.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=default",
+        "--corpus=in-domain",
+        "--size=4096",
+        "--csv=bench_results/default_in-domain_4096.csv"
+      ]
+    },
+    {
+      "suite": "default",
+      "corpus": "boundary",
+      "size": 4096,
+      "csv": "bench_results/default_boundary_4096.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=default",
+        "--corpus=boundary",
+        "--size=4096",
+        "--csv=bench_results/default_boundary_4096.csv"
+      ]
+    },
+    {
+      "suite": "default",
+      "corpus": "random-bit",
+      "size": 4096,
+      "csv": "bench_results/default_random-bit_4096.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=default",
+        "--corpus=random-bit",
+        "--size=4096",
+        "--csv=bench_results/default_random-bit_4096.csv"
+      ]
+    },
+    {
+      "suite": "default",
+      "corpus": "coherent",
+      "size": 4096,
+      "csv": "bench_results/default_coherent_4096.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=default",
+        "--corpus=coherent",
+        "--size=4096",
+        "--csv=bench_results/default_coherent_4096.csv"
+      ]
+    },
+    {
+      "suite": "default",
+      "corpus": "mixed-special",
+      "size": 4096,
+      "csv": "bench_results/default_mixed-special_4096.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=default",
+        "--corpus=mixed-special",
+        "--size=4096",
+        "--csv=bench_results/default_mixed-special_4096.csv"
+      ]
+    },
+    {
+      "suite": "traversal",
+      "corpus": "default",
+      "size": 1048576,
+      "csv": "bench_results/traversal.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=traversal",
+        "--csv=bench_results/traversal.csv"
+      ]
+    },
+    {
+      "suite": "repair",
+      "corpus": "default",
+      "size": 1048576,
+      "csv": "bench_results/repair.csv",
+      "cmd": [
+        "cargo",
+        "run",
+        "--release",
+        "--example",
+        "bench",
+        "--",
+        "--suite=repair",
+        "--csv=bench_results/repair.csv"
+      ]
+    }
+  ]
+}

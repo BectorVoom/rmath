@@ -383,6 +383,22 @@ pub trait Simd:
         }
         out
     }
+
+    /// Load a vector from a slice of length `LANES`.
+    #[inline(always)]
+    fn load_slice(slice: &[Self::Elem]) -> Self {
+        debug_assert!(slice.len() >= Self::LANES);
+        let mut arr = Self::Floats::filled_default();
+        arr.as_mut_slice().copy_from_slice(&slice[..Self::LANES]);
+        Self::from_array(arr)
+    }
+
+    /// Store a vector into a slice of length `LANES`.
+    #[inline(always)]
+    fn store_slice(self, slice: &mut [Self::Elem]) {
+        debug_assert!(slice.len() >= Self::LANES);
+        slice[..Self::LANES].copy_from_slice(self.to_array().as_slice());
+    }
 }
 
 /// The sign-bit pattern for an element type.
@@ -448,6 +464,67 @@ pub fn patch_lanes2<V: Simd>(
         bits &= bits - 1;
     }
     V::from_array(zs)
+}
+
+/// [`patch_lanes`] for a function returning two values (e.g. `sincos`, `modf`).
+///
+/// Repaired lanes invoke the scalar pair function once and write both outputs,
+/// avoiding redundant unpacks and redundant scalar work.
+#[inline(always)]
+pub fn patch_lanes_pair<V: Simd>(
+    x: V,
+    (y1, y2): (V, V),
+    mask: V::Mask,
+    reference: impl Fn(V::Elem) -> (V::Elem, V::Elem),
+) -> (V, V) {
+    if mask.none() {
+        return (y1, y2);
+    }
+    if mask.all() {
+        return map_lanes_pair(x, reference);
+    }
+    let xs = x.to_array();
+    let mut ys1 = y1.to_array();
+    let mut ys2 = y2.to_array();
+    let mut bits = mask.to_bitmask();
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        let (r1, r2) = reference(xs.as_slice()[i]);
+        ys1.as_mut_slice()[i] = r1;
+        ys2.as_mut_slice()[i] = r2;
+        bits &= bits - 1;
+    }
+    (V::from_array(ys1), V::from_array(ys2))
+}
+
+/// [`patch_lanes`] for a two-argument function returning two values (e.g. `remquo`).
+#[inline(always)]
+pub fn patch_lanes2_pair<V: Simd>(
+    x: V,
+    y: V,
+    (z1, z2): (V, V),
+    mask: V::Mask,
+    reference: impl Fn(V::Elem, V::Elem) -> (V::Elem, V::Elem),
+) -> (V, V) {
+    if mask.none() {
+        return (z1, z2);
+    }
+    if mask.all() {
+        return map_lanes2_pair(x, y, reference);
+    }
+    let xs = x.to_array();
+    let ys = y.to_array();
+    let mut zs1 = z1.to_array();
+    let mut zs2 = z2.to_array();
+    let mut bits = mask.to_bitmask();
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        let (r1, r2) = reference(xs.as_slice()[i], ys.as_slice()[i]);
+        zs1.as_mut_slice()[i] = r1;
+        zs2.as_mut_slice()[i] = r2;
+        bits &= bits - 1;
+    }
+    (V::from_array(zs1), V::from_array(zs2))
 }
 
 /// Evaluate a scalar function on every lane.

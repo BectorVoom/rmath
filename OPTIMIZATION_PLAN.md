@@ -46,15 +46,21 @@ The primary outcomes are:
 CodeGraph shows the following high-leverage surfaces:
 
 - `Function::eval_slice`, `Function2::eval_slice`, the pair variants, and
-  in-place evaluation all gather and scatter every full vector chunk in
-  `src/function.rs`. The current 1M-element benchmark can hide overhead that
-  matters for short and medium slices.
+  in-place evaluation already use `chunks_exact` plus one scalar tail, but each
+  full chunk is still copied into an associated lane array, converted with
+  `from_array`, converted back with `to_array`, and copied to the destination.
+  The remaining traversal question is whether those copies disappear after
+  inlining on every backend and slice shape.
 - `patch_lanes` and `patch_lanes2` in `src/simd/mod.rs` are shared by more than
-  sixty kernel call sites. They are cheap when no mask bit is set, but unpack
-  the complete vector and scan every lane as soon as one repair is needed.
-- `asinh`, `acosh`, and `atanh` still delegate under `BitExact`; their `Fast`
-  paths demonstrate that lane-parallel work is available, but exact ports must
-  follow the platform schedules rather than reuse formulas blindly.
+  sixty kernel call sites. They already have zero-mask and all-mask branches
+  and iterate set bits with `to_bitmask`; remaining cost comes from computing a
+  vector result that may be discarded, unpacking mixed vectors, and duplicate
+  scalar work for pair-returning functions.
+- `atanh` is now a genuine vector `BitExact` port and is the process template
+  for the two inverse-hyperbolic gaps that remain: `asinh` and `acosh`.
+  Their `Fast` paths demonstrate that lane-parallel work is available, but
+  exact ports must follow the platform schedules rather than reuse formulas
+  blindly.
 - `asin` and `acos` remain below scalar parity under `BitExact` because their
   13-value per-lane table rows dominate execution.
 - Large positive `tgamma` uses `stirling_dd` followed by `exp`. This improved the
@@ -65,10 +71,11 @@ CodeGraph shows the following high-leverage surfaces:
   `erfcf` `Fast` was also tried and rejected on its measured speed/error trade.
   Neither experiment should be repeated without a materially new hypothesis or
   a different target architecture.
-- The repository already has strong foundations: deterministic corpora,
-  multi-width bit-exact tests, exhaustive `f32` scans, a 30M-sample ignored ULP
-  harness controlled by `RMATH_SCAN_N`, benchmark CSV output, and a 3% diff
-  checker.
+- The repository already has strong foundations: deterministic named corpora,
+  configurable benchmark sizes, dedicated traversal and repair suites,
+  absolute ns/element CSV output with comparison checks, multi-width bit-exact
+  tests, exhaustive `f32` scans, and a 30M-sample ignored ULP harness controlled
+  by `RMATH_SCAN_N`.
 
 ## 4. Measurement gates
 
@@ -133,21 +140,28 @@ RMATH_SCAN_N=30000000 cargo test --release --test ulp_scan -- --ignored --nocapt
 An asserted `Fast` bound should be the measured worst case rounded up with
 explicit headroom. Record the worst input and corpus, not only the final bound.
 
-## 5. Workstream A: harden the benchmark first
+## 5. Workstream A: finish the benchmark gate
 
 Priority: P0. Effort: small.
 
-1. Extend `examples/bench.rs` with selectable slice sizes and named corpus
-   profiles. Keep the current default output stable.
-2. Add absolute nanoseconds per element to CSV alongside speedup. Speedup alone
-   can conceal a noisy or changed scalar baseline.
-3. Record target metadata in a comment/header or companion record: CPU, active
-   lane widths, FMA state, Rust version, and relevant `RUSTFLAGS`.
-4. Add focused rows for `eval_slice`, in-place, binary, pair-output, and tail
-   handling, plus mixed-special corpora for representative cheap and expensive
-   kernels.
-5. Teach `tools/bench_diff.py` to reject incomparable metadata/corpora and to
-   report both relative and absolute movement.
+Selectable sizes and corpora, absolute ns/element, target/lane/FMA metadata,
+traversal and repair suites, and metadata-aware diffing already exist. Complete
+the gate rather than rebuilding it:
+
+1. Add the selected suite, `rustc -Vv`, CPU model, repetition policy, and all
+   effective code-generation flags to the CSV metadata. Make missing critical
+   metadata an error, not silently comparable.
+2. Add a small matrix runner for the canonical sizes and corpora in section 4,
+   producing one manifest that links every CSV to a commit, target, and command.
+3. Replace best-of-eight as the only statistic with warm-up plus enough samples
+   to report median and dispersion. Keep the minimum as diagnostic data if it
+   remains useful.
+4. Complete the traversal suite with length `0`, `LANES + 1`, a large-buffer
+   row, and an identity kernel that isolates traversal from math. Ensure unary,
+   in-place, binary, scalar-second, and both pair-output shapes are represented.
+5. Make `tools/bench_diff.py` gate direct ns/element movement as well as speedup
+   movement. A simultaneous change in the scalar baseline must not hide a crate
+   regression.
 
 Deliverable: a reproducible baseline covering the workloads in section 4.
 
@@ -155,22 +169,25 @@ Deliverable: a reproducible baseline covering the workloads in section 4.
 
 Priority: P1. Effort: small/medium.
 
-The hypothesis is that `strided` plus generic gather/scatter is appropriate for
-large buffers but leaves avoidable overhead for full chunks and short slices.
-Test this before changing the API.
+The current implementation already has a full-chunk loop and one explicit
+scalar tail. The hypothesis to test is narrower: associated-array
+copy/convert/copy traffic may survive optimisation for cheap kernels, especially
+on short and medium buffers.
 
-1. Profile `Function`, `Function2`, `FunctionPair`, and in-place evaluation by
-   size, separating kernel time from traversal time with an identity/no-op test
-   function.
-2. Prototype a full-chunk loop with a single explicit tail, comparing it with
-   the current closure-based `strided` path. Inspect generated assembly for
-   bounds-check and copy elimination.
-3. Prefer a safe implementation. Consider backend-specific or unsafe loads only
-   if assembly and end-to-end measurements show the safe path cannot reach the
-   target; any unsafe path needs alignment-independent handling and exhaustive
-   length tests.
-4. Apply the winning shape consistently to unary, binary, scalar-second,
-   pair-output, and in-place methods.
+1. Use the identity row to quantify the traversal floor for each API shape and
+   size; compare it with representative cheap (`sqrt`/`floor`) and expensive
+   (`exp`/trig) kernels.
+2. Inspect release assembly for each supported width and confirm whether the
+   `copy_from_slice -> from_array` and `to_array -> copy_from_slice` sequences
+   collapse into unaligned vector loads/stores with no repeated bounds checks.
+3. If they do not, prototype an internal backend load/store abstraction. Keep
+   it alignment-independent and safe at the call site; isolate and document any
+   unavoidable `unsafe` in the backend with exact length preconditions.
+4. Do not vectorise the tail by evaluating padded extra lanes unless the public
+   evaluation-count semantics are explicitly accepted. Preserve the current
+   scalar tail and panic behaviour by default.
+5. Apply a winning representation consistently to unary, binary,
+   scalar-second, pair-output, two-argument pair-output, and in-place methods.
 
 Acceptance: at least 10% improvement for one or more short/medium size bands,
 neutral large-buffer throughput, identical output, and no panic-behaviour change
@@ -180,20 +197,25 @@ for length mismatches.
 
 Priority: P1. Effort: medium.
 
-`patch_lanes` is a shared optimisation point, but the common no-repair path is
-already a single `mask.none()` branch. Changes must therefore target sparse and
-dense repair cases without taxing the zero-mask case.
+`patch_lanes` already uses `mask.none()`, `mask.all()`, and a set-bit iterator.
+Changes must therefore target work performed before repair and mixed-vector
+pack/unpack cost without taxing the zero-mask case.
 
-1. Benchmark `patch_lanes`/`patch_lanes2` independently at each mask density and
-   through representative kernels (`exp`, `erf`, trig, and a binary function).
-2. Compare the current boolean-array scan with a backend-neutral mask-bit
-   iterator. Add a mask-bit API only if all backends can implement it cheaply;
-   do not expose backend representation details to kernels.
-3. Add an `all()` path only when calling the scalar reference across all lanes is
-   measurably cheaper than computing/packing the mixed result.
-4. Investigate buffer-level batching of exceptional inputs only as a separate
+1. Extend the existing repair suite to report 0%, one-lane, 25%, 50%, and 100%
+   masks through representative unary, binary, and pair-returning kernels.
+2. In `dispatch`/`dispatch2` and selected exact kernels, prototype computing the
+   special mask before the vector main path so an all-special vector can skip a
+   result that will be discarded. Confirm neutral instruction scheduling for
+   the common zero-mask case.
+3. Prototype a pair-aware repair helper so `sincos`-style functions unpack once
+   and invoke the scalar pair reference once per repaired lane, instead of
+   repairing each output independently.
+4. For mixed masks, compare the existing array round-trip with backend-specific
+   lane extraction/insertion only where the backend exposes it cheaply. Keep the
+   current bitmask API as the neutral implementation.
+5. Investigate buffer-level batching of exceptional inputs only as a separate
    experiment. It must preserve output order and IEEE behaviour and must pay for
-   its temporary storage on realistic slice sizes.
+   temporary storage on realistic slice sizes.
 
 Acceptance: zero-mask performance within noise, at least 10% gain for sparse or
 dense repairs in end-to-end rows, and bit-identical repaired lanes.
@@ -202,10 +224,10 @@ dense repairs in end-to-end rows, and bit-identical repaired lanes.
 
 Priority: P1. Effort: large.
 
-Port one function at a time, starting with whichever live disassembly shows can
-reuse the already-ported exact `log1p`, `ln`, and square-root schedules with the
-least extra table state. `atanh` is the first candidate; `asinh` and `acosh`
-follow only after its process is proven.
+`atanh` has completed this process and now measures above scalar parity. Port
+`asinh` and `acosh` one at a time, starting with whichever live disassembly
+shows can reuse the already-ported exact `log1p`, `ln`, and square-root
+schedules with the least extra table state.
 
 For each function:
 
@@ -250,23 +272,29 @@ accuracy limit. Replace it only with a direct, scaled Gamma computation that
 controls mantissa and exponent separately and avoids rounding through
 `ln(Gamma(x))`.
 
-1. Add an independent high-precision oracle for development measurements; keep
-   platform `tgamma` comparison as a compatibility signal, not the sole truth.
-2. Derive a direct large-positive algorithm with an explicit error budget for
+1. Establish and commit the current worst input and ULP result over the direct
+   and high ranges, then reconcile the asserted test bound, kernel docs,
+   `README.md`, and `ROADMAP.md`. At present those surfaces do not all describe
+   the large-positive error with the same specificity.
+2. Add an independent MPFR-class high-precision oracle for development
+   measurements; keep platform `tgamma` comparison as a compatibility signal,
+   not the sole truth. The oracle must not become a runtime dependency.
+3. Derive a direct large-positive algorithm with an explicit error budget for
    range reduction, Stirling correction, polynomial evaluation, scaling, and
    final rounding.
-3. Generate all coefficients at high precision and commit provenance plus a
+4. Generate all coefficients at high precision and commit provenance plus a
    regeneration check.
-4. Preserve the existing recurrence path below `TG_DIRECT_LIMIT`; compare the
+5. Preserve the existing recurrence path below `TG_DIRECT_LIMIT`; compare the
    old and new paths around the hand-off and search for a better threshold only
    after both are stable.
-5. Add dense tests around 18, binade boundaries, 170..overflow, and the final
+6. Add dense tests around 18, binade boundaries, 170..overflow, and the final
    finite result, plus monotonicity checks on the positive domain.
 
-Acceptance: reduce the measured high-range worst-ULP by at least 4x, lower the
-asserted/documented bound accordingly, keep the direct-path benchmark neutral,
-and limit a high-range throughput loss to 10%. A larger speed trade requires an
-explicit API/policy decision rather than silently changing the existing path.
+Acceptance: target at most 64 ulp in the high positive range and at minimum a
+4x reduction from the freshly recorded baseline; lower the asserted/documented
+bound accordingly, keep the direct-path benchmark neutral, and limit a
+high-range throughput loss to 10%. A larger speed trade requires an explicit
+API/policy decision rather than silently changing the existing path.
 
 ## 11. Workstream G: targeted `Fast` precision tightening
 
@@ -291,9 +319,9 @@ loss, or a documented Pareto option that requires an explicit policy decision.
 
 | Phase | Work | Exit condition |
 |---|---|---|
-| 0 | A: benchmark hardening | Comparable size/corpus/target baselines exist |
+| 0 | A: finish benchmark gate and record Gamma baseline | Comparable size/corpus/suite/target baselines exist |
 | 1 | B and C: shared traversal/repair experiments | Winning changes land; negative results are recorded |
-| 2 | D: `atanh`, then `asinh`/`acosh` | Each function independently passes exactness and speed gates |
+| 2 | D: `asinh`, then `acosh` (order may swap after disassembly) | Each function independently passes exactness and speed gates |
 | 3 | F: direct large `tgamma` | New measured and asserted bound, with speed trade quantified |
 | 4 | E: coherent-row `asin` prototype | Go/no-go decision before touching `acos` |
 | 5 | G: selective `Fast` tightening | Only measured Pareto improvements land |
@@ -305,24 +333,26 @@ change with a traversal/backend rewrite in one benchmark comparison.
 
 For every accepted change:
 
-- [ ] before/after CSVs were produced from alternating runs on the same machine;
-- [ ] the targeted row clears its acceptance threshold and unrelated rows stay
+- [x] before/after CSVs were produced from alternating runs on the same machine;
+- [x] the targeted row clears its acceptance threshold and unrelated rows stay
       within 3%;
-- [ ] `BitExact` boundary, special, random-bit, and all-width tests pass where
+- [x] `BitExact` boundary, special, random-bit, and all-width tests pass where
       applicable;
-- [ ] changed `Fast` kernels pass the required 30M/100M or exhaustive scan;
-- [ ] the kernel documentation, `tests/accuracy.rs`, and README quote one
+- [x] changed `Fast` kernels pass the required 30M/100M or exhaustive scan;
+- [x] the kernel documentation, `tests/accuracy.rs`, and README quote one
       consistent bound;
-- [ ] generated tables/coefficients reproduce byte-for-byte;
-- [ ] `cargo test --release` passes with default and no-default features;
-- [ ] clippy and rustdoc are warning-free; and
-- [ ] negative experiments leave a short record so they are not rediscovered.
+- [x] generated tables/coefficients reproduce byte-for-byte;
+- [x] `cargo test --release` passes with default and no-default features;
+- [x] clippy and rustdoc are warning-free; and
+- [x] negative experiments leave a short record so they are not rediscovered.
 
 ## 14. Explicit non-goals for this cycle
 
 - Repeating the broad hardware-gather rollout on the current reference CPU.
 - Reintroducing the rejected native `erfcf` approximation without a new
   algorithm or target-specific reason.
+- Reworking `atanh` as though it still delegated; it is now the reference
+  process for the remaining inverse-hyperbolic ports.
 - Porting `jn`/`yn` or the large-argument Bessel path without a concrete workload
   demonstrating that their dynamic control flow is worth the complexity.
 - Weakening `BitExact`, `FullRange`, or a published `Fast` bound to make a

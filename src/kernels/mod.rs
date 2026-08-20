@@ -67,11 +67,19 @@ pub(crate) fn dispatch<V: Simd, A: Accuracy, D: Domain>(
     if A::BIT_EXACT {
         return map_lanes(x, reference);
     }
-    let y = fast(x);
     if D::CHECKED {
-        patch_lanes(x, y, special(x), reference)
+        let mask = special(x);
+        if mask.all() {
+            return map_lanes(x, reference);
+        }
+        let y = fast(x);
+        if mask.none() {
+            y
+        } else {
+            patch_lanes(x, y, mask, reference)
+        }
     } else {
-        y
+        fast(x)
     }
 }
 
@@ -87,11 +95,19 @@ pub(crate) fn dispatch2<V: Simd, A: Accuracy, D: Domain>(
     if A::BIT_EXACT {
         return crate::simd::map_lanes2(x, y, reference);
     }
-    let z = fast(x, y);
     if D::CHECKED {
-        crate::simd::patch_lanes2(x, y, z, special(x, y), reference)
+        let mask = special(x, y);
+        if mask.all() {
+            return crate::simd::map_lanes2(x, y, reference);
+        }
+        let z = fast(x, y);
+        if mask.none() {
+            z
+        } else {
+            crate::simd::patch_lanes2(x, y, z, mask, reference)
+        }
     } else {
-        z
+        fast(x, y)
     }
 }
 

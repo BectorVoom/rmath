@@ -301,7 +301,7 @@ fn fast_cbrt_stays_within_bounds() {
     check(
         "cbrt",
         29,
-        8.0,
+        4.0,
         |r| r.log_uniform(1e-300, 1e300, true),
         fast!(Cbrt),
         f64::cbrt,

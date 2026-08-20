@@ -32,7 +32,7 @@
 //! `Function2<f64>` and `Function2<f32>` and one object serves both.
 
 use crate::policy::{BitExact, Fast, FullRange};
-use crate::simd::{Lanes, Real, Simd};
+use crate::simd::{Real, Simd};
 
 /// The widest `f64` vector the enabled backend provides.
 ///
@@ -54,10 +54,8 @@ fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
     let (d_head, d_tail) = dst.split_at_mut(end);
 
     for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
-        let mut arr = <E::Widest as Simd>::Floats::filled_default();
-        arr.as_mut_slice().copy_from_slice(s_chunk);
-        let v = f.eval(<E::Widest as Simd>::from_array(arr));
-        d_chunk.copy_from_slice(v.to_array().as_slice());
+        let v = f.eval(<E::Widest as Simd>::load_slice(s_chunk));
+        v.store_slice(d_chunk);
     }
     for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
         *d = f.eval::<E>(*s);
@@ -72,10 +70,8 @@ fn eval_unary_in_place<E: Real, F: Function<E>>(f: &F, buf: &mut [E]) {
     let (head, tail) = buf.split_at_mut(end);
 
     for chunk in head.chunks_exact_mut(lanes) {
-        let mut arr = <E::Widest as Simd>::Floats::filled_default();
-        arr.as_mut_slice().copy_from_slice(chunk);
-        let v = f.eval(<E::Widest as Simd>::from_array(arr));
-        chunk.copy_from_slice(v.to_array().as_slice());
+        let v = f.eval(<E::Widest as Simd>::load_slice(chunk));
+        v.store_slice(chunk);
     }
     for x in tail.iter_mut() {
         *x = f.eval::<E>(*x);
@@ -98,15 +94,10 @@ fn eval_binary_slice<E: Real, F: Function2<E>>(f: &F, a: &[E], b: &[E], dst: &mu
         .zip(b_head.chunks_exact(lanes))
         .zip(d_head.chunks_exact_mut(lanes))
     {
-        let mut arr_a = <E::Widest as Simd>::Floats::filled_default();
-        let mut arr_b = <E::Widest as Simd>::Floats::filled_default();
-        arr_a.as_mut_slice().copy_from_slice(a_chunk);
-        arr_b.as_mut_slice().copy_from_slice(b_chunk);
-        let v = f.eval(
-            <E::Widest as Simd>::from_array(arr_a),
-            <E::Widest as Simd>::from_array(arr_b),
-        );
-        d_chunk.copy_from_slice(v.to_array().as_slice());
+        let va = <E::Widest as Simd>::load_slice(a_chunk);
+        let vb = <E::Widest as Simd>::load_slice(b_chunk);
+        let v = f.eval(va, vb);
+        v.store_slice(d_chunk);
     }
     for ((x, y), d) in a_tail.iter().zip(b_tail.iter()).zip(d_tail.iter_mut()) {
         *d = f.eval::<E>(*x, *y);
@@ -129,10 +120,9 @@ fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(
     let y_splat = <E::Widest as Simd>::splat(y);
 
     for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
-        let mut arr = <E::Widest as Simd>::Floats::filled_default();
-        arr.as_mut_slice().copy_from_slice(s_chunk);
-        let v = f.eval(<E::Widest as Simd>::from_array(arr), y_splat);
-        d_chunk.copy_from_slice(v.to_array().as_slice());
+        let va = <E::Widest as Simd>::load_slice(s_chunk);
+        let v = f.eval(va, y_splat);
+        v.store_slice(d_chunk);
     }
     for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
         *d = f.eval::<E>(*s, y);
@@ -160,11 +150,10 @@ fn eval_pair_slice<E: Real, F: FunctionPair<E>>(
         .zip(f_head.chunks_exact_mut(lanes))
         .zip(s2_head.chunks_exact_mut(lanes))
     {
-        let mut arr = <E::Widest as Simd>::Floats::filled_default();
-        arr.as_mut_slice().copy_from_slice(s_chunk);
-        let (v1, v2) = f.eval(<E::Widest as Simd>::from_array(arr));
-        f_chunk.copy_from_slice(v1.to_array().as_slice());
-        s2_chunk.copy_from_slice(v2.to_array().as_slice());
+        let va = <E::Widest as Simd>::load_slice(s_chunk);
+        let (v1, v2) = f.eval(va);
+        v1.store_slice(f_chunk);
+        v2.store_slice(s2_chunk);
     }
     for ((s, f1), f2) in s_tail.iter().zip(f_tail.iter_mut()).zip(s2_tail.iter_mut()) {
         let (a, b) = f.eval::<E>(*s);
@@ -198,16 +187,11 @@ fn eval_2pair_slice<E: Real, F: Function2Pair<E>>(
         .zip(f_head.chunks_exact_mut(lanes))
         .zip(s2_head.chunks_exact_mut(lanes))
     {
-        let mut arr_a = <E::Widest as Simd>::Floats::filled_default();
-        let mut arr_b = <E::Widest as Simd>::Floats::filled_default();
-        arr_a.as_mut_slice().copy_from_slice(a_chunk);
-        arr_b.as_mut_slice().copy_from_slice(b_chunk);
-        let (v1, v2) = f.eval(
-            <E::Widest as Simd>::from_array(arr_a),
-            <E::Widest as Simd>::from_array(arr_b),
-        );
-        f_chunk.copy_from_slice(v1.to_array().as_slice());
-        s2_chunk.copy_from_slice(v2.to_array().as_slice());
+        let va = <E::Widest as Simd>::load_slice(a_chunk);
+        let vb = <E::Widest as Simd>::load_slice(b_chunk);
+        let (v1, v2) = f.eval(va, vb);
+        v1.store_slice(f_chunk);
+        v2.store_slice(s2_chunk);
     }
     for (((x, y), f1), f2) in a_tail
         .iter()

@@ -15,14 +15,12 @@
 //! measure. The harness says so at startup rather than silently reporting bad
 //! numbers.
 //!
-//! Method: best-of-N over a buffer, timing `eval_slice`
-//! against a plain scalar loop over the same data. Best-of rather than mean,
-//! because the quantity of interest is the achievable rate and the noise here
-//! is all one-directional.
+//! Method: warm-up iterations followed by timed samples reporting median
+//! over a buffer, timing `eval_slice` against a plain scalar loop over the same data.
 //!
 //! # Options
 //! - `--size=N`: custom buffer size (default 1048576)
-//! - `--corpus=NAME`: `default`, `in-domain`, `boundary`, `random-bit`, `coherent`, `special`
+//! - `--corpus=NAME`: `default`, `in-domain`, `boundary`, `random-bit`, `coherent`, `special`, `mixed-special`
 //! - `--suite=NAME`: `default`, `traversal`, `repair`, `all`
 //! - `--csv=PATH` or `--csv`: emit CSV output with metadata header
 
@@ -46,7 +44,8 @@ mod libm {
 }
 
 const DEFAULT_N: usize = 1 << 20;
-const REPS: usize = 8;
+const WARMUP: usize = 2;
+const SAMPLES: usize = 10;
 
 /// Every `(function, metric, speedup, ns_per_elem)` printed this run, for `--csv`.
 static RECORD: std::sync::Mutex<Vec<(String, String, f64, f64)>> =
@@ -60,13 +59,42 @@ fn record(function: impl Into<String>, metric: impl Into<String>, speedup: f64, 
         .push((function.into(), metric.into(), speedup, ns_per_elem));
 }
 
+fn get_cpu_model() -> String {
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        for line in cpuinfo.lines() {
+            if line.starts_with("model name") {
+                if let Some((_, model)) = line.split_once(':') {
+                    return model.trim().to_string();
+                }
+            }
+        }
+    }
+    std::env::consts::ARCH.to_string()
+}
+
+/// Compute median and min ns/element from sampled times.
+fn compute_stats(mut times: Vec<f64>, len: usize) -> (f64, f64) {
+    if len == 0 || times.is_empty() {
+        return (0.0, 0.0);
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    let median = if times.len() % 2 == 0 {
+        0.5 * (times[times.len() / 2 - 1] + times[times.len() / 2])
+    } else {
+        times[times.len() / 2]
+    };
+    let min = times[0];
+    (median * 1e9 / len as f64, min * 1e9 / len as f64)
+}
+
 /// Write every recorded row as CSV — to a file if `--csv=PATH` was given, to
 /// stdout if bare `--csv` was given, and not at all otherwise.
-fn write_csv(corpus: &str, size: usize) {
+fn write_csv(corpus: &str, size: usize, suite: &str) {
     let flag = std::env::args().find(|a| a == "--csv" || a.starts_with("--csv="));
     let Some(flag) = flag else { return };
     let mut out = String::new();
     out.push_str(&format!("# target_arch: {}\n", std::env::consts::ARCH));
+    out.push_str(&format!("# cpu_model: {}\n", get_cpu_model()));
     out.push_str(&format!(
         "# widest_f64_lanes: {}\n",
         <rmath::Widest as Simd>::LANES
@@ -76,8 +104,16 @@ fn write_csv(corpus: &str, size: usize) {
         <rmath::WidestF32 as Simd>::LANES
     ));
     out.push_str(&format!("# fma: {}\n", cfg!(target_feature = "fma")));
+    out.push_str(&format!("# suite: {}\n", suite));
     out.push_str(&format!("# size: {}\n", size));
     out.push_str(&format!("# corpus: {}\n", corpus));
+    out.push_str(&format!(
+        "# repetition_policy: warmup={},samples={},statistic=median\n",
+        WARMUP, SAMPLES
+    ));
+    if let Some(rustc) = option_env!("RMATH_RUSTC_VERBOSE") {
+        out.push_str(&format!("# rustc: {}\n", rustc));
+    }
     if let Some(flags) = option_env!("RUSTFLAGS") {
         out.push_str(&format!("# rustflags: {}\n", flags));
     }
@@ -117,16 +153,18 @@ fn time(src: &[f64], dst: &mut [f64], mut run: impl FnMut(&[f64], &mut [f64])) -
     if src.is_empty() {
         return 0.0;
     }
-    run(src, dst);
-    let mut best = f64::INFINITY;
-    for _ in 0..REPS {
+    for _ in 0..WARMUP {
+        run(src, dst);
+    }
+    let mut times = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
         let t = Instant::now();
         run(src, dst);
-        best = best.min(t.elapsed().as_secs_f64());
+        times.push(t.elapsed().as_secs_f64());
     }
     // Keep the result observable so nothing is optimised away.
     std::hint::black_box(dst[0]);
-    best * 1e9 / src.len() as f64
+    compute_stats(times, src.len()).0
 }
 
 fn header() {
@@ -147,15 +185,17 @@ fn time_pair(
     if src.is_empty() {
         return 0.0;
     }
-    run(src, a, b);
-    let mut best = f64::INFINITY;
-    for _ in 0..REPS {
+    for _ in 0..WARMUP {
+        run(src, a, b);
+    }
+    let mut times = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
         let t = Instant::now();
         run(src, a, b);
-        best = best.min(t.elapsed().as_secs_f64());
+        times.push(t.elapsed().as_secs_f64());
     }
     std::hint::black_box((a[0], b[0]));
-    best * 1e9 / src.len() as f64
+    compute_stats(times, src.len()).0
 }
 
 /// One unary function, every configuration, against the scalar baseline.
@@ -495,9 +535,10 @@ fn main() {
         repair_benchmarks(n);
     }
 
-    write_csv(&corpus_name, n);
+    write_csv(&corpus_name, n, &suite);
 }
 
+#[allow(clippy::type_complexity)]
 fn binary<A: Function2<f64>, B: Function2<f64>>(
     name: &'static str,
     xs: &[f64],
@@ -508,25 +549,32 @@ fn binary<A: Function2<f64>, B: Function2<f64>>(
     fast: B,
 ) {
     let base = {
-        let mut best = f64::INFINITY;
-        for _ in 0..REPS {
+        for _ in 0..WARMUP {
+            for i in 0..xs.len() {
+                dst[i] = scalar(xs[i], ys[i]);
+            }
+        }
+        let mut times = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
             let t0 = Instant::now();
             for i in 0..xs.len() {
                 dst[i] = scalar(xs[i], ys[i]);
             }
-            best = best.min(t0.elapsed().as_secs_f64());
+            times.push(t0.elapsed().as_secs_f64());
         }
-        best * 1e9 / xs.len() as f64
+        compute_stats(times, xs.len()).0
     };
-    type Binary<'a> = &'a dyn Fn(&[f64], &[f64], &mut [f64]);
-    let mut one = |f: Binary<'_>| {
-        let mut best = f64::INFINITY;
-        for _ in 0..REPS {
+    let mut one = |f: &dyn Fn(&[f64], &[f64], &mut [f64])| {
+        for _ in 0..WARMUP {
+            f(xs, ys, dst);
+        }
+        let mut times = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
             let t = Instant::now();
             f(xs, ys, dst);
-            best = best.min(t.elapsed().as_secs_f64());
+            times.push(t.elapsed().as_secs_f64());
         }
-        best * 1e9 / xs.len() as f64
+        compute_stats(times, xs.len()).0
     };
     let a = one(&|x, y, d| exact.eval_slice(x, y, d));
     let b = one(&|x, y, d| fast.eval_slice(x, y, d));
@@ -588,24 +636,32 @@ fn single_precision(n: usize) {
     macro_rules! row32 {
         ($name:literal, $src:expr, $scalar:expr, $obj:ident) => {{
             let base = {
-                let mut best = f64::INFINITY;
-                for _ in 0..REPS {
+                for _ in 0..WARMUP {
+                    for (x, o) in $src.iter().zip(d.iter_mut()) {
+                        *o = $scalar(*x);
+                    }
+                }
+                let mut times = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
                     let t = Instant::now();
                     for (x, o) in $src.iter().zip(d.iter_mut()) {
                         *o = $scalar(*x);
                     }
-                    best = best.min(t.elapsed().as_secs_f64());
+                    times.push(t.elapsed().as_secs_f64());
                 }
-                best * 1e9 / n as f64
+                compute_stats(times, n).0
             };
             let mut run = |f: &dyn Fn(&[f32], &mut [f32])| {
-                let mut best = f64::INFINITY;
-                for _ in 0..REPS {
+                for _ in 0..WARMUP {
+                    f($src, &mut d);
+                }
+                let mut times = Vec::with_capacity(SAMPLES);
+                for _ in 0..SAMPLES {
                     let t = Instant::now();
                     f($src, &mut d);
-                    best = best.min(t.elapsed().as_secs_f64());
+                    times.push(t.elapsed().as_secs_f64());
                 }
-                best * 1e9 / n as f64
+                compute_stats(times, n).0
             };
             let a = $obj::new();
             let c = $obj::builder().accuracy(Fast).domain(FullRange).build();
@@ -641,123 +697,279 @@ fn single_precision(n: usize) {
     row32!("erfcf", &erfc32, |x| libm::erfcf(x), Erfc);
 }
 
+#[derive(Copy, Clone)]
+struct Identity;
+impl<E: Real> Function<E> for Identity {
+    #[inline(always)]
+    fn eval<V: Simd<Elem = E>>(&self, x: V) -> V {
+        x
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Identity2;
+impl<E: Real> Function2<E> for Identity2 {
+    #[inline(always)]
+    fn eval<V: Simd<Elem = E>>(&self, x: V, _y: V) -> V {
+        x
+    }
+}
+
+#[derive(Copy, Clone)]
+struct IdentityPair;
+impl<E: Real> FunctionPair<E> for IdentityPair {
+    #[inline(always)]
+    fn eval<V: Simd<Elem = E>>(&self, x: V) -> (V, V) {
+        (x, x)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Identity2Pair;
+impl<E: Real> Function2Pair<E> for Identity2Pair {
+    #[inline(always)]
+    fn eval<V: Simd<Elem = E>>(&self, x: V, y: V) -> (V, V) {
+        (x, y)
+    }
+}
+
 fn traversal_benchmarks() {
     println!("\ntraversal and buffer shapes (ns/elem)");
-    println!("{:<24} {:>10} {:>10} {:>10} {:>10} {:>10}", "workload", "len=1", "len=7", "len=8", "len=64", "len=4096");
-    println!("{}", "-".repeat(78));
+    println!(
+        "{:<30} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "workload", "len=0", "len=1", "len=lanes-1", "len=lanes", "len=lanes+1", "len=64", "len=4096", "len=65536"
+    );
+    println!("{}", "-".repeat(102));
 
     let lanes = <rmath::Widest as Simd>::LANES;
-    let lens = [1, lanes.saturating_sub(1).max(1), lanes, 64, 4096];
+    let l_minus_1 = lanes.saturating_sub(1).max(1);
+    let l_plus_1 = lanes + 1;
+    let lens = [0, 1, l_minus_1, lanes, l_plus_1, 64, 4096, 65536];
+
+    let identity = Identity;
+    let identity2 = Identity2;
+    let identity_pair = IdentityPair;
+    let identity_2pair = Identity2Pair;
+
     let exp = Exp::new();
+    let sqrt = Sqrt::new();
+    let floor = Floor::new();
     let pow = Pow::new();
     let sincos = SinCos::new();
+    let remquo = Remquo::new();
 
-    let bench_lens = |name: &str, mut run: Box<dyn FnMut(usize) -> f64>| {
-        let times: Vec<f64> = lens.iter().map(|&len| run(len)).collect();
+    let time_iters = |len: usize, mut run: Box<dyn FnMut()>| -> f64 {
+        if len == 0 {
+            return 0.0;
+        }
+        let iters = (65536 / len.max(1)).clamp(10, 10000);
+        for _ in 0..WARMUP {
+            for _ in 0..iters {
+                run();
+            }
+        }
+        let mut times = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let t = Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            times.push(t.elapsed().as_secs_f64() / iters as f64);
+        }
+        compute_stats(times, len).0
+    };
+
+    let bench_lens = |name: &str, mut make_runner: Box<dyn FnMut(usize) -> Box<dyn FnMut()>>| {
+        let times: Vec<f64> = lens.iter().map(|&len| time_iters(len, make_runner(len))).collect();
         println!(
-            "{:<24} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
-            name, times[0], times[1], times[2], times[3], times[4]
+            "{:<30} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+            name, times[0], times[1], times[2], times[3], times[4], times[5], times[6], times[7]
         );
         for (&len, &t) in lens.iter().zip(times.iter()) {
             record(format!("{name}_len{len}"), "ns_per_elem", 1.0, t);
         }
     };
 
-    bench_lens("unary_eval_slice", Box::new(|len| {
+    // Identity floor benchmarks
+    bench_lens("identity_unary", Box::new(|len| {
         let src = vec![1.5f64; len];
         let mut dst = vec![0.0f64; len];
-        let mut best = f64::INFINITY;
-        for _ in 0..1000 {
-            let t = Instant::now();
-            exp.eval_slice(&src, &mut dst);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best * 1e9 / len as f64
+        Box::new(move || {
+            identity.eval_slice(&src, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
     }));
 
-    bench_lens("unary_in_place", Box::new(|len| {
+    bench_lens("identity_in_place", Box::new(|len| {
         let mut buf = vec![1.5f64; len];
-        let mut best = f64::INFINITY;
-        for _ in 0..1000 {
-            let t = Instant::now();
-            exp.eval_in_place(&mut buf);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best * 1e9 / len as f64
+        Box::new(move || {
+            identity.eval_in_place(&mut buf);
+            std::hint::black_box(buf.first().copied());
+        })
     }));
 
-    bench_lens("binary_eval_slice", Box::new(|len| {
+    bench_lens("identity_binary", Box::new(|len| {
         let a = vec![2.0f64; len];
         let b = vec![3.0f64; len];
         let mut dst = vec![0.0f64; len];
-        let mut best = f64::INFINITY;
-        for _ in 0..1000 {
-            let t = Instant::now();
-            pow.eval_slice(&a, &b, &mut dst);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best * 1e9 / len as f64
+        Box::new(move || {
+            identity2.eval_slice(&a, &b, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
     }));
 
-    bench_lens("binary_scalar_second", Box::new(|len| {
+    bench_lens("identity_scalar_second", Box::new(|len| {
         let a = vec![2.0f64; len];
         let mut dst = vec![0.0f64; len];
-        let mut best = f64::INFINITY;
-        for _ in 0..1000 {
-            let t = Instant::now();
-            pow.eval_slice_scalar(&a, 3.0, &mut dst);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best * 1e9 / len as f64
+        Box::new(move || {
+            identity2.eval_slice_scalar(&a, 3.0, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
     }));
 
-    bench_lens("pair_eval_slice", Box::new(|len| {
+    bench_lens("identity_pair", Box::new(|len| {
         let src = vec![1.0f64; len];
         let mut d1 = vec![0.0f64; len];
         let mut d2 = vec![0.0f64; len];
-        let mut best = f64::INFINITY;
-        for _ in 0..1000 {
-            let t = Instant::now();
+        Box::new(move || {
+            identity_pair.eval_slice(&src, &mut d1, &mut d2);
+            std::hint::black_box(d1.first().copied());
+        })
+    }));
+
+    bench_lens("identity_2pair", Box::new(|len| {
+        let a = vec![1.0f64; len];
+        let b = vec![2.0f64; len];
+        let mut d1 = vec![0.0f64; len];
+        let mut d2 = vec![0.0f64; len];
+        Box::new(move || {
+            identity_2pair.eval_slice(&a, &b, &mut d1, &mut d2);
+            std::hint::black_box(d1.first().copied());
+        })
+    }));
+
+    // Real kernels
+    bench_lens("sqrt_unary", Box::new(|len| {
+        let src = vec![4.0f64; len];
+        let mut dst = vec![0.0f64; len];
+        Box::new(move || {
+            sqrt.eval_slice(&src, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
+    }));
+
+    bench_lens("floor_unary", Box::new(|len| {
+        let src = vec![4.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        Box::new(move || {
+            floor.eval_slice(&src, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
+    }));
+
+    bench_lens("exp_unary", Box::new(|len| {
+        let src = vec![1.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        Box::new(move || {
+            exp.eval_slice(&src, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
+    }));
+
+    bench_lens("pow_binary", Box::new(|len| {
+        let a = vec![2.0f64; len];
+        let b = vec![3.0f64; len];
+        let mut dst = vec![0.0f64; len];
+        Box::new(move || {
+            pow.eval_slice(&a, &b, &mut dst);
+            std::hint::black_box(dst.first().copied());
+        })
+    }));
+
+    bench_lens("sincos_pair", Box::new(|len| {
+        let src = vec![1.0f64; len];
+        let mut d1 = vec![0.0f64; len];
+        let mut d2 = vec![0.0f64; len];
+        Box::new(move || {
             sincos.eval_slice(&src, &mut d1, &mut d2);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best * 1e9 / len as f64
+            std::hint::black_box(d1.first().copied());
+        })
+    }));
+
+    bench_lens("remquo_2pair", Box::new(|len| {
+        let a = vec![5.0f64; len];
+        let b = vec![2.0f64; len];
+        let mut d1 = vec![0.0f64; len];
+        let mut d2 = vec![0.0f64; len];
+        Box::new(move || {
+            remquo.eval_slice(&a, &b, &mut d1, &mut d2);
+            std::hint::black_box(d1.first().copied());
+        })
     }));
 }
 
 fn repair_benchmarks(n: usize) {
     println!("\nscalar repair density overhead (ns/elem)");
-    println!("{:<20} {:>10} {:>10} {:>10} {:>10}", "kernel", "0% repair", "1-lane", "25% repair", "100% repair");
-    println!("{}", "-".repeat(64));
+    println!(
+        "{:<20} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "kernel", "0% repair", "1-lane", "25% repair", "50% repair", "100% repair"
+    );
+    println!("{}", "-".repeat(76));
 
     let lanes = <rmath::Widest as Simd>::LANES;
     let exp = Exp::new();
     let erf = Erf::new();
     let sin = Sin::new();
+    let pow = Pow::new();
+    let atan2 = Atan2::new();
+    let sincos = SinCos::new();
+    let modf = Modf::new();
 
     let run_density = |name: &str, make_vec: &dyn Fn(f64) -> Vec<f64>| {
-        let densities = [0.0, 1.0 / (lanes as f64), 0.25, 1.0];
-        let mut times = [0.0; 4];
+        let densities = [0.0, 1.0 / (lanes as f64), 0.25, 0.50, 1.0];
+        let mut times = [0.0; 5];
         for (i, &d) in densities.iter().enumerate() {
             let src = make_vec(d);
             let mut dst = vec![0.0; n];
-            let mut best = f64::INFINITY;
-            for _ in 0..REPS {
+            let mut dst2 = vec![0.0; n];
+            let mut times_samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..WARMUP {
+                match name {
+                    "exp" => exp.eval_slice(&src, &mut dst),
+                    "erf" => erf.eval_slice(&src, &mut dst),
+                    "sin" => sin.eval_slice(&src, &mut dst),
+                    "pow" => pow.eval_slice(&src, &src, &mut dst),
+                    "atan2" => atan2.eval_slice(&src, &src, &mut dst),
+                    "sincos" => sincos.eval_slice(&src, &mut dst, &mut dst2),
+                    "modf" => modf.eval_slice(&src, &mut dst, &mut dst2),
+                    _ => {}
+                }
+            }
+            for _ in 0..SAMPLES {
                 let t = Instant::now();
                 match name {
                     "exp" => exp.eval_slice(&src, &mut dst),
                     "erf" => erf.eval_slice(&src, &mut dst),
                     "sin" => sin.eval_slice(&src, &mut dst),
+                    "pow" => pow.eval_slice(&src, &src, &mut dst),
+                    "atan2" => atan2.eval_slice(&src, &src, &mut dst),
+                    "sincos" => sincos.eval_slice(&src, &mut dst, &mut dst2),
+                    "modf" => modf.eval_slice(&src, &mut dst, &mut dst2),
                     _ => {}
                 }
-                best = best.min(t.elapsed().as_secs_f64());
+                times_samples.push(t.elapsed().as_secs_f64());
             }
-            times[i] = best * 1e9 / n as f64;
-            record(format!("repair_{name}_{:.0}pct", d * 100.0), "ns_per_elem", 1.0, times[i]);
+            times[i] = compute_stats(times_samples, n).0;
+            record(
+                format!("repair_{name}_{:.0}pct", d * 100.0),
+                "ns_per_elem",
+                1.0,
+                times[i],
+            );
         }
         println!(
-            "{:<20} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
-            name, times[0], times[1], times[2], times[3]
+            "{:<20} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+            name, times[0], times[1], times[2], times[3], times[4]
         );
     };
 
@@ -777,5 +989,29 @@ fn repair_benchmarks(n: usize) {
     run_density("sin", &|pct| {
         let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
         (0..n).map(|i| if step > 0 && i % step == 0 { 10000.0 } else { 1.5 }).collect()
+    });
+
+    // pow repairs on non-normal/extreme
+    run_density("pow", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { f64::NAN } else { 2.0 }).collect()
+    });
+
+    // atan2 repairs on zero/infinite/NaN
+    run_density("atan2", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { 0.0 } else { 2.0 }).collect()
+    });
+
+    // sincos repairs on large angles
+    run_density("sincos", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { 1e8 } else { 1.5 }).collect()
+    });
+
+    // modf repairs on inf/nan
+    run_density("modf", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { f64::INFINITY } else { 1.5 }).collect()
     });
 }
