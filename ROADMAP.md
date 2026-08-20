@@ -24,7 +24,7 @@ What remains, grouped by what it costs the user today:
 |---|---|---|
 | `tan` `BitExact` — ported **and** vectorised (§6a A1) | done: 2.77x | — |
 | `atan`/`atan2` `BitExact` — ported **and** vectorised (§6a A4) | done: 1.28x / 2.74-3.03x | — |
-| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.83-0.85x exact (just under parity — 13-slot per-lane gather is the cost), `Fast` 8.4-8.5x / 10.2x `+Finite` | parity or better needs A5's hardware gather |
+| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.83-0.85x exact (just under parity — 13-slot per-lane gather is the cost), `Fast` 8.4-8.5x / 10.2x `+Finite` | parity still open — A5's hardware gather was tried and measured slower (see §3) |
 | Hyperbolic inverses `BitExact` delegate | 0.97–1.00x | `Fast` reaches 8–13x |
 | `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 2.61x | — |
 | `log1p`, `hypot` `BitExact` — scalar ported (§6a A2/A3), still one lane at a time | ~1.0x | vector kernel not yet built |
@@ -211,17 +211,18 @@ band's Dekker split — `fma(c, 2^27, c)`, which the C source's literal
 `t27`). `asin`/`acos`'s vector kernel is the one in the group whose `BitExact`
 path does not beat parity (0.83-0.85x, just under it): their 13-slot
 per-lane table gather dominates, which is precisely the cost A5's
-hardware-gather backend targets.
+hardware-gather backend targeted — and the cost that experiment, measured
+end-to-end, failed to remove (see A5's entry).
 
-### A5. Hardware-gather backend experiment — **prototyped on `exp`, accepted; wider rollout paused**
+### A5. Hardware-gather backend experiment — **prototyped on `exp`, rolled out, measured, rolled back**
 
 Every `BitExact` table kernel pays a per-lane scalar loop for its gathers.
 AVX-512 (`vpgatherqq`, via `_mm512_i64gather_epi64`) does this in one
 instruction; AVX2 has a narrower equivalent (`_mm256_i64gather_epi64`).
 
-**Done:** `Simd::gather_bits(table, idx)` (`src/simd/mod.rs`), an `unsafe fn`
-with a safe, checked-indexing default — the same per-lane loop every table
-kernel already had — overridden for `f64x8` behind
+**Done (kept):** `Simd::gather_bits(table, idx)` (`src/simd/mod.rs`), an
+`unsafe fn` with a safe, checked-indexing default — the same per-lane loop
+every table kernel already had — overridden for `f64x8` behind
 `cfg(target_feature = "avx512f")` and `f64x4` behind `avx2`
 (`src/simd/wide_backend.rs`). `#![deny(unsafe_code)]` added to `src/lib.rs`
 with `#[allow(unsafe_code)]` only on the trait default and the two overrides;
@@ -230,33 +231,66 @@ every call site goes through a tiny safe per-kernel wrapper (`exp.rs`'s
 arithmetic that makes it true. Verified independently before touching any
 kernel: 1M randomized indices against both overrides, exact match every time.
 
-Wired into `exp`'s `BitExact` path (both table reads). Measured
-(`examples/dbg_gather_bench.rs`, a throwaway A/B harness, both
-implementations timed in one process to remove cross-run noise): **f64x8
-+22-23%, f64x4 +11-12%, f64x2 and scalar ~unchanged** (within ±1%, from the
-gather step being restructured out of the original single loop into three —
-index computation, two gathers, post-processing — which has no hardware
-gather to amortize that restructuring against at those widths).
-`examples/bench.rs`'s end-to-end `exp` `BitExact` row (which exercises
-`Real::Widest`, `f64x8` on this hardware) measured consistently at 2.51-2.63x
-against a ~2.20x-2.36x baseline — clears the 15% bar. Bit-exactness
-unaffected by construction (same bits, different instruction) and confirmed
-by the full `tests/bit_exact.rs`/`tests/glibc.rs` suites, unchanged.
+Wired into `exp`'s `BitExact` path (both table reads), where the prototype
+measured a +22-23% gain on `f64x8` in an in-process A/B of the gather step
+alone and the end-to-end row at 2.51-2.63x against a ~2.20x-2.36x baseline —
+accepted on that basis, and still in place. Bit-exactness unaffected by
+construction (same bits, different instruction).
 
-**Rollout to `ln`/`log2`/`pow`/`erf`/`erfc` not attempted this round** — a
-deliberate pause, not a rejection. The `exp` prototype answered the
-go/no-go question (below) with real numbers; each further kernel needs its
-own restructuring (`pow` gathers twice, from two different tables) and its
-own A/B verification, which is real, uncompressible work per kernel rather
-than a mechanical copy. Left as the next concrete step.
+**Rolled out this round to every other table kernel** — `ln`, `log2`, `pow`
+(two tables, three gathers), `erf`/`erfc` (13-slot rows), and the `asin`/
+`acos`/`atan`/`atan2` rows (`cij_row`, the 13-slot `asncs_row`, and
+`near_one_root`'s two 1/sqrt tables), each restructured per the `exp`
+pattern: per-lane index computation, one vector gather per slot, then the
+degree/zeroing logic as vector selects. Bit-exact at every width from the
+first compile (the full suite passed; one structural bug — the rewritten
+`asncs_row`'s `outer`/`fin` select chains compared the degree against
+`7..=10`/`8..=11` instead of `5..=8`, exactly the off-by-degree slip the
+per-lane original could not make — was caught by
+`tests/bit_exact.rs`'s at-every-width sweep before any measurement).
 
-**A second data point since: `asin`/`acos`.** §6a's A4 account of those
-kernels measures the per-lane gather's cost directly — removing the 13-slot
-table gather from the blend jumps the `BitExact` row from 0.83x to ~5.9x —
-the same cost `exp`'s A/B measured, at a scale the earlier prototype's
-22-23% gain would more than absorb (the asin/acos rows are the first in the
-crate to sit *under* parity because of it). Their A/B numbers are the
-strongest argument yet for resuming the rollout.
+**Measured — negative, rolled back.** A/B against the pre-rollout code,
+round-robin builds timed alternately (four runs each, medians; the same
+`examples/bench.rs` end-to-end protocol the prototype's accept used), on the
+reference machine (Ryzen AI 7 350, Zen 5, AVX-512):
+
+| kernel | before | with hw gather | Δ |
+|---|---|---|---|
+| `exp` (kept prototype) | 2.23x | 2.21x | ~0 |
+| `ln` | 1.80x | 1.58x | −12% |
+| `log2` | 1.93x | 1.75x | −9% |
+| `log10` | 2.45x | 2.37x | −3% |
+| `pow` | 1.47x | 1.45x | ~0 |
+| `erf` | 4.45x | 3.49x | −22% |
+| `erfc` | 4.28x | 3.33x | −22% |
+| `asin` | 0.84x | 0.74x | −12% |
+| `acos` | 0.85x | 0.73x | −14% |
+| `atan` | 1.36x | 1.06x | −22% |
+| `atan2` | 2.96x | 2.74x | −7% |
+
+Every row moved the wrong way; the biggest regressions track the biggest
+slot counts (13 gathers for `erf`/`erfc`/`asin`/`acos`, 7 for `atan`), which
+is the hardware gather's latency showing through: the tables all sit in L1,
+and a pipelined per-lane load costs less than a `vpgatherqq` whose ~20-cycle
+latency the surrounding FMA chain cannot hide. A control run of the same
+restructured code with the hardware override disabled (per-lane fallback)
+recovered most of the loss for `atan`/`atan2`/`ln`/`log10` but not
+`erf`/`erfc` (−1.3x/−0.9x), so the restructuring itself also carries a cost
+the `exp` prototype's in-process measurement never had to pay. Notably, even
+`exp`'s accepted end-to-end margin does not reproduce on this machine today
+(at best a wash); the prototype's +22-23% was a measurement of the gather
+step in isolation, and the end-to-end row does not carry it.
+
+**Verdict:** the go/no-go criterion was "clears the 15% bar"; the rollout
+clears it in no direction. Reverted to the per-lane idiom across the board
+(working tree restored to the pre-rollout kernels; nothing but this record
+remains). `Simd::gather_bits` and the two overrides stay — they are the
+correct surface for a target where gathers do win, and `exp`'s accepted use
+keeps them exercised. The takeaway for any revisit is in the control run,
+not the prototype: restructure to gather *or* not, but measure the end-to-end
+row, on the target, before committing kernels to either idiom. `asin`/`acos`
+parity remains open (0.83-0.85x) — the 13-slot per-lane gather is the cost,
+and the hardware gather is not the cure on this hardware.
 
 ## 4. Workstream B — `Fast`-path speed (mostly `f32`)
 
@@ -956,10 +990,12 @@ widening whenever the f64 kernel does more than the f32 result needs.
         ~90% of the exact path's cost, and the platform's scalar routine
         never pays for more than one band per input. That is exactly the
         cost A5's hardware-gather backend (`Simd::gather_bits`, prototyped
-        on `exp`) removes; this pass deliberately stayed with the per-lane
-        idiom every other table kernel uses, and A5's entry is where the
-        asin/acos numbers now stand as the second data point in favour of
-        rolling it out. `Fast` is unaffected and still the win.
+        on `exp`) set out to remove, and it *is* ~90% of the exact path's
+        cost — but A5's end-to-end measurement then showed the hardware
+        gather replacing it with a slower instruction on this machine, and
+        the rollout was rolled back (see §3's A5 entry); the per-lane idiom
+        this pass deliberately stayed with remains the right one here.
+        `Fast` is unaffected and still the win.
 
 - **A2/A3: `log10` ported and vectorised; `log1p`/`hypot` ported at the
   scalar level.** Both A2 and A3's prior "genuinely hard, comparable to
@@ -1076,7 +1112,7 @@ the full verification protocol (§8).
 | **2** | B1, B3 (B2 withdrawn — considered decision) | M–L | native f32 `Fast`: `tanhf` 4.97x, `sin`/`cos`f 17-18x, `tan`f 7.4x — **done** |
 | **3** | A3, A2, D3 | **L, not M–L; corrected again, see below** | `log10` bit-exact *and* faster (2.61x, reusing `ln`'s table) — **done, see §6a**; `log1p`/`hypot` scalar ported and verified, vector kernel not yet built — **done, see §6a** |
 | **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | the whole trigonometric family bit-exact *and* faster — **done, see §6a**: `sin`/`cos`/`sincos` 3.0–3.7x, `tan` 2.77x, A4's `atan`/`atan2` 1.28x/2.74-3.03x; only A4's `asin`/`acos` vector kernel remains (plus one known `acos` scalar gap) |
-| **5** | A5 gather experiment; ~~C2, C3~~ done | M | either a fleet-wide `BitExact` uplift or a documented negative result; `tgamma` 2037→512 ulp — **C2/C3 done** |
+| **5** | A5 gather experiment; ~~C2, C3~~ done | M | **measured negative end-to-end and rolled back** — documented in §3, the hardware gather lost to the per-lane idiom on this machine; `tgamma` 2037→512 ulp — **C2/C3 done** |
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a
 multi-session project with its own intermediate milestones.
@@ -1089,7 +1125,8 @@ underflow; a `gen_poly.py` coefficient-splitting bug), the `exact.rs`
 vectorisation question closed as a documented architectural limit rather than
 attempted blind, `sinh`/`cosh` D4 corpus hardening, and the `tgamma`
 dual-compute guard (8.4x/4.6x). None of this was on the table above when it
-was written; §6a has the full accounting for each. A5 (gather) is next.
+was written; §6a has the full accounting for each. A5 was next; it has been
+done and its negative verdict is recorded in §3 — see §10 for what remains.
 
 ## 8. Verification protocol (applies to every item)
 
@@ -1132,12 +1169,15 @@ was written; §6a has the full accounting for each. A5 (gather) is next.
    3–4) the user's actual pain point? The sequencing above assumes value
    density; a user running everything under `BitExact` should invert phases
    2 and 3/4.
-2. ~~**A5 gather backend**~~ — **decided: go, on `exp` — wider rollout still
-   open.** Prototyped, measured (+22-23% on `f64x8`, +11-12% on `f64x4`),
-   and accepted; `#![deny(unsafe_code)]` added with the surface confined to
-   the trait default and two overrides, per the original ask. Whether to
-   extend it to `ln`/`log2`/`pow`/`erf`/`erfc` is the now-open follow-on
-   question — see §5's A5 entry.
+2. ~~**A5 gather backend**~~ — **decided: go — then measured negative and
+   rolled back.** Prototyped, measured (+22-23% on `f64x8` in an in-process
+   gather-step A/B), and accepted for `exp`; the wider rollout to every other
+   table kernel was then done, A/B'd end-to-end on the reference machine, and
+   reverted — the hardware gather lost to the per-lane idiom on this
+   hardware. `Simd::gather_bits` and the two overrides remain (exercised by
+   `exp`'s accepted use); see §3's A5 entry for the table and the takeaway.
+   `asin`/`acos` parity stays open — the 13-slot per-lane gather remains the
+   cost, and the hardware gather is not the cure on this machine.
 3. ~~**f64 `cbrt` `Fast`**~~ — **decided: offered.** A native seed-plus-Newton
    `Fast` path landed (`src/kernels/double/cbrt.rs`), measuring 7-8x against
    `BitExact`'s 1.7x. Its bound is 16 ulp (measured worst 8, stable from 100M
