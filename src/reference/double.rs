@@ -31,11 +31,17 @@
 pub mod bessel;
 pub mod erf_parts;
 pub mod erfc_parts;
+pub mod hypot;
+pub mod invtrig;
+pub mod log1p;
 pub mod trig;
 
 pub use bessel::{j0, j1, jn, y0, y1, yn};
 pub use erf_parts::erf;
 pub use erfc_parts::erfc;
+pub use hypot::hypot;
+pub use invtrig::{acos, asin, atan, atan2};
+pub use log1p::log1p;
 pub use trig::{cos, sin, sincos};
 
 use crate::tables::double::{exp as et, exp10 as x10t, log as lt, pow as pt};
@@ -606,28 +612,14 @@ macro_rules! delegate {
 
 delegate! { /// `tan(x)`, the platform's. `x` in radians.
 tan => tan }
-delegate! { /// `asin(x)`, the platform's.
-asin => asin }
-delegate! { /// `acos(x)`, the platform's.
-acos => acos }
-delegate! { /// `atan(x)`, the platform's.
-atan => atan }
-
 delegate! { /// `asinh(x)`, the platform's.
 asinh => asinh }
 delegate! { /// `acosh(x)`, the platform's.
 acosh => acosh }
 delegate! { /// `log10(x)`, the platform's.
 log10 => log10 }
-delegate! { /// `log1p(x)`, the platform's `log1p`.
-log1p => ln_1p }
-
 delegate! { /// `log2(x)`, the platform's.
 log2 => log2 }
-delegate! { /// `atan2(y, x)`, the platform's.
-atan2 => atan2, 2 }
-delegate! { /// `hypot(x, y)`, the platform's.
-hypot => hypot, 2 }
 
 /// `atanh(x)`, matching Rust's `f64::atanh`.
 ///

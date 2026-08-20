@@ -1,5 +1,8 @@
 //! Double-precision tables.
 
+pub mod asincos_data;
+pub mod atan2_data;
+pub mod atan_data;
 pub mod bessel;
 pub mod erf;
 pub mod erfc;

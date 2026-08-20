@@ -123,18 +123,86 @@ pub mod log2 {
 }
 
 /// Base-10 logarithm.
+///
+/// [`BitExact`](crate::policy::BitExact) is a port of glibc's
+/// `__log10_finite`: disassembly (glibc 2.43, x86-64) shows it is a thin
+/// wrapper, not its own table algorithm — it extracts the unbiased exponent
+/// `k` and a rounding-parity bit `i`, forces `x`'s exponent field to
+/// `0x3ff - i` (so the reduced argument sits within one exponent step of
+/// 1.0), calls straight into `__ieee754_log_fma` (i.e. [`super::ln`]'s own
+/// `bit_exact` table walk — reused here rather than re-derived), and combines
+/// with three *unfused* operations, in exactly the order `e_log10.c`'s own
+/// `z = y*log10_2lo + ivln10*log(x); return z + y*log10_2hi;` reads — a first
+/// pass at this mapped the two spilled products to the wrong constants
+/// (the compiler schedules `y*log10_2lo` before the call, `y*log10_2hi`
+/// after, so reading top-to-bottom without checking which literal address
+/// held which value swapped them); confirmed by reading the four constant
+/// bit patterns live out of process memory rather than trusting position.
+/// No `vfmadd` anywhere in `__log10_finite` itself — the final combine is
+/// genuinely three separate roundings, not one fused into another.
 pub mod log10 {
     use super::*;
 
-    /// `1 / ln(10)`.
+    /// `1 / ln(10)`, bit-identical to `__log10_finite`'s `ivln10` (verified
+    /// by reading the live constant out of process memory, not transcribed
+    /// from the C source's decimal comment).
     const INV_LN10: f64 = f64::from_bits(0x3fdbcb7b1526e50e);
     /// `log10(2)`, for scaling the exponent without going through `ln`.
+    ///
+    /// Only used by [`fast`]; [`bit_exact`] needs the split `LOG10_2HI`/
+    /// `LOG10_2LO` pair below instead, since a single rounding of
+    /// `log10(2)` is not what the platform computes.
     const LOG10_2: f64 = f64::from_bits(0x3fd34413509f79ff);
+    /// High part of `log10(2)`, `__log10_finite`'s `log10_2hi`.
+    const LOG10_2HI: f64 = f64::from_bits(0x3fd34413509f6000);
+    /// Low part of `log10(2)`, `__log10_finite`'s `log10_2lo`.
+    const LOG10_2LO: f64 = f64::from_bits(0x3d59fef311f12b36);
 
     /// `log10(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-        dispatch::<V, A, D>(x, reference::log10, fast, not_positive_normal)
+        let y = if A::BIT_EXACT { bit_exact(x) } else { fast(x) };
+        if D::CHECKED {
+            patch_lanes(x, y, not_positive_normal(x), reference::log10)
+        } else {
+            y
+        }
+    }
+
+    /// The reduce-and-delegate-to-`ln` path, lane-for-lane identical to
+    /// `__log10_finite`.
+    ///
+    /// Only handles the positive-normal case; zero, negative, subnormal,
+    /// infinite and NaN lanes are the reference's job via [`eval`]'s
+    /// `patch_lanes`, the same convention [`super::ln::bit_exact`] itself
+    /// uses — `__log10_finite`'s own subnormal pre-scale and special-value
+    /// branches are therefore not replayed here at all.
+    #[inline(always)]
+    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+        let ix = x.to_bits();
+        let mut y_a = V::Floats::filled_default();
+        let mut r_bits = V::Bits::filled_default();
+        for lane in 0..V::LANES {
+            let b = ix.as_slice()[lane];
+            // `x` is positive-normal here, so the raw biased exponent is
+            // exactly `b >> 52`; no prescale is needed the way
+            // `__log10_finite` needs one for subnormal input.
+            let k = (b >> 52) as i64 - 1023;
+            // `i`: 1 when `k` is negative, 0 otherwise -- `__log10_finite`'s
+            // own rounding-parity bit, read via `k >> 63` as an unsigned
+            // shift in the disassembly.
+            let i = ((k as u64) >> 63) as i64;
+            y_a.as_mut_slice()[lane] = (k + i) as f64;
+            let exp_field = (0x3ffu64.wrapping_sub(i as u64)) << 52;
+            r_bits.as_mut_slice()[lane] = (b & 0x000f_ffff_ffff_ffff) | exp_field;
+        }
+        let reduced = V::from_bits(r_bits);
+        let y = V::from_array(y_a);
+
+        let log_reduced = crate::kernels::double::ln::bit_exact(reduced);
+        // Deliberately not `mul_add`: the disassembly has three separate,
+        // unfused `mulsd`/`addsd` pairs here, not a fusion opportunity.
+        (log_reduced * V::splat(INV_LN10) + y * V::splat(LOG10_2LO)) + y * V::splat(LOG10_2HI)
     }
 
     /// Measured error: below 2 ulp over the positive normals.

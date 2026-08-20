@@ -21,8 +21,11 @@ What remains, grouped by what it costs the user today:
 | gap | today | ceiling |
 |---|---|---|
 | `tan` `BitExact` delegates | 0.97–0.99x | ~20x is proven by the `Fast` path; `sin`/`cos`/`sincos` already ported to 3.0–3.7x, see §6a |
-| Inverse trig + hyperbolic inverses `BitExact` delegate | 0.94–1.01x | `Fast` reaches 8–13x |
-| `log10`, `log1p`, `hypot`, `atan2` `BitExact` delegate | 0.92–1.02x | `Fast` reaches 4.7–14x |
+| `atan`/`atan2` `BitExact` — ported **and** vectorised (§6a A4) | done: 1.28x / 2.74-3.03x | — |
+| `asin`/`acos` `BitExact` — scalar ported (§6a A4), still one lane at a time; `acos` has a known 1-ulp near-1 gap, see §6a | 0.97–1.00x | vector kernel not yet built; `atan`/`atan2`'s 1.3-3.0x is the model to follow |
+| Hyperbolic inverses `BitExact` delegate | 0.97–1.00x | `Fast` reaches 8–13x |
+| `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 2.61x | — |
+| `log1p`, `hypot` `BitExact` — scalar ported (§6a A2/A3), still one lane at a time | ~1.0x | vector kernel not yet built |
 | Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x | hardware gathers could close part of that spread |
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
 | `tgamma` above 18 | up to ~2000 ulp near overflow | <64 with a direct double-double Stirling route |
@@ -80,66 +83,124 @@ wrinkle that needs its own schedule-reading pass before porting, the same
 discipline `sin`/`cos` needed. Left as a follow-on session rather than
 guessed at.
 
-### A2. `log10` and `log1p` ports — effort L for `log10` (corrected), M for `log1p`
+### A2. `log10` and `log1p` ports — **`log10` done end-to-end; `log1p` scalar-only**
 
-- **`log10` disassembled and it is not the `ln`/`log2` shape.** Entry point
-  `__log10_finite` at `0x51170` opens with an integer-domain fast/special-case
-  dispatch (bit tests on the raw `u64` pattern, not the usual float compares),
-  then a *second*, much larger block at `0x512a0` with a two-row, 16-byte-stride
-  table gather (`[rax+0x9]<<4` / `[rax+0x49]<<4` indexing into what looks like
-  a ~64-entry table of coefficient pairs) feeding roughly a dozen `mulsd`/`addsd`
-  operations across nine-plus registers before the block was cut off mid-trace.
-  This is at least as large as the `pow` kernel's table path, not a "smaller"
-  job — the README's own description undersold it. Needs the same disassembly
-  budget as A3, and the same warning: do not port under time pressure.
-- `log1p` not yet disassembled this round; still expected fdlibm-shaped
-  (branchy around 0) per the original plan, but given how wrong the `hypot`
-  and `log10` estimates turned out to be, disassemble before estimating.
-- `log1p` is fdlibm-shaped (branchy around 0). Vectorising it bit-exactly
-  means computing both the small-`x` and reduced paths and selecting — worth a
-  prototype to confirm the select overhead still beats parity before
-  committing.
+**The earlier "at least as large as `pow`'s table" finding was stale**,
+based on an incomplete trace from a prior session that had broken at the
+wrong address. Re-disassembled properly this round (`break main; run;
+disassemble /rs __log10_finite`, glibc 2.43, x86-64, no separate FMA ifunc):
+`__log10_finite` is only ~80 bytes and is a thin wrapper, not its own table
+algorithm. It extracts the unbiased exponent `k` and a rounding-parity bit
+`i` from the raw bits, forces `x`'s exponent field to `0x3ff - i` (a
+`select` between two constants, not a variable shift), **calls straight into
+`__ieee754_log_fma`** — confirmed live, by breaking at the call site and
+stepping in — which is the exact table-walk this crate already ported
+bit-exact and vectorised as `ln`'s `BitExact` kernel, and combines with
+three genuinely unfused operations, `((ivln10 * log(reduced)) + y*log10_2lo)
++ y*log10_2hi`, in exactly the order `e_log10.c`'s own source grouping
+reads (a first attempt at reading the disassembly swapped which spilled
+product was `log10_2hi` vs `log10_2lo` — the compiler schedules the `lo`
+product before the call and the `hi` one after, so reading instruction order
+top-to-bottom without checking which literal address held which value gets
+it backwards; caught by brute-force verification, not by a second read).
+**Ported and vectorised**, reusing `ln`'s existing table rather than
+re-deriving one: `src/kernels/double/logx.rs`'s `log10::bit_exact` calls
+`crate::kernels::double::ln::bit_exact` (made `pub(super)`) directly on the
+reduced argument. Measures **2.61x** `BitExact` (2.27x `+Finite`), verified
+bit-exact against the live platform over 19M+ samples (30M random bit
+patterns filtered to positive-normal-finite, plus a dense sweep across every
+biased exponent). `reference::log10` itself is left as a platform delegate
+(only used by the rare-lane `patch_lanes` repair and by tests) rather than
+also ported — a deliberate scope call, since the vector kernel's own
+independence from the platform is what the throughput claim rests on.
 
-### A3. `hypot` port — effort L, corrected from M after disassembly
+`log1p` disassembled too (`__log1p_fma`): it is genuinely the classic
+fdlibm `s_log1p.c` shape as originally predicted — confirmed by finding
+glibc's own `s_log1p-fma.c`, which is *the same source file*, `#define`d
+and recompiled with `-mfma`; the source is untouched, only the compiler's
+fusion choices differ, and those differ a lot (a straight, unfused
+transliteration of the C source passed 42M+ random samples with only 63
+mismatches, all 1 ulp, all traceable to specific fused operations the
+disassembly shows and the source's own grouping does not: the `Lp[]`
+polynomial's `R = R1 + z2*R2 + z4*R3 + z6*R4` is a genuine 3-step `fma`
+chain — algebraically Horner in `z2`, not the flat sum the source's own
+expression suggests — and the final `k*ln2_hi - (...)` combine is one fused
+`vfmsub231sd`, not two roundings). **Scalar reference ported and verified**
+(`src/reference/double/log1p.rs`), replacing the platform delegate; no
+vector kernel yet. One correctness subtlety beyond FMA placement, found by
+`tests/delegating.rs`'s existing corpus (not the brute-force sweep, whose
+own "want" values came from the same code path and so never exercised it):
+x86-64's `divsd` for a genuine runtime `0.0/0.0` returns
+`0xfff8000000000000` (sign bit set) as its hardware default NaN, which
+differs from Rust's own compile-time-folded `f64::NAN` constant
+(`0x7ff8...`, unset) — the initial port's `(x - x) / (x - x)`, ported
+faithfully from the C source, got this right by construction; "simplifying"
+it to `f64::NAN` to silence a clippy lint quietly introduced the bug.
+Separately, NaN *input* (any sign) needed an explicit early check to
+preserve payload and quiet a signaling NaN (`x.to_bits() | (1 << 51)`) —
+the plain algorithm's own domain-error branch, read literally, would
+canonicalise it instead, which does not match the live platform's actual
+behaviour for a NaN argument.
 
-**This section's original effort estimate was wrong**, found by actually
-disassembling `/lib64/libm.so.6`'s `hypot@@GLIBC_2.35` (== `__hypot_finite`,
-no separate FMA ifunc — glibc 2.43 on the reference machine has one `hypot`
-implementation for x86-64). It is not a short FMA sequence. It is a
-**compensated (2Sum/2Product) algorithm that specifically avoids FMA** —
-every multiply and add is a separate, non-fused `mulsd`/`addsd`/`subsd`,
-because the error-free-transformation technique it uses (Dekker-style: split
-`o² + t²` into a head and a compensated tail, √ it, then correct with one
-Newton-style division) depends on IEEE separately-rounded arithmetic to
-extract the rounding error each step discards. Fusing any of it would not
-just "be more accurate and stop matching" (the crate's usual FMA story) —
-it would break the error-extraction identities outright.
+### A3. `hypot` port — **scalar-only, done**
 
-Shape found so far (entry point `0x48380`, reference disassembly, not yet
-fully traced): a fast path for `min/max` within a moderate exponent range
-computing `o² + t²`'s head via `addsd`/`mulsd` then correcting with a
-2Sum-derived tail (`0x483fe`-`0x48468`); a scaled-down path for very large
-inputs guarded by a `2^-...` pre-scale (from `0x48530`, constant at
-`0xa5198` = `5.551115123125783e-17` = `2^-54`); a scaled-up path for inputs
-where the smaller argument is negligible relative to the larger
-(`0x485f0`); and at least one more branch (`0x484e0`) not yet interpreted.
-Each scaled branch re-derives the same compensated identity at a different
-scale and un-scales the result, which is where most of the remaining
-disassembly work is.
+**The earlier "compensated 2Sum/2Product, Dekker-style, `dla.h`" finding was
+also stale.** That was glibc's *old* `hypot`; this host's glibc 2.43 ships
+the modern (2021+) Borges "MyHypot3" correction
+(`sysdeps/ieee754/dbl-64/e_hypot.c`), a considerably smaller and
+better-documented algorithm with named constants
+(`SCALE = 2^-600`, `LARGE_VAL = 2^511`, `TINY_VAL = 2^-459`, `EPS = 2^-54`).
+Confirmed no separate FMA ifunc (`__ieee754_hypot`/`__hypot` share one
+address), and confirmed by full disassembly (950 bytes, self-contained, zero
+calls out — not "cut off mid-trace" as the earlier session found, just
+mis-addressed) that this host selects the algorithm's own `#else`
+(non-FMA) branch: every multiply/add/sub is separate, matching the source's
+own stated reason — the compensated correction's error-free-transformation
+identities depend on separately-rounded arithmetic, and fusing any of it
+would silently break the error extraction, not just round differently.
 
-This is not a shape to port under time pressure: a subtly wrong constant or
-branch threshold here would silently produce a plausible-looking but
-non-bit-exact result — exactly the failure mode the crate's whole design
-exists to prevent, and worse than not porting it at all. Treat this as
-comparable in difficulty to the crate's `erf`/`erfc` double-double work, not
-to the `exp`/`ln` table ports. Whoever picks this up next: the constant
-addresses above are a real head start; budget accordingly.
+**Scalar reference ported** (`src/reference/double/hypot.rs`): the three
+branches (huge-`ax` pre-scale, tiny-`ay` pre-scale, common-case `kernel()`)
+plus `kernel()`'s own two-branch compensated correction, all literal,
+unfused (matching the source's own no-FMA intent). Verified against the
+live platform over 25M+ pairs (20M random bit patterns, 5M ordinary-magnitude
+pairs at random exponents, dense sweeps around `LARGE_VAL`/`TINY_VAL` and
+every power-of-two boundary, and the full specials cross-product including
+signaling-vs-quiet NaN). Two real bugs found and fixed along the way, both
+in constants, not algorithm structure: `SCALE` (`2^-600`) and `TINY_VAL`
+(`2^-459`) were hand-computed and both wrong — off by roughly `2^80` and
+`2^160` respectively, from a bit-pattern arithmetic slip, not a
+misunderstanding of the algorithm. The bug surfaced as spurious NaN for
+pairs of very small magnitudes: with `TINY_VAL` wrong (too extreme), pairs
+that should have been routed through the up-scaled `kernel()` path instead
+took the unscaled common-case path, where `ax*ax + ay*ay` underflowed to
+exactly `0.0` and the correction's own `.../(2.0*h)` divided by that zero.
+Recomputing both constants programmatically (`2f64.powi(n).to_bits()`)
+rather than by hand, the same discipline the crate already applies to
+tables, resolved it immediately. No vector kernel yet — this is the most
+delicate of the three ports (compensated arithmetic, per the crate's own
+standing caution that a subtly wrong bit-exact result is worse than none),
+and landing a solid, brute-force-verified scalar port this round rather than
+rushing a vector kernel on top of it is the same trade A4 made for
+`asin`/`acos`.
 
-### A4. Inverse trig ports (`asin`, `acos`, `atan`, `atan2`) — effort L each
+### A4. Inverse trig ports (`asin`, `acos`, `atan`, `atan2`) — effort L each — **`atan`/`atan2` done end-to-end; `asin`/`acos` scalar-only, one known gap**
 
-Same IBM-routine family as A1 (tables `doasin`/`atnat` etc.). Do these only
-after A1 proves the workflow; they share its tooling and its corpus
-discipline. Expected parity → 2–3x each.
+Same IBM-routine family as A1 (tables `asncs.x`/`cij`, from `asincos.tbl`
+and `uatan.tbl`). `atan` and `atan2` are fully done: scalar reference
+(`src/reference/double/invtrig.rs`) and vector kernel
+(`src/kernels/double/invtrig.rs`'s `bit_exact` submodule) both ported,
+disassembly-verified, and measuring 1.28x / 2.74-3.03x — see §6a's A4 entry
+for the full account, including three real bugs found and fixed along the
+way (a missing fusion in `acos`'s small-`x` band, a NaN-vs-domain-error
+conflation only `tests/delegating.rs` caught, and a two-fusion gap in
+`atan`'s own `D <= u < E` band only a much denser corpus caught) and one
+found and *not* fixed (`acos`'s near-1 band has an 8-in-3M-dense-samples
+1-ulp gap, root cause identified — a Dekker split via `fma(c, 2^27, c)`
+the C source's literal `y=(c+t24)-t24` does not show — but not landed,
+since a first attempt made a different region worse). `asin`/`acos` still
+need their own `bit_exact` submodule, the same shape `atan`/`atan2` just
+got; land the `acos` fix first, independent of that vector work.
 
 ### A5. Hardware-gather backend experiment — **prototyped on `exp`, accepted; wider rollout paused**
 
@@ -644,6 +705,284 @@ widening whenever the f64 kernel does more than the f32 result needs.
     the fact — left as a follow-on rather than fixed under this phase's
     scope.
 
+- **A4: `asin`/`acos`/`atan`/`atan2` — scalar reference ported and verified;
+  vector kernel deferred.** Same schedule-reading discipline as A1: broke on
+  the exported `asin`/`acos`/`atan`/`atan2` symbols, stepped through their
+  ifunc-resolved trampolines with `stepi`, and disassembled the real
+  entry points (`__ieee754_asin_fma`, `__ieee754_acos_fma`, `__atan_fma`,
+  `__ieee754_atan2_fma`; glibc 2.43, x86-64) rather than reading
+  `e_asin.c`/`s_atan.c`/`e_atan2.c` and guessing at FMA placement.
+  - **Tables.** `tools/gen_tables.py` extended with three new emitters
+    (`emit_atan_tables`, `emit_asincos_tables`, `emit_atan2_tables`),
+    fetching `atnat.h`/`uatan.tbl` (`atan`'s 241-row `cij` table),
+    `uasncs.h`/`asincos.tbl`/`root.tbl`/`powtwo.tbl` (`asin`/`acos`'s shared
+    2568-entry `asncs.x` table plus the reciprocal-sqrt seed tables), and
+    `atnat2.h` (`atan2`'s own `pi`/`3pi/4`/rescale constants) from glibc's
+    raw source tree — same provenance discipline as the trig tables, no
+    hand-transcribed numerics. One generator bug found along the way:
+    `mynumber_bits`'s regex assumed no whitespace between a `mynumber`
+    initialiser's two closing braces (`}}`); `atnat.h` writes `} }` (a
+    space), which silently failed to match until the regex was loosened to
+    `\}\s*\}`, a strict superset of the old pattern (verified: still matches
+    every existing caller). `powtwo` was assumed to live in `root.tbl`
+    alongside `inroot`; it is actually `powtwo.tbl`, a separate 28-entry
+    (not 128-entry) table — caught by the generator's own assertion, not by
+    a silent wrong answer.
+  - **Scalar reference** (`src/reference/double/invtrig.rs`, new module):
+    `atan` first (establishes the double-double primitives), then `atan2`
+    (confirmed by disassembly to *not* call into `atan`'s own code — no
+    `call` instruction anywhere in `__ieee754_atan2_fma` — so it
+    reimplements the same table/Taylor shape inline, once per quadrant, with
+    its own extra `du` division-residual term), then `asin`/`acos` together
+    (their eight bands share one table and nearly all of one polynomial
+    evaluator). `dla.h`'s `EMULV` macro, under `__FP_FAST_FMA` (true on this
+    host), collapses to exactly this crate's `a_mul` two-product shape,
+    reused rather than reinvented; `ESUB`'s magnitude-ordered branch was
+    confirmed, not assumed, to fold away at compile time in the one call site
+    that needs it (`atan`'s `D <= u < E` band, where `w = 1/u <= 1/16 < HPI`
+    always holds).
+  - **Verification: brute-force against the live platform, not sampling.**
+    A throwaway per-function harness (`examples/verify_*.rs`, deleted after
+    use — the permanent corpus lives in `tests/delegating.rs`) compared every
+    ported function against the real `f64::asin`/`acos`/`atan`/`atan2` over
+    20M random bit patterns plus dense boundary/domain sweeps, before any
+    vector code was written, exactly as A1's own protocol specifies. `atan`
+    and `atan2` matched **on the first attempt** (0/20M) — the disassembly
+    reading was thorough enough to need no iteration. `asin` also matched
+    immediately. `acos` did not: 5 mismatches in a 4,000,015-point dense
+    sweep, all 1 ulp, all in the direct-Taylor band (`|x| < 0.125`). Root
+    cause, found by disassembling that specific block: the C source's
+    `t = (x2*x)*poly; cor = (...) - t;` compiles to *one* fused
+    `vfnmadd132sd` — `t` is never separately rounded — where the initial
+    translation had rounded it as its own step (extra rounding, not extra
+    precision, but on the wrong side: it made the ported value the *less*
+    accurate one, which is what a 1-ulp mismatch against a bit-exact target
+    always means). Fixed by fusing the same way the disassembly does;
+    re-run confirmed 0 mismatches. A second, unrelated correctness gap
+    surfaced only by the *existing* `tests/delegating.rs` suite (not the
+    throwaway harness, which only fed in-domain and finite-out-of-domain
+    values): out-of-domain input (`|x| > 1`) and NaN input are not the same
+    case. The exported `asin`/`acos` *wrapper* (confirmed by disassembly of
+    the wrapper stub, not the `_fma` entry point) checks `|x| > 1` itself
+    with an ordered `ucomisd` compare — true for finite out-of-range `x`,
+    false (unordered) for NaN — so a genuine domain error never reaches
+    `__ieee754_asin_fma` at all and returns a fixed canonical NaN through a
+    shared error path, while a NaN *input* falls through into
+    `__ieee754_asin_fma`'s own final `return (x-x)/(x-x);`, which
+    propagates the input NaN's payload and sign rather than producing a
+    fresh one. The initial port conflated the two (one `(x-x)/(x-x)`
+    fallback for both), which was invisible to 20M random finite samples
+    and to a domain sweep that used only `f64::NAN` itself, but not to
+    `tests/delegating.rs`'s corpus, which includes structured NaN payloads.
+    Fixed by adding the same explicit `if x.is_nan() { return x + x; }`
+    early return `atan` already had (and had already gotten right, by the
+    same reasoning, on the first pass) ahead of the range dispatch, and
+    keeping a literal `f64::NAN` — not a division — for the true
+    out-of-domain case. `cargo test --release`, `clippy` and `cargo doc`
+    clean after both fixes; full corpus in `tests/delegating.rs`
+    (`asin_is_bit_exact`, `acos_is_bit_exact`, `atan_is_bit_exact`,
+    `binary_functions_are_bit_exact`'s `atan2` row) passes unmodified — the
+    existing infrastructure needed no changes, only a correct reference to
+    check.
+  - **Wired in:** `reference::double`'s `delegate!` macro invocations for
+    `asin`/`acos`/`atan`/`atan2` removed; `reference::double::invtrig`'s
+    ports re-exported in their place. `crate::kernels::double::invtrig`'s
+    `BitExact` path is unchanged in shape (still `dispatch`'s `map_lanes`,
+    one lane at a time) but now calls a genuine port instead of the
+    platform, closing the gap between this crate's stated goal ("bit-exact
+    without calling the libm you're replacing") and what these four
+    functions actually did, independent of the vector work below.
+  - **Vector kernel: `atan`/`atan2` done and verified; `asin`/`acos` deferred
+    for a real reason found along the way, not a schedule squeeze.** A second
+    pass added `src/kernels/double/invtrig.rs`'s `bit_exact` submodule,
+    mirroring `trig.rs`'s shape exactly: every band evaluated unconditionally
+    and blended with `V::select`, `cij` gathered per lane the same way
+    `trig.rs`'s `TAB` and `ln.rs`'s exponent-field extraction already do (no
+    packed integer shift anywhere in `Simd`, the same documented constraint),
+    a defensive `.clamp(0, 240)` on the gather index for lanes whose real
+    band is something else entirely (mirrors `trig.rs`'s `% 110`). Wired in
+    the `ln.rs`/`logx.rs` way (`if A::BIT_EXACT { bit_exact(x) } else {
+    fast(x) }`) rather than through `dispatch`, since `dispatch` under
+    `BitExact` always maps to the scalar reference lane-by-lane — using it
+    would have silently kept the "no speed change" state this entry
+    previously described. `atan2`'s early-return lanes (not-normal
+    arguments, the extreme-exponent-difference short circuit, the extreme-
+    magnitude rescale bands) are excluded from the vector path and repaired
+    via `patch_lanes2` to the reference, per this crate's own rule that rare
+    lanes stay in `reference/`, not the vector main path — detected from raw
+    bits per lane rather than a scaled float comparison, because at the very
+    magnitudes those exist to guard, a float comparison like `ay >= ax *
+    2^57` can itself silently overflow and under-count.
+    - **Moved `tests/delegating.rs` → `tests/bit_exact.rs`**: `atan_is_bit_exact`
+      and `atan2`'s row in `binary_functions_are_bit_exact` removed;
+      `corpus_atan`/`corpus_atan2` added (branch boundaries `A`..`E` ±2,
+      `atan2`'s own extreme-exponent and rescale edges, ≥1.6M random and
+      adversarial samples), checked at every width this host has (scalar,
+      `f64x2`, `f64x4`, `f64x8`) via a new `check_width2`/`check_all_widths2!`
+      pair (this file had no two-argument checker before).
+    - **A real bug found by the wider corpus, not by the original
+      disassembly pass.** `atan_recip_taylor`'s (`D <= u < E`) final combine
+      — C's `yy = ((HPI1+cor)-ww) - yy;` — has *two* fusions the earlier
+      disassembly read correctly identified in prose but the landed code
+      did not actually perform: `inner = (HPI1+cor) - s*w` and `combined =
+      inner - wv*yy` were both plain two-rounding arithmetic instead of one
+      `mul_add` each. Invisible to the original 20M-random-bit-pattern
+      verification (uniform random doubles rarely land with any density in
+      `[16, 5.805e15]`, and the miss is a rare rounding coincidence even
+      within that band); caught immediately by `corpus_atan`'s dense
+      `[-20, 20]` sweep — 1 mismatch in `atan_bit_exact_at_every_width`
+      at width 1, `x = -19.315`. Root-caused with a corrected gdb
+      methodology (the first attempt read registers *before* the
+      instruction that defines them had executed, off by one throughout;
+      fixed by reading only at breakpoints placed *after* each value is
+      written) confirming `combined = (-wv).mul_add(yy, inner)` and `inner =
+      (-s).mul_add(w, hpi1_cor)` against the live trace, then verified with a
+      30M-sample sweep concentrated on every band boundary (0 mismatches,
+      scalar reference and vector kernel both) before being accepted.
+    - **A second, pre-existing bug found and *not* fixed, on purpose.**
+      Extending the same dense-sweep discipline to `acos` (not part of this
+      pass's scope, but the methodology was already built) found 8
+      mismatches, all 1 ulp, all in the near-1 band's `x > 0` arm, all within
+      `1e-7` of `x = 1` — invisible to every check that had passed before
+      this (the original 20M-sample verification, `tests/delegating.rs`'s
+      270K-sample corpus, and this session's own earlier acceptance of
+      `acos`). A first fix attempt (fusing `cor`'s final combine the same
+      way `atan`'s bug above was fixed) *reduced* the far-tail mismatches but
+      *introduced* 537 new ones across `[0.97, 0.99]` — live disassembly of
+      that band's `y=(c+t24)-t24` step showed the compiled code does not
+      use the add/subtract truncation the C source spells at all, but a
+      Dekker split via `fma(c, 2^27, c)` (`dla.h`'s `CN = 2^27+1` constant,
+      computed as one FMA rather than one multiply), a genuinely different
+      shape this session did not have time to finish reverse-engineering
+      correctly. Rather than land an unverified guess — the exact failure
+      mode this crate's whole design exists to prevent — the attempted fix
+      was reverted; `acos`'s near-1 positive-`x` band is back to exactly its
+      previously-verified state, with this 8-in-3M-dense-samples gap now
+      documented rather than silently present. Whoever picks this up next:
+      the `CN`/Dekker-split shape and the two register addresses identified
+      above (`0x33490` = `2^27`) are a real head start.
+    - **Measured** (`examples/bench.rs`, this machine, `RUSTFLAGS="-C
+      target-cpu=native"`, two runs): `atan` `BitExact` **1.28x** (`+Finite`
+      1.16-1.18x — smaller than plain `FullRange` here, unusual but
+      reproduced across both runs; the per-lane gather cost likely already
+      dominates over the repair check `Finite` removes), up from ~0.97x
+      delegating. `atan2` `BitExact` **2.74-3.03x**, up from ~0.99x —
+      squarely inside the "expected parity → 2-3x each" estimate this
+      section originally made. `atan`'s own gain is smaller than that
+      estimate but still a genuine, verified improvement over the previous
+      ~1.0x.
+    - **Still deferred: `asin`/`acos`'s vector kernel.** Not started this
+      pass — their eight bands share one 2568-entry table and, per the
+      finding just above, at least one band's true schedule is not what the
+      C source's literal expression grouping suggests, the same "read the
+      disassembly, don't guess" lesson A1 already learned once. Land the
+      `acos` near-1 fix first (a scalar bug, independent of any vector work),
+      re-verify with the same dense-sweep discipline, *then* vectorise
+      `asin`/`acos` together the way `sin`/`cos`/`sincos` were.
+
+- **A2/A3: `log10` ported and vectorised; `log1p`/`hypot` ported at the
+  scalar level.** Both A2 and A3's prior "genuinely hard, comparable to
+  `erf`/`erfc`" findings turned out to be artifacts of incomplete traces
+  from an earlier session, not accurate readings of the real algorithms —
+  re-disassembled properly this round with the same live-gdb discipline A1
+  established (`break main; run; disassemble /rs <symbol>` against a small
+  probe binary calling each function, ASLR disabled by gdb's own default so
+  addresses stay stable across separate invocations).
+  - **`log10` is a thin wrapper, not its own table algorithm.**
+    `__log10_finite` is ~80 bytes and calls straight into
+    `__ieee754_log_fma` — confirmed live, by breaking at the call site and
+    stepping in — which is exactly the table walk this crate already ported
+    bit-exact as `ln`'s `BitExact` kernel. Ported as a reduction (exponent
+    extraction, forced-near-1 argument) plus a call into
+    `crate::kernels::double::ln::bit_exact` (made `pub(super)` for this)
+    plus a three-term combine. One real bug: a first reading of the
+    disassembly swapped which of the two spilled products was `log10_2hi`
+    vs `log10_2lo` (the compiler schedules the `lo` product before the
+    call and the `hi` one after; reading instruction order top-to-bottom
+    without checking which literal address held which constant gets it
+    backwards) — caught immediately by brute-force verification (31874 of
+    300015 mismatches, all 1 ulp, every one traced to the swap) rather than
+    shipped. Fixed, then verified clean over 19M+ positive-normal-finite
+    samples (30M random bit patterns filtered, plus a dense sweep across
+    every biased exponent) and again over a further 40M-sample NaN-inclusive
+    sweep. **Vectorised and landed**: `BitExact` measures **2.61x** (2.27x
+    `+Finite`), up from the ~0.98x delegating baseline — comfortably past
+    the "`Fast` reaches 4.7-14x" ceiling this section originally quoted for
+    the group as a whole, at zero net-new table cost since it rides `ln`'s.
+  - **`log1p` really is the classic fdlibm shape** — confirmed by finding
+    glibc's own `s_log1p-fma.c`, which is `#define __log1p __log1p_fma` plus
+    a section-attribute wrapper around `#include
+    <sysdeps/ieee754/dbl-64/s_log1p.c>`: the *same source*, recompiled with
+    `-mfma`. A literal, unfused transliteration of that source
+    (`src/reference/double/log1p.rs`) passed 42M+ random samples with only
+    63 mismatches, every one 1 ulp and traceable to a specific compiler
+    fusion the disassembly shows and the source's own expression grouping
+    does not: the tiny-`|x|` shortcut's `x - x*x*0.5` is one fused
+    `vfnmadd231sd`; the `Lp[]` polynomial's flat-looking `R = R1 + z2*R2 +
+    z4*R3 + z6*R4` is compiled as a 3-step `fma` chain, algebraically
+    Horner in `z2` but not the same roundings; and the `k != 0` tail's
+    final `k*ln2_hi - (...)` is one fused `vfmsub231sd`. Fixed all four,
+    re-verified clean over 60M further random samples plus a corpus
+    specifically constructed to land in the rare `hu == 0, k != 0` branch
+    (`x` chosen so `1 + x` normalises within a handful of ulp of a power of
+    two, 831K points, 0 mismatches). One more bug, found only by
+    `tests/delegating.rs`'s existing corpus (not the brute-force sweeps,
+    whose own "want" came from the identical code path and so could not
+    catch a difference from it): x86-64's `divsd` for a genuine runtime
+    `0.0/0.0` returns `0xfff8000000000000`, sign bit set — its hardware
+    default NaN — which is *not* Rust's own `f64::NAN` constant
+    (`0x7ff8...`, unset, a compile-time-folded value with a different
+    convention). The port's first draft wrote the source's own literal
+    `(x - x) / (x - x)` and got this right by construction; replacing it
+    with `f64::NAN` to silence clippy's `eq_op` lint silently introduced
+    the bug — fixed by using the explicit correct bit pattern instead of
+    either form. A second NaN subtlety, also found this way: a NaN
+    *argument* (either sign) needed an explicit early check
+    (`x.to_bits() | (1 << 51)`, preserving sign and payload, forcing the
+    quiet bit) — the algorithm's own domain-error branch, taken literally
+    for a negative-signed NaN input, would canonicalise it instead, which
+    does not match the live platform's actual behaviour. **Scalar reference
+    ported and verified**, replacing the platform delegate; no vector
+    kernel yet (`BitExact` measures ~1.05x, essentially unchanged from
+    delegating, since the lane-at-a-time fallback costs the same whether it
+    calls into the platform or into this crate's own Rust).
+  - **`hypot`'s prior finding was reading a different, older algorithm.**
+    This host's glibc 2.43 ships the 2021+ Borges "MyHypot3" correction
+    (`e_hypot.c`), not the Dekker/`dla.h`-style routine the earlier
+    disassembly pass found — a smaller, better-documented shape with named
+    constants (`SCALE`, `LARGE_VAL`, `TINY_VAL`, `EPS`). Confirmed no
+    separate FMA ifunc, and confirmed by *complete* disassembly this time
+    (950 bytes, self-contained, zero calls out — the earlier session's own
+    "cut off mid-trace" was an address problem, not a real limit) that this
+    host runs the algorithm's own non-FMA branch, zero `vfmadd` anywhere,
+    matching the source's stated reason (fusing would break the
+    compensated correction's error-free-transformation identities, not
+    just round differently). **Scalar reference ported**
+    (`src/reference/double/hypot.rs`), literal and unfused throughout,
+    verified against the live platform over 25M+ pairs (20M random bit
+    patterns, 5M ordinary-magnitude pairs at random exponents, dense
+    sweeps around every scale-threshold and power-of-two boundary, and the
+    full specials cross-product including signaling-vs-quiet NaN). Two
+    real bugs, both hand-computed constants: `SCALE` (`2^-600`) and
+    `TINY_VAL` (`2^-459`) were both wrong by large, silent margins from a
+    bit-pattern arithmetic slip — not an algorithm misunderstanding —
+    surfacing as spurious NaN for small-magnitude pairs that should have
+    taken the up-scaled `kernel()` path but instead underflowed
+    `ax*ax + ay*ay` to exactly `0.0` on the unscaled common-case path,
+    then divided by it. Fixed by computing both constants programmatically
+    (`2f64.powi(n).to_bits()`) rather than by hand — the same
+    provenance discipline the crate already applies to tables, now applied
+    to bare scalar constants too. No vector kernel yet, deliberately: this
+    is the most delicate of A2/A3's three ports, and landing a solid,
+    verified scalar port rather than rushing a vector kernel on top of it
+    the same session is the same trade A4 made for `asin`/`acos`.
+  - Neither `log1p` nor `hypot`'s vector kernel was attempted this round.
+    `log10`'s own experience is the template for the easiest next step of
+    the two — reduce, then reuse an existing table-walk kernel — but
+    neither `log1p` nor `hypot` has an existing sibling kernel to reuse the
+    way `log10` reused `ln`'s, so both are genuine new vectorisation work,
+    not a repeat of `log10`'s shortcut.
+
 ## 7. Suggested sequencing
 
 Ordered by value density; each phase is independently shippable and ends with
@@ -654,8 +993,8 @@ the full verification protocol (§8).
 | **0** | D1, D2, B4 | S | measurement tooling in place; bench table honest — **done** |
 | **1** | C1, then re-tighten `pow`; C4; C5 if touched | M | `Fast` exponentials ~1 ulp, `pow` ≤4 asserted, inverse trig ≤4 — **done** |
 | **2** | B1, B3 (B2 withdrawn — considered decision) | M–L | native f32 `Fast`: `tanhf` 4.97x, `sin`/`cos`f 17-18x, `tan`f 7.4x — **done** |
-| **3** | A3, A2, D3 | **L, not M–L** | corrected after disassembly (§ A2/A3): both are genuinely hard, comparable to `erf`/`erfc`, not "easy targets" — **not attempted this round, see below** |
-| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | `sin`/`cos`/`sincos` bit-exact *and* faster (3.0–3.7x) — **done, see §6a**; `tan` and A4 (inverse trig) remain |
+| **3** | A3, A2, D3 | **L, not M–L; corrected again, see below** | `log10` bit-exact *and* faster (2.61x, reusing `ln`'s table) — **done, see §6a**; `log1p`/`hypot` scalar ported and verified, vector kernel not yet built — **done, see §6a** |
+| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | `sin`/`cos`/`sincos` bit-exact *and* faster (3.0–3.7x) — **done, see §6a**; A4's `atan`/`atan2` bit-exact *and* faster (1.28x/2.74-3.03x) — **done, see §6a**; `tan` and A4's `asin`/`acos` vector kernel remain (plus one known `acos` scalar gap) |
 | **5** | A5 gather experiment; ~~C2, C3~~ done | M | either a fleet-wide `BitExact` uplift or a documented negative result; `tgamma` 2037→512 ulp — **C2/C3 done** |
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a

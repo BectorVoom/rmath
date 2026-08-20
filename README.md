@@ -36,9 +36,10 @@ faster than the call it replaces, so it is stated up front rather than buried.
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
 | **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` `atan` `atan2` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
-| **Delegating** | `tan` `asin` `acos` `atan` `atan2` `asinh` `acosh` `atanh` `log10` `log1p` `hypot` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Delegating** | `tan` `asinh` `acosh` `atanh` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Ported (scalar only)** | `asin` `acos` `log1p` `hypot` | one lane at a time, but a genuine port rather than a platform call — see `ROADMAP.md`'s A4/A2/A3 entries | vectorised, measured ulp bound |
 | **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
@@ -190,6 +191,18 @@ call it replaces.
 | `sin`   | 13.58 ns | **2.97x** | 2.63x | 19.60x | **20.35x** |
 | `cos`   | 14.20 ns | **3.01x** | 2.58x | 20.45x | **21.22x** |
 | `sincos`| 17.97 ns | **3.59x** | 3.72x | 19.11x | **25.55x** |
+| `atan`  |  7.05 ns | **1.28x** | 1.16-1.18x | 9.08x | **9.42x** |
+| `atan2` | 14.98 ns | **2.74-3.03x** | 8.03-8.36x | — |
+| `log10` |  5.50 ns | **2.61x** | 2.27x | 8.26x | **10.03x** |
+
+`atan`/`atan2`/`log10` are the newest arrivals here. `asin`/`acos`/`atan`/
+`atan2` all used to delegate (see below), but `atan`/`atan2` now have a
+genuine vector `BitExact` schedule too. `asin`/`acos` do not yet — they are
+ported (bit-exact without calling the platform), but the vector kernel that
+would make them faster is still to come; see `ROADMAP.md`'s A4 entry.
+`log10` used to delegate as well; it turned out to be a thin wrapper around
+`__ieee754_log_fma` — the exact table walk `ln` already replays lane-parallel
+— so its vector kernel reuses `ln`'s rather than deriving a new one.
 
 ### Delegating — parity by default, and a large win under `Fast`
 
@@ -198,15 +211,19 @@ call it replaces.
 | `tan`   | 16.42 ns | 0.98x | 20.84x | **21.98x** |
 | `asin`  | 11.24 ns | 1.00x | 9.01x  | 9.86x |
 | `acos`  | 11.21 ns | 0.99x | 9.06x  | 9.83x |
-| `atan`  |  6.57 ns | 0.97x | 8.55x  | 9.51x |
-| `atan2` | 13.66 ns | 0.99x | 8.23x  | — |
 | `asinh` | 10.28 ns | 1.00x | 4.41x  | 5.94x |
 | `acosh` |  9.62 ns | 0.97x | 2.00x  | 9.27x |
 | `atanh` | 14.09 ns | 1.00x | 11.94x | 14.95x |
-| `log10` |  4.93 ns | 0.98x | 7.64x  | 9.63x |
-| `log1p` |  8.87 ns | 0.99x | 10.97x | 13.90x |
-| `hypot` |  3.26 ns | 0.92x | 4.61x  | — |
+| `log1p` |  9.99 ns | 1.05x | 11.20x | 14.36x |
+| `hypot` |  6.70 ns | 0.96x | 4.83x  | — |
 | `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
+
+`asin`/`acos`/`log1p`/`hypot`'s `BitExact` rows sit at parity for the same
+reason: each is a genuine port (verified bit-exact against the live platform,
+not a platform call under the hood any more), but none has a vector kernel
+yet, so the lane-at-a-time fallback still walks one lane at a time — same
+cost as before, just no longer delegating underneath. See `ROADMAP.md`'s A4
+(`asin`/`acos`) and A2/A3 (`log1p`/`hypot`) entries.
 
 ### Special functions — bit-exact *and* several times faster
 

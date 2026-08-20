@@ -154,6 +154,71 @@ macro_rules! check_all_widths {
     }};
 }
 
+/// [`check_width`] for a two-argument function.
+fn check_width2<V, F, G>(name: &str, xs: &[f64], ys: &[f64], scalar: F, vector: G)
+where
+    V: Simd<Elem = f64>,
+    F: Fn(f64, f64) -> f64,
+    G: Fn(V, V) -> V,
+{
+    use rmath::simd::Lanes;
+    let mut shown = 0usize;
+    let mut bad = 0usize;
+
+    for (cx, cy) in xs.chunks(V::LANES).zip(ys.chunks(V::LANES)) {
+        let mut lx = V::Floats::filled_default();
+        let mut ly = V::Floats::filled_default();
+        for slot in lx.as_mut_slice() {
+            *slot = cx[0];
+        }
+        for slot in ly.as_mut_slice() {
+            *slot = cy[0];
+        }
+        lx.as_mut_slice()[..cx.len()].copy_from_slice(cx);
+        ly.as_mut_slice()[..cy.len()].copy_from_slice(cy);
+
+        let got = vector(V::from_array(lx), V::from_array(ly)).to_array();
+        for i in 0..cx.len() {
+            let (x, y) = (lx.as_slice()[i], ly.as_slice()[i]);
+            let want = scalar(x, y);
+            let have = got.as_slice()[i];
+            if want.to_bits() != have.to_bits() {
+                bad += 1;
+                if shown < 8 {
+                    shown += 1;
+                    eprintln!(
+                        "{name} @{} lanes: (x, y) = ({x:e}, {y:e}) => want {want:e} ({:#018x}), got {have:e} ({:#018x})",
+                        V::LANES,
+                        want.to_bits(),
+                        have.to_bits()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        bad,
+        0,
+        "{name}: {bad} of {} lanes differ at width {}",
+        xs.len(),
+        V::LANES
+    );
+}
+
+/// Run the two-argument comparison at every supported width.
+macro_rules! check_all_widths2 {
+    ($name:expr, $xs:expr, $ys:expr, $scalar:expr, $f:expr) => {{
+        let f = $f;
+        check_width2::<f64, _, _>($name, $xs, $ys, $scalar, |x, y| f.eval(x, y));
+        #[cfg(feature = "wide")]
+        {
+            check_width2::<wide::f64x2, _, _>($name, $xs, $ys, $scalar, |x, y| f.eval(x, y));
+            check_width2::<wide::f64x4, _, _>($name, $xs, $ys, $scalar, |x, y| f.eval(x, y));
+            check_width2::<wide::f64x8, _, _>($name, $xs, $ys, $scalar, |x, y| f.eval(x, y));
+        }
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // The reference ports themselves must match the platform libm. If these fail,
 // nothing else in the file is meaningful — the vector kernels would be
@@ -316,6 +381,88 @@ fn corpus_trig(seed: u64) -> Vec<f64> {
     v
 }
 
+/// `atan`'s five bands (`A <= u < B <= u < C <= u < D <= u < E <= u`), at the
+/// exact bit patterns `src/reference/double/invtrig.rs` and
+/// `src/kernels/double/invtrig.rs::bit_exact` branch on.
+fn corpus_atan(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3e4b_b67a_0000_0000), // A
+        1.0 / 16.0,                            // B
+        1.0,                                   // C
+        16.0,                                  // D
+        5.805e15,                              // E
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-20.0, 20.0)); // straddles every band below D
+    }
+    for _ in 0..400_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true)); // subnormals through huge
+    }
+    for _ in 0..400_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
+/// `atan2`'s quadrants and its own extra edges: the `1/16` band shared with
+/// `atan`, the extreme-exponent-difference short circuit
+/// (`de = +-57 * 16^5`, i.e. `|y| ~= |x| * 2^57`), and the extreme-magnitude
+/// rescale bands (`2^-500`, `2^500`) — all four of which
+/// `bit_exact::atan2_needs_repair` routes to the reference rather than the
+/// vector path, so this corpus exists to prove that routing is right, not to
+/// exercise the vector arithmetic at those specific points.
+fn corpus_atan2(seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Rng(seed);
+    let mut ys = universal();
+    let mut xs = universal();
+    while xs.len() < ys.len() {
+        xs.push(1.0);
+    }
+    let mut push = |y: f64, x: f64| {
+        ys.push(y);
+        xs.push(x);
+    };
+    for &s in &[1.0, -1.0] {
+        for &t in &[1.0, -1.0] {
+            for c in [
+                0.0,
+                1.0 / 16.0,
+                1.0,
+                1e-10,
+                1e10,
+                f64::from_bits(0x20b0_0000_0000_0000), // 2^-500
+                f64::from_bits(0x5f30_0000_0000_0000), // 2^500
+            ] {
+                for d in [1e-6, 1.0, 1e6] {
+                    push(s * c, t * d);
+                    push(s * d, t * c);
+                }
+            }
+            // The exponent-difference threshold itself, and just either
+            // side of it.
+            for k in -2i32..=2 {
+                let big = f64::from_bits((0x7fdu64 << 52).wrapping_add(k as u64));
+                push(s * big, t * 1.0);
+                push(s * 1.0, t * big);
+            }
+        }
+    }
+    for _ in 0..600_000 {
+        let y = rng.log_uniform(1e-300, 1e300, true);
+        let x = rng.log_uniform(1e-300, 1e300, true);
+        push(y, x);
+    }
+    for _ in 0..300_000 {
+        push(f64::from_bits(rng.next()), f64::from_bits(rng.next()));
+    }
+    (ys, xs)
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -347,6 +494,38 @@ fn assert_reference(
          library is built differently (a non-FMA variant, a different version), \
          this is where it shows up.",
         vals.len()
+    );
+}
+
+/// [`assert_reference`] for a two-argument function.
+fn assert_reference2(
+    name: &str,
+    ys: &[f64],
+    xs: &[f64],
+    ours: impl Fn(f64, f64) -> f64,
+    libm: impl Fn(f64, f64) -> f64,
+) {
+    let mut bad = 0usize;
+    let mut shown = 0;
+    for (&y, &x) in ys.iter().zip(xs) {
+        let (a, b) = (ours(y, x), libm(y, x));
+        if a.to_bits() != b.to_bits() {
+            bad += 1;
+            if shown < 8 {
+                shown += 1;
+                eprintln!(
+                    "reference::{name}: (y, x) = ({y:e}, {x:e}) => ours {a:e} ({:#018x}), libm {b:e} ({:#018x})",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        bad,
+        0,
+        "reference::{name} differs from the platform libm on {bad} of {} inputs.",
+        ys.len()
     );
 }
 
@@ -430,6 +609,22 @@ fn reference_cos_matches_platform_libm() {
     );
 }
 
+#[test]
+fn reference_atan_matches_platform_libm() {
+    assert_reference(
+        "atan",
+        &corpus_atan(0x2545_F491_4F6C_DD21),
+        reference::atan,
+        f64::atan,
+    );
+}
+
+#[test]
+fn reference_atan2_matches_platform_libm() {
+    let (ys, xs) = corpus_atan2(0x0BAD_C0DE_1234_5678);
+    assert_reference2("atan2", &ys, &xs, reference::atan2, f64::atan2);
+}
+
 /// `reference::sincos` must agree with `reference::sin`/`cos` taken
 /// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
 /// are genuinely different computations, so this is not redundant with the
@@ -499,6 +694,18 @@ fn cosh_bit_exact_at_every_width() {
 fn cbrt_bit_exact_at_every_width() {
     let vals = corpus_cbrt(0x2545_F491_4F6C_DD1D);
     check_all_widths!("cbrt", &vals, f64::cbrt, Cbrt::new());
+}
+
+#[test]
+fn atan_bit_exact_at_every_width() {
+    let vals = corpus_atan(0xC2B2_AE3D_27D4_EB53);
+    check_all_widths!("atan", &vals, f64::atan, Atan::new());
+}
+
+#[test]
+fn atan2_bit_exact_at_every_width() {
+    let (ys, xs) = corpus_atan2(0x5DEE_CE66_D1B5_4A37);
+    check_all_widths2!("atan2", &ys, &xs, f64::atan2, Atan2::new());
 }
 
 #[test]

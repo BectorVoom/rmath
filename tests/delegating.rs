@@ -155,7 +155,6 @@ macro_rules! suite {
 suite!(tan_is_bit_exact, "tan", Tan, wide_corpus(3), f64::tan);
 suite!(asin_is_bit_exact, "asin", Asin, unit_corpus(4), f64::asin);
 suite!(acos_is_bit_exact, "acos", Acos, unit_corpus(5), f64::acos);
-suite!(atan_is_bit_exact, "atan", Atan, wide_corpus(6), f64::atan);
 suite!(sinh_is_bit_exact, "sinh", Sinh, wide_corpus(7), f64::sinh);
 suite!(cosh_is_bit_exact, "cosh", Cosh, wide_corpus(8), f64::cosh);
 suite!(tanh_is_bit_exact, "tanh", Tanh, wide_corpus(9), f64::tanh);
@@ -266,7 +265,6 @@ fn binary_functions_are_bit_exact() {
     let n = vals.len() / 2;
     let (xs, ys) = (&vals[..n], &vals[n..2 * n]);
     all_widths2!("pow", xs, ys, f64::powf, Pow::new());
-    all_widths2!("atan2", xs, ys, f64::atan2, Atan2::new());
     all_widths2!("hypot", xs, ys, f64::hypot, Hypot::new());
 }
 

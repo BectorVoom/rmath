@@ -660,7 +660,9 @@ def mynumber_bits(text: str, name: str) -> int:
     the double's bits are `(hi << 32) | lo`.
     """
     m = re.search(
-        rf"\b{re.escape(name)}\s*=\s*\{{\{{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\}}\}}", text
+        rf"\b{re.escape(name)}\s*=\s*\{{\{{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\}}\s*\}}",
+        text,
+        re.IGNORECASE,
     )
     if not m:
         raise ValueError(f"mynumber initialiser not found: {name}")
@@ -804,6 +806,181 @@ def emit_trig_tables(src_dir: Path | None) -> str:
     return "\n".join(out) + "\n"
 
 
+def emit_atan_tables(src_dir: Path | None) -> str:
+    atnat = strip_c_comments_only(fetch_glibc("atnat.h", src_dir))
+    atnat_le = little_endi_span(atnat)
+    uatan = strip_c_comments_only(fetch_glibc("uatan.tbl", src_dir))
+    uatan_le = little_endi_span(uatan)
+
+    out = [TRIG_HEADER.format(
+        title="`atan` data: the IBM Accurate Math Library's reduction "
+              "constants, Taylor coefficients and 241-row `cij` table.",
+        src="atnat.h / uatan.tbl",
+    )]
+    w = out.append
+
+    # atnat.h: thresholds and the two Taylor-series coefficient sets, all
+    # `mynumber` unions.
+    for name, const, doc in [
+        ("d3", "D3", "`atan(x)`'s direct Taylor series, cubic coefficient (`A <= u < B` band)."),
+        ("d5", "D5", "Quintic coefficient."),
+        ("d7", "D7", "Septic coefficient."),
+        ("d9", "D9", "Nonic coefficient."),
+        ("d11", "D11", "11th-order coefficient."),
+        ("d13", "D13", "13th-order coefficient, the series' highest order term."),
+        ("a", "A", "Lower threshold: below this, `atan(x)` underflows to `x`."),
+        ("b", "B", "`1/16`, boundary between the direct-Taylor and table bands."),
+        ("c", "C", "`1`, boundary between the table and reciprocal-table bands."),
+        ("d", "D", "`16`, boundary between the reciprocal-table and reciprocal-Taylor bands."),
+        ("e", "E", "`5.805e15`, above which `atan(x)` saturates to `+-pi/2`."),
+        ("hpi", "HPI", "`pi/2`."),
+        ("mhpi", "MHPI", "`-pi/2`."),
+        ("hpi1", "HPI1", "`pi/2 - HPI`, the low part of `pi/2`."),
+    ]:
+        bits = mynumber_bits(atnat_le, name)
+        w(f"/// {doc}")
+        w(f"pub const {const}: f64 = f64::from_bits(0x{bits:016x});\n")
+
+    # uatan.tbl: cij[241][7] -- for row i, [0] = x0 (the table's base point),
+    # [1] = atan(x0)'s leading part, [2..6] = the 5 polynomial coefficients
+    # `__atan`/`__atan2` evaluate at `z = u - x0` (direct band) or
+    # `z = (w - x0) + ww` (reciprocal band, `w = 1/u`).
+    ints = [int(t, 16) for t in re.findall(r"0[xX][0-9a-fA-F]+", uatan_le)]
+    assert len(ints) == 241 * 7 * 2, f"uatan.tbl has {len(ints)} u32 halves, expected {241 * 7 * 2}"
+    flat = [(ints[i + 1] << 32) | ints[i] for i in range(0, len(ints), 2)]
+    assert len(flat) == 241 * 7
+    w("/// `CIJ[7i..7i+7] = [x0, t1, c2, c3, c4, c5, c6]` for row `i` in `0..241`:\n"
+      "/// `__atan`/`__atan2`'s per-interval table, indexed by\n"
+      "/// `((TWO52 + 256*w) - TWO52) - 16` where `w` is `u` (direct band) or\n"
+      "/// `1/u` (reciprocal band).")
+    w(f"pub static CIJ: [u64; {len(flat)}] = [")
+    for i in range(0, len(flat), 4):
+        w("    " + " ".join(f"0x{v:016x}," for v in flat[i:i + 4]))
+    w("];")
+    return "\n".join(out) + "\n"
+
+
+def emit_asincos_tables(src_dir: Path | None) -> str:
+    uasncs = strip_c_comments_only(fetch_glibc("uasncs.h", src_dir))
+    uasncs_le = little_endi_span(uasncs)
+    asincos = strip_c_comments_only(fetch_glibc("asincos.tbl", src_dir))
+    asincos_le = little_endi_span(asincos)
+    root = strip_c_comments_only(fetch_glibc("root.tbl", src_dir))
+    powtwo_src = strip_c_comments_only(fetch_glibc("powtwo.tbl", src_dir))
+
+    out = [TRIG_HEADER.format(
+        title="`asin`/`acos` data: the IBM Accurate Math Library's Taylor\n"
+              "//! coefficients, reduction constants, 2568-entry band table and the\n"
+              "//! shared reciprocal-square-root seed tables.",
+        src="uasncs.h / asincos.tbl / root.tbl",
+    )]
+    w = out.append
+
+    for name, const, doc in [
+        ("hp0", "HP0", "`pi/2`, high part."),
+        ("hp1", "HP1", "`pi/2`, low part (`pi/2 - HP0`)."),
+    ]:
+        bits = mynumber_bits(uasncs_le, name)
+        w(f"/// {doc}")
+        w(f"pub const {const}: f64 = f64::from_bits(0x{bits:016x});\n")
+
+    for name, const, doc in [
+        ("f1", "F1", "`asin`/`acos`'s shared Taylor series, `x^1` coefficient (`|x| < 1/8` band)."),
+        ("f2", "F2", "`x^3` coefficient."),
+        ("f3", "F3", "`x^5` coefficient."),
+        ("f4", "F4", "`x^7` coefficient."),
+        ("f5", "F5", "`x^9` coefficient."),
+        ("f6", "F6", "`x^11` coefficient, the series' highest order term."),
+        ("big", "BIG", "`103079215104.0` (`= 1.5 * 2^36`), unused by the `_fma` build's schedule but kept for provenance."),
+        ("t24", "T24", "`2^24`, the round-to-24-bits trick constant the `0.96875 <= |x| < 1` band uses to split `c`."),
+        ("t27", "T27", "`2^27`, the same trick at 27 bits, for `acos`'s equivalent split."),
+        ("rt0", "RT0", "Newton-step seed refinement constant for `1/sqrt(z)`."),
+        ("rt1", "RT1", "Second refinement constant."),
+        ("rt2", "RT2", "Third refinement constant."),
+        ("rt3", "RT3", "Fourth (last) refinement constant."),
+    ]:
+        v, raw = chained_double_const(uasncs, name)
+        w(rust_const(const, v, raw, doc) + "\n")
+
+    # root.tbl: `inroot[128]`, `1/sqrt(z)`'s seed, plain decimal.
+    m = re.search(r"\binroot\s*\[128\]\s*=\s*\{([^}]*)\}", root, re.S)
+    if not m:
+        raise ValueError("inroot[128] not found")
+    vals = [float(x) for x in re.findall(r"-?\d+\.\d+", m.group(1))]
+    assert len(vals) == 128, f"inroot has {len(vals)} entries"
+    w("/// `1/sqrt(z)`'s seed, indexed by the top 7 bits of `z`'s mantissa.")
+    w("pub const INROOT: [f64; 128] = [")
+    for i in range(0, 128, 4):
+        w("    " + " ".join(f"{rust_f64(v)}," for v in vals[i:i + 4]))
+    w("];")
+    w("")
+
+    # powtwo.tbl: `powtwo[]`, 28 entries (2^0 .. 2^27, exact), plain decimal --
+    # a different, much smaller table from `pow_log_data.c`'s (unrelated) own
+    # naming, and not sized in its own declaration, so the count comes from
+    # what upstream actually wrote rather than an assumed literal.
+    m = re.search(r"\bpowtwo\s*\[\s*\]\s*=\s*\{([^}]*)\}", powtwo_src, re.S)
+    if not m:
+        raise ValueError("powtwo[] not found")
+    vals = [float(x) for x in re.findall(r"-?\d+\.\d+", m.group(1))]
+    w(f"/// The matching power-of-two scale, indexed by `511 - (k>>21)`; upstream\n"
+      f"/// spells only `2^0..2^{len(vals) - 1}` ({len(vals)} entries), which is enough\n"
+      f"/// range for the exponents `asin`/`acos`'s near-1 band produces.")
+    w(f"pub const POWTWO: [f64; {len(vals)}] = [")
+    for i in range(0, len(vals), 4):
+        w("    " + " ".join(f"{rust_f64(v)}," for v in vals[i:i + 4]))
+    w("];")
+    w("")
+
+    # asincos.tbl: a flat 2568-entry `double` table (`union { int4 i[5136]; double x[2568]; }`),
+    # indexed by band-specific offsets computed from the input's mantissa bits.
+    ints = [int(t, 16) for t in re.findall(r"0[xX][0-9a-fA-F]+", asincos_le)]
+    assert len(ints) == 2568 * 2, f"asincos.tbl has {len(ints)} u32 halves, expected {2568 * 2}"
+    tab = [(ints[i + 1] << 32) | ints[i] for i in range(0, len(ints), 2)]
+    assert len(tab) == 2568
+    w("/// `asncs.x`: the shared per-interval table for all six of `asin`/`acos`'s\n"
+      "/// table bands (`0.125 <= |x| < 0.96875`). Each band indexes a different\n"
+      "/// stride/offset into the same flat array -- see `src/reference/double/\n"
+      "/// invtrig.rs` for the per-band index arithmetic, transcribed from\n"
+      "/// `e_asin.c`.")
+    w(f"pub static ASNCS: [u64; {len(tab)}] = [")
+    for i in range(0, len(tab), 4):
+        w("    " + " ".join(f"0x{v:016x}," for v in tab[i:i + 4]))
+    w("];")
+    return "\n".join(out) + "\n"
+
+
+def emit_atan2_tables(src_dir: Path | None) -> str:
+    atnat2 = strip_c_comments_only(fetch_glibc("atnat2.h", src_dir))
+    atnat2_le = little_endi_span(atnat2)
+
+    out = [TRIG_HEADER.format(
+        title="`atan2` data: the constants `__ieee754_atan2` needs beyond\n"
+              "//! what `atan` (`atan_data.rs`) already provides -- the shared `d3..d13`\n"
+              "//! Taylor coefficients, `HPI`/`HPI1`/`MHPI` and the `1/16` band edge are\n"
+              "//! bit-identical between the two tables and are not repeated here.",
+        src="atnat2.h",
+    )]
+    w = out.append
+
+    for name, const, doc in [
+        ("opi", "OPI", "`pi`."),
+        ("opi1", "OPI1", "`pi - OPI`, the low part of `pi`."),
+        ("mopi", "MOPI", "`-pi`."),
+        ("qpi", "QPI", "`pi/4`, returned for `atan2(+-inf, +-inf)`."),
+        ("mqpi", "MQPI", "`-pi/4`."),
+        ("tqpi", "TQPI", "`3*pi/4`."),
+        ("mtqpi", "MTQPI", "`-3*pi/4`."),
+        ("two500", "TWO500", "`2^500`, the far-apart-exponents rescale for `x`/`y`."),
+        ("twom500", "TWOM500", "`2^-500`."),
+    ]:
+        bits = mynumber_bits(atnat2_le, name)
+        w(f"/// {doc}")
+        w(f"pub const {const}: f64 = f64::from_bits(0x{bits:016x});\n")
+
+    return "\n".join(out) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", type=Path, help="directory holding the upstream .c files")
@@ -827,6 +1004,18 @@ def main() -> int:
     dst = args.out / "double" / "trig.rs"
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(emit_trig_tables(args.src))
+    print(f"wrote {dst} ({len(dst.read_text().splitlines())} lines)")
+
+    dst = args.out / "double" / "atan_data.rs"
+    dst.write_text(emit_atan_tables(args.src))
+    print(f"wrote {dst} ({len(dst.read_text().splitlines())} lines)")
+
+    dst = args.out / "double" / "asincos_data.rs"
+    dst.write_text(emit_asincos_tables(args.src))
+    print(f"wrote {dst} ({len(dst.read_text().splitlines())} lines)")
+
+    dst = args.out / "double" / "atan2_data.rs"
+    dst.write_text(emit_atan2_tables(args.src))
     print(f"wrote {dst} ({len(dst.read_text().splitlines())} lines)")
     return 0
 

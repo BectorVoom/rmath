@@ -38,8 +38,16 @@ const NEAR_HI: f64 = f64::from_bits(0x3ff1090000000000);
 /// The table-centring offset, `bits(0x1.6p-1)`.
 const OFF: u64 = 0x3fe6000000000000;
 
+/// The table path, lane-for-lane identical to `__ieee754_log_fma`.
+///
+/// Exposed to [`super::logx::log10`], which reduces its argument to `x`'s own
+/// mantissa with a forced near-1.0 exponent field and calls straight into
+/// this — `log10`'s own glibc wrapper does exactly that (confirmed by
+/// disassembly: `__log10_finite` calls `__ieee754_log_fma` directly, not a
+/// separate routine), so replaying it here rather than re-deriving the same
+/// 128-entry table walk a second time is the schedule, not a shortcut.
 #[inline(always)]
-fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+pub(super) fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let ix = x.to_bits();
 
     let mut invc_a = V::Floats::filled_default();
