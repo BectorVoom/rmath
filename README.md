@@ -36,10 +36,9 @@ faster than the call it replaces, so it is stated up front rather than buried.
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
 | **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `log1p` `hypot` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
 | **Delegating** | `asinh` `acosh` `atanh` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
-| **Ported (scalar only)** | `log1p` `hypot` | one lane at a time, but a genuine port rather than a platform call — see `ROADMAP.md`'s A2/A3 entries | vectorised, measured ulp bound |
 | **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
@@ -209,18 +208,18 @@ call it replaces.
 | `asin`  | 12.7 ns | 0.83-0.84x | 0.87x | 8.36-8.45x | **10.2x** |
 | `acos`  | 12.8 ns | 0.84-0.85x | 0.86x | 8.44-8.51x | **10.2x** |
 | `log10` |  5.50 ns | **2.61x** | 2.27x | 8.26x | **10.03x** |
+| `log1p` |  9.99 ns | **1.13x** | 1.31x | 11.39x | **14.36x** |
+| `hypot` |  6.70 ns | **1.93x** | — | 4.82x | — |
 
-`tan`/`atan`/`atan2`/`asin`/`acos`/`log10` are the newest arrivals here.
-`tan` and the four inverse trig functions all used to delegate (see below),
-and now all have a genuine vector `BitExact` schedule. `asin`/`acos`'s exact
-rows sit just under parity (0.83-0.85x) rather than above it: their table
+`tan`/`atan`/`atan2`/`asin`/`acos`/`log10`/`log1p`/`hypot` all have genuine vector `BitExact` schedules.
+`asin`/`acos`'s exact rows sit just under parity (0.83-0.85x) rather than above it: their table
 bands need a 13-slot per-lane gather and the platform's scalar routine never
 pays for more than one band — the one case in this table where the vector
 `BitExact` path is not the faster one, and the exact cost `ROADMAP.md`'s A5
 hardware-gather backend targets. Their `Fast` rows are the win, as elsewhere.
-`log10` used to delegate as well; it turned out to be a thin wrapper around
-`__ieee754_log_fma` — the exact table walk `ln` already replays lane-parallel
-— so its vector kernel reuses `ln`'s rather than deriving a new one.
+`log10` reuses `ln`'s exact table walk rather than deriving a new one. `log1p`
+replays `__log1p_fma` lane-parallel, and `hypot` replays the modern Borges
+"MyHypot3" compensated correction with unfused vector arithmetic.
 
 ### Delegating — parity by default, and a large win under `Fast`
 
@@ -229,16 +228,8 @@ hardware-gather backend targets. Their `Fast` rows are the win, as elsewhere.
 | `asinh` | 10.28 ns | 1.00x | 4.41x  | 5.94x |
 | `acosh` |  9.62 ns | 0.97x | 2.00x  | 9.27x |
 | `atanh` | 14.09 ns | 1.00x | 11.94x | 14.95x |
-| `log1p` |  9.99 ns | 1.05x | 11.20x | 14.36x |
-| `hypot` |  6.70 ns | 0.96x | 4.83x  | — |
 | `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
 
-`log1p`/`hypot`'s `BitExact` rows sit at parity for the same
-reason: each is a genuine port (verified bit-exact against the live platform,
-not a platform call under the hood any more), but neither has a vector kernel
-yet, so the lane-at-a-time fallback still walks one lane at a time — same
-cost as before, just no longer delegating underneath. See `ROADMAP.md`'s A2/A3
-entries.
 
 ### Special functions — bit-exact *and* several times faster
 

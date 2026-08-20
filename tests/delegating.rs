@@ -152,9 +152,6 @@ macro_rules! suite {
     };
 }
 
-suite!(sinh_is_bit_exact, "sinh", Sinh, wide_corpus(7), f64::sinh);
-suite!(cosh_is_bit_exact, "cosh", Cosh, wide_corpus(8), f64::cosh);
-suite!(tanh_is_bit_exact, "tanh", Tanh, wide_corpus(9), f64::tanh);
 suite!(
     asinh_is_bit_exact,
     "asinh",
@@ -176,102 +173,4 @@ suite!(
     unit_corpus(12),
     f64::atanh
 );
-suite!(
-    expm1_is_bit_exact,
-    "expm1",
-    Expm1,
-    wide_corpus(16),
-    f64::exp_m1
-);
 
-/// Compare a two-argument function against the platform, at one width.
-fn check_width2<V, F, G>(name: &str, xs: &[f64], ys: &[f64], scalar: F, vector: G)
-where
-    V: Simd<Elem = f64>,
-    F: Fn(f64, f64) -> f64,
-    G: Fn(V, V) -> V,
-{
-    let mut bad = 0usize;
-    let mut shown = 0;
-    for (cx, cy) in xs.chunks(V::LANES).zip(ys.chunks(V::LANES)) {
-        let mut lx = V::Floats::filled_default();
-        let mut ly = V::Floats::filled_default();
-        for k in 0..V::LANES {
-            lx.as_mut_slice()[k] = cx[0];
-            ly.as_mut_slice()[k] = cy[0];
-        }
-        lx.as_mut_slice()[..cx.len()].copy_from_slice(cx);
-        ly.as_mut_slice()[..cy.len()].copy_from_slice(cy);
-        let got = vector(V::from_array(lx), V::from_array(ly)).to_array();
-        for i in 0..cx.len().min(cy.len()) {
-            let (x, y) = (lx.as_slice()[i], ly.as_slice()[i]);
-            let (want, have) = (scalar(x, y), got.as_slice()[i]);
-            if want.to_bits() != have.to_bits() {
-                bad += 1;
-                if shown < 5 {
-                    shown += 1;
-                    eprintln!(
-                        "{name} @{} lanes: ({x:e}, {y:e}) => want {want:e} ({:#018x}), got {have:e} ({:#018x})",
-                        V::LANES,
-                        want.to_bits(),
-                        have.to_bits()
-                    );
-                }
-            }
-        }
-    }
-    assert_eq!(bad, 0, "{name}: {bad} lanes differ");
-}
-
-macro_rules! all_widths2 {
-    ($name:expr, $xs:expr, $ys:expr, $scalar:expr, $f:expr) => {{
-        let f = $f;
-        check_width2::<f64, _, _>($name, $xs, $ys, $scalar, |a, b| f.eval(a, b));
-        #[cfg(feature = "wide")]
-        {
-            check_width2::<wide::f64x2, _, _>($name, $xs, $ys, $scalar, |a, b| f.eval(a, b));
-            check_width2::<wide::f64x4, _, _>($name, $xs, $ys, $scalar, |a, b| f.eval(a, b));
-            check_width2::<wide::f64x8, _, _>($name, $xs, $ys, $scalar, |a, b| f.eval(a, b));
-        }
-    }};
-}
-
-/// The two-argument functions, at every width.
-///
-/// `pow` is a port, so this is the same class of check `tests/bit_exact.rs`
-/// makes of `exp` — and the width sweep matters more here than for the
-/// delegating pair, because the vector code walks two lane arrays by hand.
-#[test]
-fn binary_functions_are_bit_exact() {
-    let vals = wide_corpus(18);
-    let n = vals.len() / 2;
-    let (xs, ys) = (&vals[..n], &vals[n..2 * n]);
-    all_widths2!("pow", xs, ys, f64::powf, Pow::new());
-}
-
-/// `pow` over the ranges its own main path actually covers.
-///
-/// The shared corpus is dominated by inputs that leave the vector path
-/// immediately — random bit patterns are NaN or out of range far more often
-/// than not — so this adds a sweep that stays inside it, where the ported
-/// schedule is what is being tested rather than the repair.
-#[test]
-fn pow_is_bit_exact_on_its_main_path() {
-    let mut rng = Rng(0xF00D_BABE_1234_5678);
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    for _ in 0..250_000 {
-        xs.push(rng.log_uniform(1e-300, 1e300, false));
-        ys.push(rng.uniform(-40.0, 40.0));
-    }
-    for _ in 0..100_000 {
-        xs.push(rng.uniform(0.0, 4.0));
-        ys.push(rng.uniform(-200.0, 200.0));
-    }
-    // Exact powers, where a seeded reconstruction is most likely to be off.
-    for i in 1..500u64 {
-        xs.push(i as f64);
-        ys.push(((i % 7) + 1) as f64);
-    }
-    all_widths2!("pow/main", &xs, &ys, f64::powf, Pow::new());
-}

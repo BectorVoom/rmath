@@ -313,6 +313,70 @@ fn corpus_hyper(seed: u64) -> Vec<f64> {
     v
 }
 
+fn corpus_expm1(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3c90000000000000), // 0x1p-54 tiny
+        f64::from_bits(0x3fd62e4300000000), // HALF_LN2: 0.5 * ln(2)
+        f64::from_bits(0x4043687a00000000), // MAIN_PATH_LIMIT: 56 * ln(2)
+        -0.25,                              // xr threshold in at_plus_one
+        -56.0 * std::f64::consts::LN_2,
+        20.0 * std::f64::consts::LN_2,
+        -2.0 * std::f64::consts::LN_2,
+        -std::f64::consts::LN_2,
+        std::f64::consts::LN_2,
+        709.782712893383973096, // overflow threshold
+        -708.39641853226410622, // underflow threshold
+        -745.13321910194110842, // flush-to-zero threshold
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-40.0, 40.0));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-760.0, 720.0));
+    }
+    for _ in 0..300_000 {
+        v.push(rng.log_uniform(1e-30, 1e3, true));
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
+fn corpus_tanh(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3c80000000000000), // TANH_TINY: 2^-55
+        1.0,
+        22.0, // saturation boundary
+        9.02, // saturation threshold
+        -1.0,
+        -22.0,
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-30.0, 30.0));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.log_uniform(1e-30, 1e10, true));
+    }
+    for _ in 0..300_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true));
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
 fn corpus_cbrt(seed: u64) -> Vec<f64> {
     let mut rng = Rng(seed);
     let mut v = universal();
@@ -700,6 +764,51 @@ fn corpus_hypot(seed: u64) -> (Vec<f64>, Vec<f64>) {
     (ys, xs)
 }
 
+fn corpus_pow(seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Rng(seed);
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut push = |x: f64, y: f64| {
+        xs.push(x);
+        ys.push(y);
+    };
+    let u = universal();
+    for &x in &u {
+        for &y in &u {
+            push(x, y);
+        }
+    }
+    for c in [0.5f64, 1.0, 2.0, 10.0, std::f64::consts::E] {
+        for d in [-2.0f64, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0] {
+            for dx in -2i64..=2 {
+                for dy in -2i64..=2 {
+                    let x = f64::from_bits(c.to_bits().wrapping_add(dx as u64));
+                    let y = f64::from_bits(d.to_bits().wrapping_add(dy as u64));
+                    push(x, y);
+                }
+            }
+        }
+    }
+    for _ in 0..400_000 {
+        push(rng.log_uniform(1e-300, 1e300, false), rng.uniform(-40.0, 40.0));
+    }
+    for _ in 0..200_000 {
+        push(rng.uniform(0.0, 4.0), rng.uniform(-200.0, 200.0));
+    }
+    for _ in 0..200_000 {
+        push(rng.log_uniform(1e-320, 1e308, true), rng.log_uniform(1e-320, 1e308, true));
+    }
+    for _ in 0..200_000 {
+        push(f64::from_bits(rng.next()), f64::from_bits(rng.next()));
+    }
+    // Exact integer powers
+    for i in 1..1000u64 {
+        push(i as f64, ((i % 7) + 1) as f64);
+        push(i as f64, -(((i % 7) + 1) as f64));
+    }
+    (xs, ys)
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -918,6 +1027,32 @@ fn reference_hypot_matches_platform_libm() {
     assert_reference2("hypot", &ys, &xs, reference::hypot, f64::hypot);
 }
 
+#[test]
+fn reference_expm1_matches_platform_libm() {
+    assert_reference(
+        "expm1",
+        &corpus_expm1(0xD1B5_4A32_D192_ED06),
+        reference::expm1,
+        f64::exp_m1,
+    );
+}
+
+#[test]
+fn reference_tanh_matches_platform_libm() {
+    assert_reference(
+        "tanh",
+        &corpus_tanh(0xD1B5_4A32_D192_ED07),
+        reference::tanh,
+        f64::tanh,
+    );
+}
+
+#[test]
+fn reference_pow_matches_platform_libm() {
+    let (xs, ys) = corpus_pow(0x0BAD_C0DE_1234_567A);
+    assert_reference2("pow", &xs, &ys, reference::pow, f64::powf);
+}
+
 /// `reference::sincos` must agree with `reference::sin`/`cos` taken
 /// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
 /// are genuinely different computations, so this is not redundant with the
@@ -1055,6 +1190,24 @@ fn hypot_bit_exact_at_every_width() {
     check_all_widths2!("hypot", &ys, &xs, f64::hypot, Hypot::new());
 }
 
+#[test]
+fn expm1_bit_exact_at_every_width() {
+    let vals = corpus_expm1(0x5DEE_CE66_D1B5_4A39);
+    check_all_widths!("expm1", &vals, f64::exp_m1, Expm1::new());
+}
+
+#[test]
+fn tanh_bit_exact_at_every_width() {
+    let vals = corpus_tanh(0x5DEE_CE66_D1B5_4A3A);
+    check_all_widths!("tanh", &vals, f64::tanh, Tanh::new());
+}
+
+#[test]
+fn pow_bit_exact_at_every_width() {
+    let (xs, ys) = corpus_pow(0x5DEE_CE66_D1B5_4A3B);
+    check_all_widths2!("pow", &xs, &ys, f64::powf, Pow::new());
+}
+
 /// `sincos` must agree with `sin`/`cos` taken separately at every width — the
 /// pair object cannot go through `check_all_widths!` directly (it returns two
 /// values), so each half is compared through a shim that keeps only that
@@ -1127,6 +1280,10 @@ fn special_lanes_do_not_leak_into_neighbours() {
         check_all_widths!("ln/mixed", &lanes, f64::ln, Ln::new());
         check_all_widths!("cbrt/mixed", &lanes, f64::cbrt, Cbrt::new());
         check_all_widths!("log1p/mixed", &lanes, f64::ln_1p, Log1p::new());
+        check_all_widths!("expm1/mixed", &lanes, f64::exp_m1, Expm1::new());
+        check_all_widths!("sinh/mixed", &lanes, f64::sinh, Sinh::new());
+        check_all_widths!("cosh/mixed", &lanes, f64::cosh, Cosh::new());
+        check_all_widths!("tanh/mixed", &lanes, f64::tanh, Tanh::new());
         // For asin/acos, the out-of-domain lanes (|x| > 1) must come out as
         // the canonical NaN from the vector path itself, without touching
         // their neighbours or being repaired.
