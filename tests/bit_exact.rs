@@ -514,6 +514,63 @@ fn corpus_asincos(seed: u64) -> Vec<f64> {
     v
 }
 
+/// `tan`'s six bands: the `g1`/`g2`/`g3` cutoffs, the two reduction ceilings
+/// (`25.0` and `1e8`, the latter the `patch_lanes` handoff), the `xfg`
+/// table-index edges (`256*w - 15.5` at integer `k`), and the `n`-parity
+/// flips at multiples of `pi/2`. The `gy2` split lives in the *reduced*
+/// argument, so it cannot be targeted directly — the dense sweeps below
+/// reach it — while every other branch is hit exactly.
+fn corpus_tan(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3e4b_096c_0000_0000), // g1: below it, tan(x) = x
+        f64::from_bits(0x3faf_212d_0000_0000), // g2 / gy2
+        f64::from_bits(0x3fe9_2f1a_0000_0000), // g3
+        25.0,                                  // g4: first reduction's ceiling
+        1e8,                                   // g5: second's, the patch handoff
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    // The table-index edges: `(256*w - 15.5)` at integer `k`, `k = 0..185`.
+    for k in 0..186i64 {
+        let w = (k as f64 + 15.5) / 256.0;
+        v.extend(around(w));
+        v.extend(around(-w));
+    }
+    // Quadrant boundaries: `n`'s parity flips at every multiple of pi/2, in
+    // both reductions' domains.
+    for k in 1..2000i64 {
+        let q = k as f64 * std::f64::consts::FRAC_PI_2;
+        v.extend(around(q));
+        v.extend(around(-q));
+    }
+    for k in [7000i32, 33_550_336, 67_100_672, 134_201_344] {
+        let q = k as f64 * std::f64::consts::FRAC_PI_2;
+        v.extend(around(q));
+        v.extend(around(-q));
+    }
+    for _ in 0..600_000 {
+        v.push(rng.uniform(-1000.0, 1000.0)); // ordinary use, table band
+    }
+    // Dense across both reductions' domains: the reduced argument ya sweeps
+    // through gy2 inside them, exercising the poly/table split's far side.
+    for _ in 0..300_000 {
+        v.push(rng.uniform(0.787, 25.0));
+        v.push(-rng.uniform(0.787, 25.0));
+        v.push(rng.uniform(25.0, 1e8));
+        v.push(-rng.uniform(25.0, 1e8));
+    }
+    for _ in 0..300_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true)); // subnormals through huge
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -697,6 +754,15 @@ fn reference_acos_matches_platform_libm() {
 }
 
 #[test]
+fn reference_tan_matches_platform_libm() {
+    assert_reference(
+        "tan",
+        &corpus_tan(0x9E37_79B9_7F4A_7C19),
+        reference::tan,
+        f64::tan,
+    );
+}
+
 /// `reference::sincos` must agree with `reference::sin`/`cos` taken
 /// separately — the module doc explains why `sin`'s and `sincos`'s mid-band
 /// are genuinely different computations, so this is not redundant with the
@@ -805,6 +871,11 @@ fn cos_bit_exact_at_every_width() {
 }
 
 #[test]
+fn tan_bit_exact_at_every_width() {
+    let vals = corpus_tan(0x0BAD_C0DE_DEAD_BEEF);
+    check_all_widths!("tan", &vals, f64::tan, Tan::new());
+}
+
 /// `sincos` must agree with `sin`/`cos` taken separately at every width — the
 /// pair object cannot go through `check_all_widths!` directly (it returns two
 /// values), so each half is compared through a shim that keeps only that

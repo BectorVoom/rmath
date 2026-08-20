@@ -42,7 +42,7 @@ pub use erfc_parts::erfc;
 pub use hypot::hypot;
 pub use invtrig::{acos, asin, atan, atan2};
 pub use log1p::log1p;
-pub use trig::{cos, sin, sincos};
+pub use trig::{cos, sin, sincos, tan};
 
 use crate::tables::double::{exp as et, exp10 as x10t, log as lt, pow as pt};
 
@@ -610,8 +610,6 @@ macro_rules! delegate {
     };
 }
 
-delegate! { /// `tan(x)`, the platform's. `x` in radians.
-tan => tan }
 delegate! { /// `asinh(x)`, the platform's.
 asinh => asinh }
 delegate! { /// `acosh(x)`, the platform's.

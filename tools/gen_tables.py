@@ -712,9 +712,10 @@ def emit_trig_tables(src_dir: Path | None) -> str:
     s_sin = strip_c_comments_only(fetch_glibc("s_sin.c", src_dir))
 
     out = [TRIG_HEADER.format(
-        title="`sin`/`cos`/`sincos` data: the IBM Accurate Math Library's "
-              "reduction constants, polynomial coefficients and 440-entry table.",
-        src="usncs.h / branred.h / sincostab.c",
+        title="`sin`/`cos`/`sincos`/`tan` data: the IBM Accurate Math Library's "
+              "reduction constants, polynomial coefficients and the 440-entry "
+              "`sincostab` / 186-row `xfg` tables.",
+        src="usncs.h / branred.h / sincostab.c / utan.h / utan.tbl",
     )]
     w = out.append
 
@@ -802,6 +803,68 @@ def emit_trig_tables(src_dir: Path | None) -> str:
     w(f"pub static TAB: [u64; {len(tab)}] = [")
     for i in range(0, len(tab), 4):
         w("    " + " ".join(f"0x{v:016x}," for v in tab[i:i + 4]))
+    w("];")
+
+    # utan.h / utan.tbl: `tan`'s own data. Most of the reduction constants
+    # (`MP1`/`MP2`/`PP3`/`PP4`/`HPINV`/`TOINT`) are bit-identical to
+    # `usncs.h`'s, emitted above -- asserted rather than re-emitted. New here
+    # are `tan`'s two polynomial sets (`D3..D11`, `E0`/`E1`), the band
+    # thresholds, the second reduction's extra `MP3`, and the 186-row `xfg`
+    # table.
+    utan = strip_c_comments_only(fetch_glibc("utan.h", src_dir))
+    utan_le = little_endi_span(utan)
+    utan_tbl = strip_c_comments_only(fetch_glibc("utan.tbl", src_dir))
+    utan_tbl_le = little_endi_span(utan_tbl)
+
+    for name, const in [
+        ("mp1", "MP1"),
+        ("mp2", "MP2"),
+        ("pp3", "PP3"),
+        ("pp4", "PP4"),
+        ("hpinv", "HPINV"),
+        ("toint", "TOINT"),
+    ]:
+        shared = struct.unpack("<Q", struct.pack("<d", double_const(usncs, name)[0]))[0]
+        assert mynumber_bits(utan_le, name) == shared, f"{const} differs between usncs.h and utan.h"
+
+    for name, const, doc in [
+        ("d3", "D3", "`tan(x)`'s direct Taylor series (`polynomial I`), cubic coefficient -- the small-argument and reduced bands' odd polynomial."),
+        ("d5", "D5", "Quintic coefficient."),
+        ("d7", "D7", "Septic coefficient."),
+        ("d9", "D9", "Nonic coefficient."),
+        ("d11", "D11", "11th-order coefficient, `polynomial I`'s highest-order term."),
+        ("e0", "E0", "`polynomial III`: `e0 + e1*z^2`, the table bands' interpolation polynomial for `tan`."),
+        ("e1", "E1", "Quadratic coefficient of `polynomial III`."),
+        ("mfftnhf", "MFFTNHF", "`-15.5`, the table index's `256*w - 15.5` offset."),
+        ("g1", "G1", "`1.259e-8`: below this, `tan(x)` returns `x`."),
+        ("g2", "G2", "`0.0608`, boundary between the direct-Taylor and first-reduction bands."),
+        ("g3", "G3", "`0.787`, boundary between the `w`-indexed table band and the quadrant reduction."),
+        ("g4", "G4", "`25.0`, the first (three-part `mp`) reduction's ceiling."),
+        ("g5", "G5", "`1e8`, the second (four-part `pp`) reduction's ceiling; past this, `__branred`."),
+        ("gy2", "GY2", "`0.0608`, the reduced-argument sub-band boundary: below it the odd polynomial, above it the table."),
+        ("mp3", "MP3", "`pi/2` residue, the first (`mp`) reduction's third part."),
+    ]:
+        v = mynumber_bits(utan_le, name)
+        w(f"/// {doc}")
+        w(f"pub const {const}: f64 = f64::from_bits(0x{v:016x});\n")
+
+    # utan.tbl: 186 rows of four doubles; the fourth column (FFi) is unused by
+    # `__tan`'s schedule, so it is dropped and the emitted stride is 3.
+    ints = [int(t, 16) for t in re.findall(r"0x[0-9a-fA-F]+", utan_tbl_le)]
+    assert len(ints) == 186 * 4 * 2, f"utan.tbl has {len(ints)} u32 halves, expected {186 * 4 * 2}"
+    flat = [(ints[i + 1] << 32) | ints[i] for i in range(0, len(ints), 2)]
+    assert len(flat) == 186 * 4
+    xfg = [v for i, v in enumerate(flat) if i % 4 != 3]
+    assert len(xfg) == 186 * 3
+    w("/// `XFG[3i..3i+3] = [xi, Fi, Gi]` for `i` in `0..186`: `__tan`'s\n"
+      "/// per-interval table (indexed by `256*w - 15.5`, `i` in `16..201`).\n"
+      "/// `xi` is the interval's base point, and `Fi + Gi ~= tan(xi)` is\n"
+      "/// carried as an unevaluated sum so the interpolation keeps accuracy a\n"
+      "/// single nearest double would lose. Upstream stores a fourth, unused\n"
+      "/// `FFi` column per row; it is dropped here (stride 3, not 4).")
+    w(f"pub static XFG: [u64; {len(xfg)}] = [")
+    for i in range(0, len(xfg), 3):
+        w("    " + " ".join(f"0x{v:016x}," for v in xfg[i:i + 3]))
     w("];")
     return "\n".join(out) + "\n"
 

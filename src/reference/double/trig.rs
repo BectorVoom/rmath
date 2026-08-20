@@ -1,17 +1,18 @@
-//! `sin`, `cos` and `sincos`: a port of glibc's `__sin`/`__cos`/`__sincos`
-//! (`sysdeps/ieee754/dbl-64/s_sin.c`, `s_sincos.c` — the IBM Accurate
-//! Mathematical Library), not a delegation.
+//! `sin`, `cos`, `sincos` and `tan`: a port of glibc's
+//! `__sin`/`__cos`/`__sincos`/`__tan` (`sysdeps/ieee754/dbl-64/s_sin.c`,
+//! `s_sincos.c`, `s_tan.c` — the IBM Accurate Mathematical Library), not a
+//! delegation.
 //!
-//! Ported rather than left as `f64::sin`/`f64::cos` because
+//! Ported rather than left as `f64::sin`/`f64::cos`/`f64::tan` because
 //! `src/kernels/double/trig.rs`'s vector `BitExact` path needs a schedule to
 //! replay lane-parallel, and the platform call is opaque to that. The huge-
-//! argument band (`|x| >= 105414350`, where the source reaches for
-//! `__branred`'s Payne-Hanek reduction) is deliberately **not** ported: it
-//! still calls straight through to `f64::sin`/`f64::cos`, which is bit-exact
-//! by construction and correct for every input — a `patch_lanes` repair the
-//! vector kernel reaches for, not a port with a gap in it. `__branred` itself
-//! may be ported later if profiling shows that band matters; nothing here
-//! depends on it not being.
+//! argument bands (`|x| >= 105414350` for the sine family, `|x| > 1e8` for
+//! `tan`, where the source reaches for `__branred`'s Payne-Hanek reduction)
+//! are deliberately **not** ported: they still call straight through to the
+//! platform function, which is bit-exact by construction and correct for
+//! every input — a `patch_lanes` repair the vector kernel reaches for, not a
+//! port with a gap in it. `__branred` itself may be ported later if
+//! profiling shows that band matters; nothing here depends on it not being.
 //!
 //! Three entry points, not one shared by projection: `__sin`'s and
 //! `__sincos`'s mid-band (`0.855469 <= |x| < 2.426265`) compute the
@@ -164,7 +165,11 @@ fn reduce_sincos(x: f64) -> (f64, f64, i32) {
 /// equivalent choice differently; see the module doc).
 #[inline(always)]
 fn do_sincos_one(a: f64, da: f64, n: i32) -> f64 {
-    let retval = if n & 1 != 0 { do_cos(a, da) } else { do_sin(a, da) };
+    let retval = if n & 1 != 0 {
+        do_cos(a, da)
+    } else {
+        do_sin(a, da)
+    };
     if n & 2 != 0 { -retval } else { retval }
 }
 
@@ -252,4 +257,162 @@ pub fn sincos(x: f64) -> (f64, f64) {
         return (f64::sin(x), f64::cos(x));
     }
     (f64::sin(x), f64::cos(x))
+}
+
+/// `tan(x)`: a port of glibc's `__tan` (`sysdeps/ieee754/dbl-64/s_tan.c` —
+/// the IBM Accurate Mathematical Library), not a delegation.
+///
+/// Ported rather than left as `f64::tan` for the same reason `sin`/`cos`
+/// are: `src/kernels/double/trig.rs`'s vector `BitExact` path needs a
+/// schedule to replay lane-parallel, and the platform call is opaque to
+/// that. The huge-argument band (`|x| > 1e8`, where the source reaches for
+/// `__branred`'s Payne-Hanek reduction) is deliberately **not** ported: it
+/// still calls straight through to `f64::tan`, which is bit-exact by
+/// construction and correct for every input — a `patch_lanes` repair the
+/// vector kernel reaches for, not a port with a gap in it.
+///
+/// The reduction is shared with `sin`/`cos` (`HPINV`, `TOINT`, `MP1`/`MP2`,
+/// `PP3`/`PP4` are bit-identical between `usncs.h` and `utan.h`, asserted by
+/// the table generator), but the reduction *constants differ*: `__tan` adds
+/// the extra third (`MP3`) / fourth (`PP4`) `pi/2` residue terms that
+/// `reduce_sincos` does not use, because `tan` must keep the reduced angle
+/// accurate to the very last bit to reach its 0.62-ULP bound.
+///
+/// Every `mul_add` here fuses (read from the compiled `__tan_fma`,
+/// `objdump -d`, glibc 2.43): the band-II polynomial's last step and final
+/// product, the table bands' index `256*w/ya - 15.5`, the `e`/`pz`
+/// interpolations, the reductions' `t = x*HPINV + TOINT` and their `a`/`da`
+/// steps, and `DIV2`'s `uu = c*b - u` and `cc = t3 - db*c`. The `+ 0.0` in
+/// `DIV2` matters: it is the `xx` term of the dividend `1.0 + 0.0`, and is
+/// kept exactly as the compiled code writes it.
+#[inline(always)]
+pub fn tan(x: f64) -> f64 {
+    let m = x.to_bits();
+    let k = (0x7fffffff_u32 & (m >> 32) as u32) as i32;
+
+    // Specials: `|x|` is `inf` or NaN — `retval = x - x` (NaN). The `EDOM`
+    // errno `__tan` raises for `inf` is not Rust's to set. The `x - x` is
+    // glibc's own idiom, not a typo for `0.0`: it is the exact instruction
+    // `vsubsd %xmm0, %xmm0, %xmm0`, whose NaN carries `x`'s own payload.
+    #[allow(clippy::eq_op)]
+    if k >= 0x7ff00000 {
+        return x - x;
+    }
+
+    let w = x.abs();
+
+    // (I): `|x| < 1.259e-8`. The underflow-force `w * w` for subnormal `w`
+    // changes flags only, never `retval`, so it is dropped.
+    if w <= t::G1 {
+        return x;
+    }
+    // (II): `|x| < 0.0608` — polynomial I, the direct Taylor series in `x`.
+    if w <= t::G2 {
+        let x2 = x * x;
+        let t2 = x2.mul_add(t::D11, t::D9);
+        let t2 = x2.mul_add(t2, t::D7);
+        let t2 = x2.mul_add(t2, t::D5);
+        let t2 = x2.mul_add(t2, t::D3);
+        return (x * x2).mul_add(t2, x);
+    }
+    // (III): `|x| < 0.787` — the `w`-indexed table, `s = (x < 0) ? -1 : 1`
+    // on the *signed* argument (the disassembly tests `x`, not `w`).
+    if w <= t::G3 {
+        let i = (w.mul_add(256.0, t::MFFTNHF)) as i32;
+        let xfg = f64::from_bits(t::XFG[i as usize * 3]);
+        let fi = f64::from_bits(t::XFG[i as usize * 3 + 1]);
+        let gi = f64::from_bits(t::XFG[i as usize * 3 + 2]);
+        let z = w - xfg;
+        let z2 = z * z;
+        let sy = if x < 0.0 { -1.0 } else { 1.0 };
+        let pz = (z * z2).mul_add(z2.mul_add(t::E1, t::E0), z);
+        let t2 = pz * (gi + fi) / (gi - pz);
+        return sy * (fi + t2);
+    }
+    // (IV): `|x| < 25.0` — reduction by algorithm i (three-part `mp`).
+    if w <= t::G4 {
+        let t = x.mul_add(t::HPINV, t::TOINT);
+        let xn = t - t::TOINT;
+        let t1 = xn.mul_add(-t::MP1, x);
+        let t1 = xn.mul_add(-t::MP2, t1);
+        let a = xn.mul_add(-t::MP3, t1);
+        let da = xn.mul_add(-t::MP3, t1 - a);
+        return tan_sub(t, a, da);
+    }
+    // (V): `|x| <= 1e8` — reduction by algorithm ii (four-part `pp`).
+    if w <= t::G5 {
+        let t = x.mul_add(t::HPINV, t::TOINT);
+        let xn = t - t::TOINT;
+        let t1 = xn.mul_add(-t::MP1, x);
+        let t1 = xn.mul_add(-t::MP2, t1);
+        let a = xn.mul_add(-t::PP3, t1);
+        let da = xn.mul_add(-t::PP3, t1 - a);
+        let b = xn.mul_add(-t::PP4, a);
+        let db = xn.mul_add(-t::PP4, a - b);
+        let da = db + da;
+        // EADD(a, da, sum, cc) — the four-part reduction's compensation.
+        let sum = b + da;
+        let cc = if b.abs() > da.abs() { (b - sum) + da } else { (da - sum) + b };
+        return tan_sub(t, sum, cc);
+    }
+    // (VI): `|x| > 1e8` — `__branred`'s Payne-Hanek reduction, not ported,
+    // see the module doc.
+    f64::tan(x)
+}
+
+/// The `(IV)`/`(V)` common tail: `tan` (or `-cot`) of the reduced argument
+/// `a + da`, with quadrant parity `n`.
+///
+/// Bands (VI)/(VIII)/(X) evaluate the *signed* `a`/`da` — the polynomial is
+/// odd, and `-cot` is its own odd evaluation, so the sign is carried by the
+/// values, not by `sy`; only the table bands multiply `sy`, with `-cot` as
+/// `-sy * y`. The disassembly shows the `sy` load (`+-1.0`) and the negated
+/// `a`/`da` prepared together, before the `ya <= gy2` branch.
+#[inline(always)]
+fn tan_sub(t: f64, a: f64, da: f64) -> f64 {
+    let n = (t.to_bits() & 1) as u32;
+    let (ya, yya, sy) = if a < 0.0 { (-a, -da, -1.0) } else { (a, da, 1.0) };
+
+    // (VI)/(VIII)/(X): `0 < |y| <= 0.0608` — the odd polynomial, on the
+    // signed values.
+    if ya <= t::GY2 {
+        let a2 = a * a;
+        let t2 = a2.mul_add(t::D11, t::D9);
+        let t2 = a2.mul_add(t2, t::D7);
+        let t2 = a2.mul_add(t2, t::D5);
+        let t2 = a2.mul_add(t2, t::D3);
+        let t2 = (a * a2).mul_add(t2, da);
+        let y = a + t2;
+        if n & 1 != 0 {
+            // EADD(a, t2, b, db); DIV2(1.0, 0.0, b, db, ...) — `-cot`.
+            let b = y;
+            let db = if a.abs() > t2.abs() { (a - b) + t2 } else { (t2 - b) + a };
+            let c = 1.0 / b;
+            let u = c * b;
+            let uu = c.mul_add(b, -u);
+            let t3 = ((1.0 - u) - uu) + 0.0;
+            let cc = (-db).mul_add(c, t3) / b;
+            let z = c + cc;
+            let zz = (c - z) + cc;
+            -(z + zz)
+        } else {
+            y
+        }
+    } else {
+        // (VII)/(IX)/(XI): `0.0608 < |y| <= 0.787` — the `ya`-indexed table.
+        let i = (ya.mul_add(256.0, t::MFFTNHF)) as i32;
+        let xfg = f64::from_bits(t::XFG[i as usize * 3]);
+        let fi = f64::from_bits(t::XFG[i as usize * 3 + 1]);
+        let gi = f64::from_bits(t::XFG[i as usize * 3 + 2]);
+        let z = (ya - xfg) + yya;
+        let z2 = z * z;
+        let pz = (z * z2).mul_add(z2.mul_add(t::E1, t::E0), z);
+        if n & 1 != 0 {
+            let t2 = pz * (fi + gi) / (fi + pz);
+            -sy * (gi - t2)
+        } else {
+            let t2 = pz * (gi + fi) / (gi - pz);
+            sy * (fi + t2)
+        }
+    }
 }

@@ -36,10 +36,10 @@ faster than the call it replaces, so it is stated up front rather than buried.
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
 | **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` `atan` `atan2` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `pow` `cbrt` `sinh` `cosh` `tanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
-| **Delegating** | `tan` `asinh` `acosh` `atanh` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
-| **Ported (scalar only)** | `asin` `acos` `log1p` `hypot` | one lane at a time, but a genuine port rather than a platform call — see `ROADMAP.md`'s A4/A2/A3 entries | vectorised, measured ulp bound |
+| **Delegating** | `asinh` `acosh` `atanh` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Ported (scalar only)** | `log1p` `hypot` | one lane at a time, but a genuine port rather than a platform call — see `ROADMAP.md`'s A2/A3 entries | vectorised, measured ulp bound |
 | **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
@@ -61,14 +61,27 @@ bit-exact, with no policy to opt into.
 
 **Ported** is the crate's headline case: the vector code replays the platform
 routine's operation schedule, so it is both bit-exact and several times faster.
-`sin`, `cos` and `sincos` are the largest members of this group: glibc's IBM
-Accurate Mathematical Library schedule for them — a 440-entry table, a
-degree-11 near-zero Taylor band, and fused-multiply-add placement that had to
-be read out of a disassembly (`objdump -d` against `__sin_fma`/`__cos_fma`,
-not inferred from the C source, which gets the fusion pairing wrong in more
-than one place) — is replayed lane-parallel rather than one lane at a time.
-`sincos` benefits most because it shares one argument reduction across both
-outputs, the same asymmetry the platform routine itself exploits.
+`sin`, `cos`, `sincos` and `tan` are the largest members of this group:
+glibc's IBM Accurate Mathematical Library schedule for them — a 440-entry
+table (and `tan`'s own 186-row `xfg`), degree-11 near-zero Taylor bands, a
+six-band control flow, and fused-multiply-add placement that had to
+be read out of a disassembly (`objdump -d` against
+`__sin_fma`/`__cos_fma`/`__tan_fma`, not inferred from the C source, which
+gets the fusion pairing wrong in more than one place) — is replayed
+lane-parallel rather than one lane at a time. `sincos` benefits most because
+it shares one argument reduction across both outputs, the same asymmetry the
+platform routine itself exploits. `tan`'s kernel keeps the family's six-band
+shape but adds the cotangent's compensated-division path, and hands `|x| >
+1e8` to the same `patch_lanes` repair as the other three; it measures **2.77x
+`BitExact`**, a step under `sin`/`cos`'s 3.0x for exactly that extra work.
+The newest members are `asin`/`acos`, whose five-degree table schedule is
+replayed from a single per-lane gather; their `BitExact` gain is smaller
+than the group's headline — measured 0.83-0.85x, just under parity — because
+that 13-slot
+gather is a per-lane loop (the hardware-gather backend `ROADMAP.md`'s A5 entry
+prototyped for `exp` is not rolled out yet), where `atan`/`atan2`'s lighter
+seven-slot rows land at 1.28x / 2.74-3.03x. Their `Fast` path still measures
+**8.4-8.5x**.
 
 **Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
 by their shape. Below `|x| = 2` they are rational functions of `x^2` and
@@ -87,11 +100,10 @@ the compiler chooses and the C source does not show. That has not been
 reproduced here, so under `BitExact` those kernels call the platform routine
 per lane — still bit-exact, so substituting `rmath` cannot change your result,
 but no faster than what it replaces. `Fast` is where their vector path lives,
-and it is worth a lot: **20x** for `tan`, which shares `sin`/`cos`'s schedule
-but has its own unported table shape. `jn` and `yn` are
-here for a different reason: they choose between three algorithms on `n`
-against `x`, and one of them runs a continued fraction whose length is decided
-at run time, so there is no vector shape to give them.
+and it is worth a lot: the hyperbolic inverses measure **8-13x**. `jn` and
+`yn` are here for a different reason: they choose between three algorithms on
+`n` against `x`, and one of them runs a continued fraction whose length is
+decided at run time, so there is no vector shape to give them.
 
 **Own** is the Gamma family. Rust has no `f64::tgamma`, so there is no call for
 `BitExact` to be bit-exact *to*; both policies run one vectorised
@@ -191,15 +203,21 @@ call it replaces.
 | `sin`   | 13.58 ns | **2.97x** | 2.63x | 19.60x | **20.35x** |
 | `cos`   | 14.20 ns | **3.01x** | 2.58x | 20.45x | **21.22x** |
 | `sincos`| 17.97 ns | **3.59x** | 3.72x | 19.11x | **25.55x** |
+| `tan`   | 16.86 ns | **2.77x** | 2.70x | 19.63x | **20.97x** |
 | `atan`  |  7.05 ns | **1.28x** | 1.16-1.18x | 9.08x | **9.42x** |
 | `atan2` | 14.98 ns | **2.74-3.03x** | 8.03-8.36x | — |
+| `asin`  | 12.7 ns | 0.83-0.84x | 0.87x | 8.36-8.45x | **10.2x** |
+| `acos`  | 12.8 ns | 0.84-0.85x | 0.86x | 8.44-8.51x | **10.2x** |
 | `log10` |  5.50 ns | **2.61x** | 2.27x | 8.26x | **10.03x** |
 
-`atan`/`atan2`/`log10` are the newest arrivals here. `asin`/`acos`/`atan`/
-`atan2` all used to delegate (see below), but `atan`/`atan2` now have a
-genuine vector `BitExact` schedule too. `asin`/`acos` do not yet — they are
-ported (bit-exact without calling the platform), but the vector kernel that
-would make them faster is still to come; see `ROADMAP.md`'s A4 entry.
+`tan`/`atan`/`atan2`/`asin`/`acos`/`log10` are the newest arrivals here.
+`tan` and the four inverse trig functions all used to delegate (see below),
+and now all have a genuine vector `BitExact` schedule. `asin`/`acos`'s exact
+rows sit just under parity (0.83-0.85x) rather than above it: their table
+bands need a 13-slot per-lane gather and the platform's scalar routine never
+pays for more than one band — the one case in this table where the vector
+`BitExact` path is not the faster one, and the exact cost `ROADMAP.md`'s A5
+hardware-gather backend targets. Their `Fast` rows are the win, as elsewhere.
 `log10` used to delegate as well; it turned out to be a thin wrapper around
 `__ieee754_log_fma` — the exact table walk `ln` already replays lane-parallel
 — so its vector kernel reuses `ln`'s rather than deriving a new one.
@@ -208,9 +226,6 @@ would make them faster is still to come; see `ROADMAP.md`'s A4 entry.
 
 | function | scalar | `BitExact` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|
-| `tan`   | 16.42 ns | 0.98x | 20.84x | **21.98x** |
-| `asin`  | 11.24 ns | 1.00x | 9.01x  | 9.86x |
-| `acos`  | 11.21 ns | 0.99x | 9.06x  | 9.83x |
 | `asinh` | 10.28 ns | 1.00x | 4.41x  | 5.94x |
 | `acosh` |  9.62 ns | 0.97x | 2.00x  | 9.27x |
 | `atanh` | 14.09 ns | 1.00x | 11.94x | 14.95x |
@@ -218,12 +233,12 @@ would make them faster is still to come; see `ROADMAP.md`'s A4 entry.
 | `hypot` |  6.70 ns | 0.96x | 4.83x  | — |
 | `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
 
-`asin`/`acos`/`log1p`/`hypot`'s `BitExact` rows sit at parity for the same
+`log1p`/`hypot`'s `BitExact` rows sit at parity for the same
 reason: each is a genuine port (verified bit-exact against the live platform,
-not a platform call under the hood any more), but none has a vector kernel
+not a platform call under the hood any more), but neither has a vector kernel
 yet, so the lane-at-a-time fallback still walks one lane at a time — same
-cost as before, just no longer delegating underneath. See `ROADMAP.md`'s A4
-(`asin`/`acos`) and A2/A3 (`log1p`/`hypot`) entries.
+cost as before, just no longer delegating underneath. See `ROADMAP.md`'s A2/A3
+entries.
 
 ### Special functions — bit-exact *and* several times faster
 

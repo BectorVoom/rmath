@@ -152,9 +152,6 @@ macro_rules! suite {
     };
 }
 
-suite!(tan_is_bit_exact, "tan", Tan, wide_corpus(3), f64::tan);
-suite!(asin_is_bit_exact, "asin", Asin, unit_corpus(4), f64::asin);
-suite!(acos_is_bit_exact, "acos", Acos, unit_corpus(5), f64::acos);
 suite!(sinh_is_bit_exact, "sinh", Sinh, wide_corpus(7), f64::sinh);
 suite!(cosh_is_bit_exact, "cosh", Cosh, wide_corpus(8), f64::cosh);
 suite!(tanh_is_bit_exact, "tanh", Tanh, wide_corpus(9), f64::tanh);

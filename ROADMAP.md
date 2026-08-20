@@ -8,8 +8,10 @@ or the ulp methodology of `tests/accuracy.rs`.
 
 ## 1. Where we stand
 
-The round of work just completed closed three gaps:
+The round of work just completed closed four gaps:
 
+- `tan` `BitExact` stopped delegating: **0.98x → 2.77x**, bit-exact (the
+  last member of the A1 trigonometric family, see §6a).
 - `Fast` `pow` tightened from **40 ulp to 8 asserted / ≤4 measured** (the
   table-free logarithm is now carried in double-double throughout), at the cost
   of 2.30x → 2.07x throughput.
@@ -20,13 +22,13 @@ What remains, grouped by what it costs the user today:
 
 | gap | today | ceiling |
 |---|---|---|
-| `tan` `BitExact` delegates | 0.97–0.99x | ~20x is proven by the `Fast` path; `sin`/`cos`/`sincos` already ported to 3.0–3.7x, see §6a |
+| `tan` `BitExact` — ported **and** vectorised (§6a A1) | done: 2.77x | — |
 | `atan`/`atan2` `BitExact` — ported **and** vectorised (§6a A4) | done: 1.28x / 2.74-3.03x | — |
-| `asin`/`acos` `BitExact` — scalar ported (§6a A4), still one lane at a time; `acos` has a known 1-ulp near-1 gap, see §6a | 0.97–1.00x | vector kernel not yet built; `atan`/`atan2`'s 1.3-3.0x is the model to follow |
+| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.83-0.85x exact (just under parity — 13-slot per-lane gather is the cost), `Fast` 8.4-8.5x / 10.2x `+Finite` | parity or better needs A5's hardware gather |
 | Hyperbolic inverses `BitExact` delegate | 0.97–1.00x | `Fast` reaches 8–13x |
 | `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 2.61x | — |
 | `log1p`, `hypot` `BitExact` — scalar ported (§6a A2/A3), still one lane at a time | ~1.0x | vector kernel not yet built |
-| Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x | hardware gathers could close part of that spread |
+| Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x; `asin`/`acos` `BitExact` 0.83-0.85x — the one case under parity, see §6a | hardware gathers could close part of that spread and push `asin`/`acos` past parity |
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
 | `tgamma` above 18 | up to ~2000 ulp near overflow | <64 with a direct double-double Stirling route |
 | `f32` `Fast` kernels that widen to `f64` | `tanhf` 2.20x, `erff` 1.57x, `sinf` via f64 | native f32 arithmetic is 2–4x cheaper |
@@ -55,7 +57,7 @@ These are the crate's contracts; the plan treats them as hard.
 The delegating rows are the largest remaining value: `BitExact` is the default
 policy, and sixteen functions currently gain nothing under it.
 
-### A1. Trigonometric family port (`sin`, `cos`, `sincos`, `tan`) — **`sin`/`cos`/`sincos` done; `tan` deferred**
+### A1. Trigonometric family port (`sin`, `cos`, `sincos`, `tan`) — **all four done**
 
 The headline job, and it was the largest. glibc computes these with the IBM
 Accurate Portable Math Library routines.
@@ -76,12 +78,21 @@ sin/cos `BitExact` **~2.97-3.01x** (from ~1.0x), `sincos` **~3.59-3.72x**
 (higher because it shares one reduction across both outputs) — within the
 plan's own 2-4x estimate.
 
-**`tan` deferred, not abandoned.** Its own table (`xfg`) has a shape
-(`xfg[186][4]`) that doesn't match how `s_tan.c` indexes it
-(`xfg[i][0..2]`) on a first read of the generator output — an unresolved
-wrinkle that needs its own schedule-reading pass before porting, the same
-discipline `sin`/`cos` needed. Left as a follow-on session rather than
-guessed at.
+**`tan` done too** (see §6a). The one wrinkle the deferral noted — `xfg`'s
+declared shape (`xfg[186][4]`) vs. how `s_tan.c` indexes it (`xfg[i][0..2]`)
+— resolved on the schedule-reading pass: `[3]` is a fourth column only the
+*cotangent* rows populate (`FFi`), which `__tan_fma`'s compiled code never
+loads, so the generator emits the table as `XFG: [u64; 558]` (`186 x 3`) and
+the kernel never touches a phantom fourth column. Same discipline as the
+other three: schedule read from the `__tan_fma` disassembly (glibc 2.43, the
+FMA ifunc), scalar reference port brute-force-verified against the platform
+(0 mismatches over ~58M inputs including 36M banded and all 186 table-index
+boundaries), then vectorised with whole-band blending. `|x| > 1e8` (glibc's
+own `__branred` Payne-Hanek reduction) stays a `patch_lanes` repair. Moved
+to `tests/bit_exact.rs` with `corpus_tan`. Measured: `tan` `BitExact`
+**2.77x** — inside the plan's 2-4x, a little under `sin`/`cos` because the
+tan schedule carries the extra `DIV2` cotangent path and the heavier
+reduction for `|x| > 25`.
 
 ### A2. `log10` and `log1p` ports — **`log10` done end-to-end; `log1p` scalar-only**
 
@@ -184,23 +195,23 @@ and landing a solid, brute-force-verified scalar port this round rather than
 rushing a vector kernel on top of it is the same trade A4 made for
 `asin`/`acos`.
 
-### A4. Inverse trig ports (`asin`, `acos`, `atan`, `atan2`) — effort L each — **`atan`/`atan2` done end-to-end; `asin`/`acos` scalar-only, one known gap**
+### A4. Inverse trig ports (`asin`, `acos`, `atan`, `atan2`) — effort L each — **done end-to-end**
 
 Same IBM-routine family as A1 (tables `asncs.x`/`cij`, from `asincos.tbl`
-and `uatan.tbl`). `atan` and `atan2` are fully done: scalar reference
+and `uatan.tbl`). All four are fully done: scalar reference
 (`src/reference/double/invtrig.rs`) and vector kernel
-(`src/kernels/double/invtrig.rs`'s `bit_exact` submodule) both ported,
-disassembly-verified, and measuring 1.28x / 2.74-3.03x — see §6a's A4 entry
-for the full account, including three real bugs found and fixed along the
-way (a missing fusion in `acos`'s small-`x` band, a NaN-vs-domain-error
-conflation only `tests/delegating.rs` caught, and a two-fusion gap in
-`atan`'s own `D <= u < E` band only a much denser corpus caught) and one
-found and *not* fixed (`acos`'s near-1 band has an 8-in-3M-dense-samples
-1-ulp gap, root cause identified — a Dekker split via `fma(c, 2^27, c)`
-the C source's literal `y=(c+t24)-t24` does not show — but not landed,
-since a first attempt made a different region worse). `asin`/`acos` still
-need their own `bit_exact` submodule, the same shape `atan`/`atan2` just
-got; land the `acos` fix first, independent of that vector work.
+(`src/kernels/double/invtrig.rs`'s `bit_exact` submodule) both ported and
+disassembly-verified, measuring 1.28x / 2.74-3.03x / 0.83-0.85x — see §6a's
+A4 entry for the full account, including four real bugs found and fixed along
+the way (a missing fusion in `acos`'s small-`x` band, a NaN-vs-domain-error
+conflation only `tests/delegating.rs` caught, a two-fusion gap in `atan`'s
+own `D <= u < E` band only a much denser corpus caught, and `acos`'s near-1
+band's Dekker split — `fma(c, 2^27, c)`, which the C source's literal
+`y=(c+t24)-t24` does not show — read out of the disassembly and fixed as
+`t27`). `asin`/`acos`'s vector kernel is the one in the group whose `BitExact`
+path does not beat parity (0.83-0.85x, just under it): their 13-slot
+per-lane table gather dominates, which is precisely the cost A5's
+hardware-gather backend targets.
 
 ### A5. Hardware-gather backend experiment — **prototyped on `exp`, accepted; wider rollout paused**
 
@@ -238,6 +249,14 @@ go/no-go question (below) with real numbers; each further kernel needs its
 own restructuring (`pow` gathers twice, from two different tables) and its
 own A/B verification, which is real, uncompressible work per kernel rather
 than a mechanical copy. Left as the next concrete step.
+
+**A second data point since: `asin`/`acos`.** §6a's A4 account of those
+kernels measures the per-lane gather's cost directly — removing the 13-slot
+table gather from the blend jumps the `BitExact` row from 0.83x to ~5.9x —
+the same cost `exp`'s A/B measured, at a scale the earlier prototype's
+22-23% gain would more than absorb (the asin/acos rows are the first in the
+crate to sit *under* parity because of it). Their A/B numbers are the
+strongest argument yet for resuming the rollout.
 
 ## 4. Workstream B — `Fast`-path speed (mostly `f32`)
 
@@ -615,8 +634,9 @@ widening whenever the f64 kernel does more than the f32 result needs.
   than blending into one number) measure 8.4x on the recurrence-only corpus
   and 4.6x on the Stirling-only one.
 
-- **A1: `sin`/`cos`/`sincos` ported; `tan` deferred.** The crate's
-  stated-biggest remaining claim. Full pipeline, in order:
+- **A1: `sin`/`cos`/`sincos`/`tan` ported — the trigonometric family
+  complete.** The crate's stated-biggest remaining claim. Full pipeline, in
+  order:
   - **Table/constant generation.** `tools/gen_tables.py` extended to fetch
     `usncs.h`, `branred.h`, `sincostab.c` and `s_sin.c` from glibc's own
     source tree (not ARM-optimized-routines, the source for every other
@@ -679,13 +699,37 @@ widening whenever the f64 kernel does more than the f32 result needs.
     `BitExact` **2.97x/2.63x** (`+Finite`), `cos` **3.01x/2.58x**, `sincos`
     **3.59x/3.72x** — `sincos` beats `sin`/`cos` taken separately because it
     shares one reduction across both outputs, same asymmetry the platform
-    routine itself exploits. All three land inside the plan's 2-4x estimate;
-    `tan` is unaffected (still ~0.98x, deliberately deferred — see below).
-  - **`tan` deferred, not attempted.** Its own table (`xfg`) has a shape
-    (`xfg[186][4]`) that does not match how `s_tan.c` indexes it
-    (`xfg[i][0..2]`) on a first read — a wrinkle that needs its own
-    schedule-reading pass, the same discipline `sin`/`cos` needed, before any
-    Rust is written. Left as a follow-on session rather than guessed at.
+    routine itself exploits. All three land inside the plan's 2-4x estimate
+    (`tan` was still ~0.98x at that point, deferred — next bullet).
+  - **`tan` done on the same pipeline.** The deferral's wrinkle resolved
+    first: `xfg`'s declared `[186][4]` shape vs. the `xfg[i][0..2]` indexing
+    is not a discrepancy in the algorithm — `[3]` (`FFi`) is only filled for
+    the cotangent half-rows `__tan_fma` never reads, so the generator emits
+    `XFG: [u64; 558]` (`186 x 3`) and no phantom fourth column is carried.
+    `tools/gen_tables.py`'s trig emitter gained the tan section (fetches
+    `utan.h`/`utan.tbl`, asserts `MP1`/`MP2`/`PP3`/`PP4`/`HPINV`/`TOINT`
+    bit-identical to `usncs.h`'s copies). The scalar reference port
+    (`src/reference/double/trig.rs::tan`, bands I-VI, six constants `g1`-`g5`
+    plus `gy2`, the `DIV2` cotangent with its `+0.0` term kept, `n`-parity
+    via the truncation bit) was brute-force-verified against the platform
+    over ~58M inputs — 20M random bit patterns, 36M banded log-uniform, all
+    five band boundaries ±8 ulps, every table-index edge `(k+15.5)/256`
+    ±4 ulps, 5M dense in `(0.0608, 25)`, 2M subnormals — **0 mismatches**
+    (the harness lives at `/tmp/opencode/tancheck`, outside the repo). The
+    vector kernel (`bit_exact::tan`) computes all six bands unconditionally
+    and blends, with the parity flag carried as a float and the reduction's
+    residue (`cvttsd2si` truncation) as per-lane integer casts; `|x| > 1e8`
+    stays a `patch_lanes` repair to `reference::tan`. Verified bit-exact at
+    every width (scalar, `f64x2`, `f64x4`, `f64x8`) against 8M further
+    inputs; tests moved from `tests/delegating.rs` to `tests/bit_exact.rs`
+    (`corpus_tan`: the `g1`/`g2`/`g3`/`25`/`1e8` thresholds ±2 neighbours,
+    all 186 table-index edges, quadrant parity flips at multiples of `pi/2`
+    through `134201344*pi/2`, dense across both reductions' domains so the
+    reduced-argument `gy2` split is hit, subnormals, random bit patterns).
+    Measured: `tan` `BitExact` **2.77x** (`+Finite` 2.70x), `Fast` 19.63x —
+    inside the plan's 2-4x estimate for `BitExact`, a little under
+    `sin`/`cos` because the schedule also runs the cotangent's `DIV2` path
+    and the second reduction for `|x| > 25`.
   - **Upstream-drift hazard found and worked around, not absorbed.**
     Re-running `tools/gen_tables.py` at the end of this phase (to confirm
     byte-identical regeneration, the standing gate) also re-fetched
@@ -705,8 +749,9 @@ widening whenever the f64 kernel does more than the f32 result needs.
     the fact — left as a follow-on rather than fixed under this phase's
     scope.
 
-- **A4: `asin`/`acos`/`atan`/`atan2` — scalar reference ported and verified;
-  vector kernel deferred.** Same schedule-reading discipline as A1: broke on
+- **A4: `asin`/`acos`/`atan`/`atan2` — scalar reference ported and verified,
+  then all four vectorised (see below for the full account).** Same
+  schedule-reading discipline as A1: broke on
   the exported `asin`/`acos`/`atan`/`atan2` symbols, stepped through their
   ifunc-resolved trampolines with `stepi`, and disassembled the real
   entry points (`__ieee754_asin_fma`, `__ieee754_acos_fma`, `__atan_fma`,
@@ -787,11 +832,13 @@ widening whenever the f64 kernel does more than the f32 result needs.
   - **Wired in:** `reference::double`'s `delegate!` macro invocations for
     `asin`/`acos`/`atan`/`atan2` removed; `reference::double::invtrig`'s
     ports re-exported in their place. `crate::kernels::double::invtrig`'s
-    `BitExact` path is unchanged in shape (still `dispatch`'s `map_lanes`,
-    one lane at a time) but now calls a genuine port instead of the
-    platform, closing the gap between this crate's stated goal ("bit-exact
+    `BitExact` path at that point still used `dispatch`'s `map_lanes` (one
+    lane at a time) but called a genuine port instead of the platform,
+    closing the gap between this crate's stated goal ("bit-exact
     without calling the libm you're replacing") and what these four
-    functions actually did, independent of the vector work below.
+    functions actually did, independent of the vector work below; the
+    `asin`/`acos` `BitExact` path has since been replaced by its own vector
+    kernel too (see below).
   - **Vector kernel: `atan`/`atan2` done and verified; `asin`/`acos` deferred
     for a real reason found along the way, not a schedule squeeze.** A second
     pass added `src/kernels/double/invtrig.rs`'s `bit_exact` submodule,
@@ -839,28 +886,26 @@ widening whenever the f64 kernel does more than the f32 result needs.
       (-s).mul_add(w, hpi1_cor)` against the live trace, then verified with a
       30M-sample sweep concentrated on every band boundary (0 mismatches,
       scalar reference and vector kernel both) before being accepted.
-    - **A second, pre-existing bug found and *not* fixed, on purpose.**
-      Extending the same dense-sweep discipline to `acos` (not part of this
-      pass's scope, but the methodology was already built) found 8
-      mismatches, all 1 ulp, all in the near-1 band's `x > 0` arm, all within
-      `1e-7` of `x = 1` — invisible to every check that had passed before
-      this (the original 20M-sample verification, `tests/delegating.rs`'s
-      270K-sample corpus, and this session's own earlier acceptance of
-      `acos`). A first fix attempt (fusing `cor`'s final combine the same
-      way `atan`'s bug above was fixed) *reduced* the far-tail mismatches but
-      *introduced* 537 new ones across `[0.97, 0.99]` — live disassembly of
-      that band's `y=(c+t24)-t24` step showed the compiled code does not
-      use the add/subtract truncation the C source spells at all, but a
-      Dekker split via `fma(c, 2^27, c)` (`dla.h`'s `CN = 2^27+1` constant,
-      computed as one FMA rather than one multiply), a genuinely different
-      shape this session did not have time to finish reverse-engineering
-      correctly. Rather than land an unverified guess — the exact failure
-      mode this crate's whole design exists to prevent — the attempted fix
-      was reverted; `acos`'s near-1 positive-`x` band is back to exactly its
-      previously-verified state, with this 8-in-3M-dense-samples gap now
-      documented rather than silently present. Whoever picks this up next:
-      the `CN`/Dekker-split shape and the two register addresses identified
-      above (`0x33490` = `2^27`) are a real head start.
+    - **The near-1 bug this entry previously documented as "found and *not*
+      fixed" is now fixed and verified.** Root cause confirmed exactly as the
+      earlier reading said: `e_asin.c`'s acos near-1 band uses `y = (t27*c+c)
+      - t27*c` in **both** arms (a Dekker split via one fused `fma(c, 2^27, c)`,
+      `dla.h`'s `CN`), while the port had wrongly transcribed asin's `t24`
+      shape `(c + t24) - t24` into acos's positive-`x` arm. The fix is one
+      line in `src/reference/double/invtrig.rs` (`y = T27.mul_add(c, c) -
+      T27 * c`); `cor = cc + p*(y+cc)` stays unfused, which a first failed
+      attempt (537 new mismatches across `[0.97, 0.99]` from fusing it) had
+      already shown is required. The decisive check, and the reason the
+      earlier "8-in-3M" number is now stronger rather than weaker: a
+      three-way split at the last `2^22` ulps below 1 shows the buggy `t24`
+      form vs the `t27` fix differ at 283 points, buggy vs platform 283,
+      fixed vs platform 0 — the fix is *the* difference, and the corrected
+      verification sweep (the first harness used `1u64 << 52` as 1.0's bit
+      pattern, which is not it — 1.0 is `0x3ff0_0000_0000_0000` — so its
+      "0 mismatches" had swept the wrong range; with the constant fixed, the
+      buggy form shows 799 mismatches in the 1e-7-of-1 window and the fixed
+      form 0 across ~46M points) confirms both directions. A hostile `t27`
+      variant of the same check passed on the first run, unchanged.
     - **Measured** (`examples/bench.rs`, this machine, `RUSTFLAGS="-C
       target-cpu=native"`, two runs): `atan` `BitExact` **1.28x** (`+Finite`
       1.16-1.18x — smaller than plain `FullRange` here, unusual but
@@ -871,14 +916,50 @@ widening whenever the f64 kernel does more than the f32 result needs.
       section originally made. `atan`'s own gain is smaller than that
       estimate but still a genuine, verified improvement over the previous
       ~1.0x.
-    - **Still deferred: `asin`/`acos`'s vector kernel.** Not started this
-      pass — their eight bands share one 2568-entry table and, per the
-      finding just above, at least one band's true schedule is not what the
-      C source's literal expression grouping suggests, the same "read the
-      disassembly, don't guess" lesson A1 already learned once. Land the
-      `acos` near-1 fix first (a scalar bug, independent of any vector work),
-      re-verify with the same dense-sweep discipline, *then* vectorise
-      `asin`/`acos` together the way `sin`/`cos`/`sincos` were.
+    - **`asin`/`acos` vector kernel done, after the near-1 fix above
+      landed first** — the order this entry prescribed. Their `bit_exact`
+      submodule (same module, `src/kernels/double/invtrig.rs`) reuses
+      `high32`, the near-1 machinery, and the blend discipline, but the six
+      index formulas and five degrees of `asncs_band_index` are resolved per
+      lane into a single `(n, degree)` pair, so the whole table band is one
+      13-slot per-lane gather (`asncs_row`) feeding one unrolled polynomial
+      (`asncs_poly`): the 11 coefficient slots beyond a lane's own degree
+      are zeroed at gather time and fold as no-ops, so one Horner pipeline
+      serves all five degrees — the mask-blend counterpart of the six
+      gather-and-select arms the first draft carried, which measured 0.49x
+      before this rewrite. The near-1 band keeps `asin`'s `t24` and `acos`'s
+      `t27` splits, `|x| == 1` is a select (`+-pi/2` / `0` / `2*pi/2`), and
+      the repair mask is NaN only — `|x| > 1` is the canonical NaN the
+      reference's wrapper returns, reproduced in-vector, with `asin`'s
+      `.copysign(x)` applied before the out-of-domain overwrite so
+      `asin(-inf)` stays the positive canonical NaN. Wired in the
+      `ln.rs`/`logx.rs` way (`if A::BIT_EXACT { bit_exact(x) } else {
+      fast(x) }`).
+      - **Moved `tests/delegating.rs` → `tests/bit_exact.rs`** for these two
+        as well: `asin_is_bit_exact`/`acos_is_bit_exact` removed;
+        `corpus_asincos(seed)` added (the six band boundaries and 0.96875
+        threshold each ±2 ulp, 800K uniform `[-1,1]`, 400K dense
+        `[0.96875, 1)`, 200K across the last 2^28 ulps below 1 on both
+        signs, 200K log-uniform tiny, 300K random bit patterns), checked at
+        every width via `reference_*_matches_platform_libm` (the corpus is
+        also the reference's own verification now) and
+        `*_bit_exact_at_every_width`, plus both functions added to the
+        special-lane leak test.
+      - **Measured** (same protocol as `atan` above): `asin` `BitExact`
+        **0.83-0.84x** (`+Finite` 0.87x), `acos` **0.84-0.85x** (`+Finite`
+        0.86x), `Fast` 8.36-8.51x / 10.17-10.27x `+Finite`. The exact rows
+        are the one place in this crate's vector table where the `BitExact`
+        path lands *just under* the ~1.0x delegating parity it replaces —
+        honestly reported rather than dressed up. The cause is measurable,
+        not speculative: an experiment removing the table band from the
+        blend jumps the exact row to 5.9x, so the 13-slot per-lane gather is
+        ~90% of the exact path's cost, and the platform's scalar routine
+        never pays for more than one band per input. That is exactly the
+        cost A5's hardware-gather backend (`Simd::gather_bits`, prototyped
+        on `exp`) removes; this pass deliberately stayed with the per-lane
+        idiom every other table kernel uses, and A5's entry is where the
+        asin/acos numbers now stand as the second data point in favour of
+        rolling it out. `Fast` is unaffected and still the win.
 
 - **A2/A3: `log10` ported and vectorised; `log1p`/`hypot` ported at the
   scalar level.** Both A2 and A3's prior "genuinely hard, comparable to
@@ -994,7 +1075,7 @@ the full verification protocol (§8).
 | **1** | C1, then re-tighten `pow`; C4; C5 if touched | M | `Fast` exponentials ~1 ulp, `pow` ≤4 asserted, inverse trig ≤4 — **done** |
 | **2** | B1, B3 (B2 withdrawn — considered decision) | M–L | native f32 `Fast`: `tanhf` 4.97x, `sin`/`cos`f 17-18x, `tan`f 7.4x — **done** |
 | **3** | A3, A2, D3 | **L, not M–L; corrected again, see below** | `log10` bit-exact *and* faster (2.61x, reusing `ln`'s table) — **done, see §6a**; `log1p`/`hypot` scalar ported and verified, vector kernel not yet built — **done, see §6a** |
-| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | `sin`/`cos`/`sincos` bit-exact *and* faster (3.0–3.7x) — **done, see §6a**; A4's `atan`/`atan2` bit-exact *and* faster (1.28x/2.74-3.03x) — **done, see §6a**; `tan` and A4's `asin`/`acos` vector kernel remain (plus one known `acos` scalar gap) |
+| **4** | A1 (`sincos` → `sin`/`cos` → `tan`), then A4 | XL | the whole trigonometric family bit-exact *and* faster — **done, see §6a**: `sin`/`cos`/`sincos` 3.0–3.7x, `tan` 2.77x, A4's `atan`/`atan2` 1.28x/2.74-3.03x; only A4's `asin`/`acos` vector kernel remains (plus one known `acos` scalar gap) |
 | **5** | A5 gather experiment; ~~C2, C3~~ done | M | either a fleet-wide `BitExact` uplift or a documented negative result; `tgamma` 2037→512 ulp — **C2/C3 done** |
 
 Effort legend: S ≈ under half a session, M ≈ a session, L ≈ several, XL ≈ a

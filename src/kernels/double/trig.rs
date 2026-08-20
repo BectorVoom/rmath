@@ -2,13 +2,14 @@
 //!
 //! # `BitExact`
 //!
-//! A genuine vector replay of glibc's `__sin_fma`/`__cos_fma`/`__sincos`
-//! (the IBM Accurate Mathematical Library), for `|x| < 105414350` — see
-//! this module's `bit_exact` submodule for the schedule, which was read out of a
-//! disassembly (`objdump -d`, glibc 2.43, x86-64), not inferred from the C
-//! source: several steps fuse (or specifically do *not* fuse) in a way the
-//! source's own expression grouping does not predict, verified against the
-//! platform over tens of millions of inputs before this was vectorised (see
+//! A genuine vector replay of glibc's `__sin_fma`/`__cos_fma`/`__sincos`/
+//! `__tan_fma` (the IBM Accurate Mathematical Library), for `|x| <
+//! 105414350` (`tan`: `|x| <= 1e8`) — see this module's `bit_exact`
+//! submodule for the schedule, which was read out of a disassembly
+//! (`objdump -d`, glibc 2.43, x86-64), not inferred from the C source:
+//! several steps fuse (or specifically do *not* fuse) in a way the source's
+//! own expression grouping does not predict, verified against the platform
+//! over tens of millions of inputs before this was vectorised (see
 //! [`crate::reference::double::trig`]). Past that magnitude — glibc's own
 //! `__branred` Payne-Hanek reduction, not ported — `FullRange` repairs the
 //! lanes via `patch_lanes`; `Finite` returns a wrong number for them, the
@@ -260,12 +261,210 @@ mod bit_exact {
     /// boundary test — see `crate::reference::double::trig`'s `k` comparisons.
     const TABLE_LIMIT: f64 = f64::from_bits(0x419921fb00000000);
 
+    /// Lanes past `__tan`'s second reduction's domain: `|x| >= 1e8`. glibc's
+    /// own test is `w > g5`, so the `|x| == 1e8` lane is patched too — a
+    /// no-op in value, since there the reference and this kernel run the same
+    /// schedule — and `outside`'s NaN-catching negation makes the patch the
+    /// specials handler as well, exactly as it is for `sin`/`cos`.
+    #[inline(always)]
+    pub(super) fn tan_needs_branred<V: Simd<Elem = f64>>(x: V) -> V::Mask {
+        outside(x, t::G5)
+    }
+
+    /// The fused table index `(256*w - 15.5) as i32`, per lane, truncated
+    /// exactly as `cvttsd2si` does, and clamped `% 186` defensively — a lane
+    /// whose answer is blended away or patched can still carry an adversarial
+    /// `x` here, and the gather must not index out of bounds even though its
+    /// result is thrown away (the same defence as `sincos_table_lookup`'s
+    /// `% 110`).
+    #[inline(always)]
+    fn xfg_index<V: Simd<Elem = f64>>(w: V) -> V::Bits {
+        let f = w.mul_add(V::splat(256.0), V::splat(t::MFFTNHF));
+        let bits = f.to_bits();
+        let mut idx = V::Bits::filled_default();
+        for i in 0..V::LANES {
+            let j = f64::from_bits(bits.as_slice()[i]) as i32;
+            idx.as_mut_slice()[i] = (j as usize % 186) as u64;
+        }
+        idx
+    }
+
+    /// `xfg[i][0..3] = [xi, Fi, Gi]`, gathered per lane.
+    #[inline(always)]
+    fn xfg_lookup<V: Simd<Elem = f64>>(idx: V::Bits) -> (V, V, V) {
+        let mut xi = V::Bits::filled_default();
+        let mut fi = V::Bits::filled_default();
+        let mut gi = V::Bits::filled_default();
+        for i in 0..V::LANES {
+            let j = (idx.as_slice()[i] as usize) * 3;
+            xi.as_mut_slice()[i] = t::XFG[j];
+            fi.as_mut_slice()[i] = t::XFG[j + 1];
+            gi.as_mut_slice()[i] = t::XFG[j + 2];
+        }
+        (
+            V::from_bits(xi),
+            V::from_bits(fi),
+            V::from_bits(gi),
+        )
+    }
+
+    /// `__tan`'s (IV)/(V) common tail, vectorised: `tan` (or `-cot`) of the
+    /// reduced argument `a + da`, with quadrant parity `n` as a `0.0`/`1.0`
+    /// flag. Every step runs on every lane and is blended by the parity and
+    /// `gy2` masks, exactly as the scalar reference's branch flow does —
+    /// including the odd polynomial's use of the *signed* `a`/`da` and
+    /// `sy`'s `+-1.0` only in the table bands.
+    #[inline(always)]
+    fn tan_sub<V: Simd<Elem = f64>>(n: V, a: V, da: V) -> V {
+        let neg = a.lt_mask(V::splat(0.0));
+        let ya = V::select(neg, -a, a);
+        let yya = V::select(neg, -da, da);
+        let sy = V::select(neg, V::splat(-1.0), V::splat(1.0));
+        let is_odd = n.eq_mask(V::splat(1.0));
+
+        let a2 = a * a;
+        let t2 = a2.mul_add(V::splat(t::D11), V::splat(t::D9));
+        let t2 = a2.mul_add(t2, V::splat(t::D7));
+        let t2 = a2.mul_add(t2, V::splat(t::D5));
+        let t2 = a2.mul_add(t2, V::splat(t::D3));
+        let t2 = (a * a2).mul_add(t2, da);
+        let y = a + t2;
+        let b = y;
+        // EADD(a, t2, b, db): the strict `>` selects the first branch, the
+        // equal/unordered case the second — the same mapping as the
+        // disassembly's `jbe`.
+        let db = V::select(
+            a.abs().gt_mask(t2.abs()),
+            (a - b) + t2,
+            (t2 - b) + a,
+        );
+        // DIV2(1.0, 0.0, b, db, ...) — `-cot`. The `+ 0.0` is the `xx` term.
+        let c = V::splat(1.0) / b;
+        let u = c * b;
+        let uu = c.mul_add(b, -u);
+        let t3 = (V::splat(1.0) - u - uu) + V::splat(0.0);
+        let cc = (-db).mul_add(c, t3) / b;
+        let z = c + cc;
+        let zz = (c - z) + cc;
+        let cot_val = -(z + zz);
+
+        let (xi, fi, gi) = xfg_lookup(xfg_index(ya));
+        let z = (ya - xi) + yya;
+        let z2 = z * z;
+        let pz = (z * z2).mul_add(z2.mul_add(V::splat(t::E1), V::splat(t::E0)), z);
+        let cot_tab = {
+            let t2 = pz * (fi + gi) / (fi + pz);
+            -sy * (gi - t2)
+        };
+        let tan_tab = {
+            let t2 = pz * (gi + fi) / (gi - pz);
+            sy * (fi + t2)
+        };
+        let table_val = V::select(is_odd, cot_tab, tan_tab);
+
+        let poly_val = V::select(is_odd, cot_val, y);
+        V::select(ya.le_mask(V::splat(t::GY2)), poly_val, table_val)
+    }
+
+    /// The (IV) reduction — algorithm i, the three-part `mp` split.
+    #[inline(always)]
+    fn reduce_mp<V: Simd<Elem = f64>>(x: V) -> (V, V, V) {
+        let t = x.mul_add(V::splat(t::HPINV), V::splat(t::TOINT));
+        let xn = t - V::splat(t::TOINT);
+        let t1 = xn.mul_add(-V::splat(t::MP1), x);
+        let t1 = xn.mul_add(-V::splat(t::MP2), t1);
+        let a = xn.mul_add(-V::splat(t::MP3), t1);
+        let da = xn.mul_add(-V::splat(t::MP3), t1 - a);
+        (t, a, da)
+    }
+
+    /// The (V) reduction — algorithm ii, the four-part `pp` split.
+    #[inline(always)]
+    fn reduce_pp<V: Simd<Elem = f64>>(x: V) -> (V, V, V) {
+        let t = x.mul_add(V::splat(t::HPINV), V::splat(t::TOINT));
+        let xn = t - V::splat(t::TOINT);
+        let t1 = xn.mul_add(-V::splat(t::MP1), x);
+        let t1 = xn.mul_add(-V::splat(t::MP2), t1);
+        let a = xn.mul_add(-V::splat(t::PP3), t1);
+        let da = xn.mul_add(-V::splat(t::PP3), t1 - a);
+        let b = xn.mul_add(-V::splat(t::PP4), a);
+        let db = xn.mul_add(-V::splat(t::PP4), a - b);
+        let da = db + da;
+        let sum = b + da;
+        let cc = V::select(
+            b.abs().gt_mask(da.abs()),
+            (b - sum) + da,
+            (da - sum) + b,
+        );
+        (t, sum, cc)
+    }
+
+    /// `n = t.i[LOW_HALF] & 1` as a `0.0`/`1.0` float flag.
+    #[inline(always)]
+    fn tan_parity<V: Simd<Elem = f64>>(t: V) -> V {
+        let bits = t.to_bits();
+        let mut flag = V::Floats::filled_default();
+        for i in 0..V::LANES {
+            flag.as_mut_slice()[i] = (bits.as_slice()[i] & 1) as f64;
+        }
+        V::from_array(flag)
+    }
+
+    /// `tan(x)` for `|x| <= 1e8`; callers repair the rest.
+    #[inline(always)]
+    pub(super) fn tan<V: Simd<Elem = f64>>(x: V) -> V {
+        let w = x.abs();
+        let band1 = w.le_mask(V::splat(t::G1));
+        let band2 = w.le_mask(V::splat(t::G2));
+        let band3 = w.le_mask(V::splat(t::G3));
+        let band4 = w.le_mask(V::splat(t::G4));
+
+        // (II): polynomial I, the direct Taylor series in `x`.
+        let poly_val = {
+            let x2 = x * x;
+            let t2 = x2.mul_add(V::splat(t::D11), V::splat(t::D9));
+            let t2 = x2.mul_add(t2, V::splat(t::D7));
+            let t2 = x2.mul_add(t2, V::splat(t::D5));
+            let t2 = x2.mul_add(t2, V::splat(t::D3));
+            (x * x2).mul_add(t2, x)
+        };
+
+        // (III): the `w`-indexed table.
+        let table_w = {
+            let (xi, fi, gi) = xfg_lookup(xfg_index(w));
+            let z = w - xi;
+            let z2 = z * z;
+            let sy = V::select(x.lt_mask(V::splat(0.0)), V::splat(-1.0), V::splat(1.0));
+            let pz = (z * z2).mul_add(z2.mul_add(V::splat(t::E1), V::splat(t::E0)), z);
+            let t2 = pz * (gi + fi) / (gi - pz);
+            sy * (fi + t2)
+        };
+
+        // (IV)/(V): the two reductions, then the shared tail. For a lane in
+        // the wrong band either value is garbage — the blend discards it.
+        let (t4, a4, da4) = reduce_mp(x);
+        let reduced_val = tan_sub(tan_parity(t4), a4, da4);
+        let (t5, a5, da5) = reduce_pp(x);
+        let reduced_pp_val = tan_sub(tan_parity(t5), a5, da5);
+
+        let r = V::select(band4, reduced_val, reduced_pp_val);
+        let r = V::select(band3, table_w, r);
+        let r = V::select(band2, poly_val, r);
+        V::select(band1, x, r)
+    }
+
     /// `sin(x)` for `|x| < 105414350`; callers repair the rest.
     #[inline(always)]
     pub(super) fn sin<V: Simd<Elem = f64>>(x: V) -> V {
-        let tiny = x.abs().lt_mask(V::splat(f64::from_bits(0x3e500000_00000000)));
-        let poly = x.abs().lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
-        let mid = x.abs().lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
+        let tiny = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3e500000_00000000)));
+        let poly = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+        let mid = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
 
         let poly_val = do_sin(x, V::splat(0.0));
 
@@ -288,9 +487,15 @@ mod bit_exact {
     /// `cos(x)` for `|x| < 105414350`; callers repair the rest.
     #[inline(always)]
     pub(super) fn cos<V: Simd<Elem = f64>>(x: V) -> V {
-        let tiny = x.abs().lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
-        let poly = x.abs().lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
-        let mid = x.abs().lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
+        let tiny = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
+        let poly = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+        let mid = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
 
         let poly_val = do_cos(x, V::splat(0.0));
 
@@ -303,7 +508,11 @@ mod bit_exact {
         let table_val = {
             // `n + 1`: bit0 flips, bit1 flips only when bit0 was already set
             // (the carry out of `+1` on a 2-bit field) — i.e. `n_bit1 ^= n_bit0`.
-            let new_bit1 = V::select(n_bit0.eq_mask(V::splat(1.0)), V::splat(1.0) - n_bit1, n_bit1);
+            let new_bit1 = V::select(
+                n_bit0.eq_mask(V::splat(1.0)),
+                V::splat(1.0) - n_bit1,
+                n_bit1,
+            );
             let new_bit0 = V::splat(1.0) - n_bit0;
             let is_odd = new_bit0.eq_mask(V::splat(1.0));
             let flip = new_bit1.eq_mask(V::splat(1.0));
@@ -319,9 +528,15 @@ mod bit_exact {
     /// `(sin(x), cos(x))` for `|x| < 105414350`; callers repair the rest.
     #[inline(always)]
     pub(super) fn sincos<V: Simd<Elem = f64>>(x: V) -> (V, V) {
-        let tiny = x.abs().lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
-        let poly = x.abs().lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
-        let mid = x.abs().lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
+        let tiny = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
+        let poly = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+        let mid = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
 
         let poly_sin = do_sin(x, V::splat(0.0));
         let poly_cos = do_cos(x, V::splat(0.0));
@@ -334,9 +549,12 @@ mod bit_exact {
 
         let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
         // `if (n & 3) == 1 || (n & 3) == 2 { a = -a; da = -da; }`
-        let neg_ad = n_bit0.eq_mask(V::splat(1.0)).and(n_bit1.eq_mask(V::splat(0.0))).or(
-            n_bit0.eq_mask(V::splat(0.0)).and(n_bit1.eq_mask(V::splat(1.0))),
-        );
+        let neg_ad = n_bit0
+            .eq_mask(V::splat(1.0))
+            .and(n_bit1.eq_mask(V::splat(0.0)))
+            .or(n_bit0
+                .eq_mask(V::splat(0.0))
+                .and(n_bit1.eq_mask(V::splat(1.0))));
         let a = V::select(neg_ad, -a, a);
         let da = V::select(neg_ad, -da, da);
         let sinx = do_sin(a, da);
@@ -433,18 +651,32 @@ pub mod sincos {
 
 /// Tangent.
 ///
-/// Formed as a ratio of the same two kernels rather than from a tangent
-/// polynomial of its own. That costs a division, and it is still the better
-/// trade: a direct `tan` polynomial needs a much higher degree to hold its
-/// accuracy as `r` approaches `pi/4`, where `tan` is steep, and the ratio
-/// keeps the relative error bounded across the whole quadrant including near
-/// the pole, which is where a `tan` caller usually is.
+/// Two paths, one per policy:
+///
+/// - `BitExact` replays glibc's `__tan_fma` directly (its own six bands and
+///   the `xfg` table — see [`crate::reference::double::trig`]'s `tan`), for
+///   `|x| <= 1e8`; past that — glibc's `__branred` Payne-Hanek reduction, not
+///   ported — `FullRange` repairs the lanes via `patch_lanes`.
+/// - `Fast` forms `tan` as a ratio of the same two kernels as `sin`/`cos`,
+///   which costs a division and is still the better trade: a direct `tan`
+///   polynomial needs a much higher degree to hold its accuracy as `r`
+///   approaches `pi/4`, where `tan` is steep, and the ratio keeps the
+///   relative error bounded across the whole quadrant including near the
+///   pole, which is where a `tan` caller usually is.
 pub mod tan {
     use super::*;
 
     /// `tan(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
+        if A::BIT_EXACT {
+            let y = bit_exact::tan(x);
+            return if D::CHECKED {
+                crate::simd::patch_lanes(x, y, bit_exact::tan_needs_branred(x), reference::tan)
+            } else {
+                y
+            };
+        }
         dispatch::<V, A, D>(x, reference::tan, fast, too_large)
     }
 
