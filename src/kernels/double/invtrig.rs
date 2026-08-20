@@ -183,6 +183,29 @@ mod bit_exact {
     #[inline(always)]
     pub(super) fn atan<V: Simd<Elem = f64>>(x: V) -> V {
         let u = x.abs();
+
+        let is_taylor = u.lt_mask(V::splat(at::B));
+        if is_taylor.all() {
+            let taylor = atan_taylor(x, x * x);
+            return V::select(u.lt_mask(V::splat(at::A)), x, taylor);
+        }
+        let is_table = u.ge_mask(V::splat(at::B)).and(u.lt_mask(V::splat(at::C)));
+        if is_table.all() {
+            return atan_table(u).copysign(x);
+        }
+        let is_recip_table = u.ge_mask(V::splat(at::C)).and(u.lt_mask(V::splat(at::D)));
+        if is_recip_table.all() {
+            return atan_recip_table(u).copysign(x);
+        }
+        let is_recip_taylor = u.ge_mask(V::splat(at::D)).and(u.lt_mask(V::splat(at::E)));
+        if is_recip_taylor.all() {
+            return atan_recip_taylor(u).copysign(x);
+        }
+        let is_sat = u.ge_mask(V::splat(at::E));
+        if is_sat.all() {
+            return V::select(x.gt_mask(V::splat(0.0)), V::splat(at::HPI), V::splat(at::MHPI));
+        }
+
         let taylor = atan_taylor(x, x * x);
         let table = atan_table(u).copysign(x);
         let recip_table = atan_recip_table(u).copysign(x);
@@ -648,6 +671,25 @@ mod bit_exact {
         let u = x.abs();
         let k = high32(u);
 
+        let is_taylor = k.lt_mask(V::splat(K_TAYLOR));
+        if is_taylor.all() {
+            let taylor = asin_taylor(x);
+            let r = V::select(k.lt_mask(V::splat(K_TINY)), x, taylor);
+            return r.copysign(x);
+        }
+        let is_table = k.ge_mask(V::splat(K_TAYLOR)).and(k.lt_mask(V::splat(K_TABLE)));
+        if is_table.all() {
+            let table = asin_table(u, k);
+            return table.copysign(x);
+        }
+        let is_near1 = k.ge_mask(V::splat(K_TABLE)).and(u.le_mask(V::splat(1.0)));
+        if is_near1.all() {
+            let near1 = asin_near1(u);
+            let at_one = V::splat(ac::HP0).copysign(x);
+            let r = V::select(u.eq_mask(V::splat(1.0)), at_one, near1);
+            return r.copysign(x);
+        }
+
         let taylor = asin_taylor(x);
         let table = asin_table(u, k);
         let near1 = asin_near1(u);
@@ -679,6 +721,27 @@ mod bit_exact {
     pub(super) fn acos<V: Simd<Elem = f64>>(x: V) -> V {
         let u = x.abs();
         let k = high32(u);
+
+        let is_taylor = k.lt_mask(V::splat(K_TAYLOR));
+        if is_taylor.all() {
+            let tiny = V::splat(ac::HP0);
+            let taylor = acos_taylor(x);
+            return V::select(k.lt_mask(V::splat(K_ACOS_TINY)), tiny, taylor);
+        }
+        let is_table = k.ge_mask(V::splat(K_TAYLOR)).and(k.lt_mask(V::splat(K_TABLE)));
+        if is_table.all() {
+            return acos_table(x, u, k);
+        }
+        let is_near1 = k.ge_mask(V::splat(K_TABLE)).and(u.le_mask(V::splat(1.0)));
+        if is_near1.all() {
+            let near1 = acos_near1(x);
+            let at_one = V::select(
+                x.lt_mask(V::splat(0.0)),
+                V::splat(2.0 * ac::HP0),
+                V::splat(0.0),
+            );
+            return V::select(u.eq_mask(V::splat(1.0)), at_one, near1);
+        }
 
         let tiny = V::splat(ac::HP0);
         let taylor = acos_taylor(x);

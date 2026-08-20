@@ -44,45 +44,181 @@ pub type Widest = <f64 as Real>::Widest;
 /// The widest `f32` vector the enabled backend provides.
 pub type WidestF32 = <f32 as Real>::Widest;
 
-/// Apply a buffer of `src` through `f`, widest vectors first, scalar tail.
-///
-/// Shared by every `*_slice` helper below so the chunking logic exists once.
-/// The ragged tail goes through the same kernel at one lane, so it cannot
-/// drift from the body — there is no second implementation for it to drift
-/// from.
 #[inline(always)]
-fn strided<E: Real>(len: usize, mut body: impl FnMut(usize, usize)) {
+fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
+    assert_eq!(src.len(), dst.len(), "eval_slice: length mismatch");
     let lanes = <E::Widest as Simd>::LANES;
-    let mut i = 0;
-    while i + lanes <= len {
-        body(i, lanes);
-        i += lanes;
+    let rem = src.len() % lanes;
+    let end = src.len() - rem;
+    let (s_head, s_tail) = src.split_at(end);
+    let (d_head, d_tail) = dst.split_at_mut(end);
+
+    for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
+        let mut arr = <E::Widest as Simd>::Floats::filled_default();
+        arr.as_mut_slice().copy_from_slice(s_chunk);
+        let v = f.eval(<E::Widest as Simd>::from_array(arr));
+        d_chunk.copy_from_slice(v.to_array().as_slice());
     }
-    while i < len {
-        body(i, 1);
-        i += 1;
+    for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
+        *d = f.eval::<E>(*s);
     }
 }
 
-/// Gather `n` lanes starting at `off` into a vector, padding with `src[off]`.
-///
-/// `n` is either `V::LANES` or 1; the padding case only arises for the tail,
-/// where the padded lanes are discarded.
 #[inline(always)]
-fn gather<V: Simd>(src: &[V::Elem], off: usize, n: usize) -> V {
-    let mut chunk = V::Floats::filled_default();
-    let slot = chunk.as_mut_slice();
-    for (k, s) in slot.iter_mut().enumerate() {
-        *s = src[off + if k < n { k } else { 0 }];
+fn eval_unary_in_place<E: Real, F: Function<E>>(f: &F, buf: &mut [E]) {
+    let lanes = <E::Widest as Simd>::LANES;
+    let rem = buf.len() % lanes;
+    let end = buf.len() - rem;
+    let (head, tail) = buf.split_at_mut(end);
+
+    for chunk in head.chunks_exact_mut(lanes) {
+        let mut arr = <E::Widest as Simd>::Floats::filled_default();
+        arr.as_mut_slice().copy_from_slice(chunk);
+        let v = f.eval(<E::Widest as Simd>::from_array(arr));
+        chunk.copy_from_slice(v.to_array().as_slice());
     }
-    V::from_array(chunk)
+    for x in tail.iter_mut() {
+        *x = f.eval::<E>(*x);
+    }
 }
 
-/// Scatter the first `n` lanes of `v` to `dst[off..]`.
 #[inline(always)]
-fn scatter<V: Simd>(v: V, dst: &mut [V::Elem], off: usize, n: usize) {
-    let out = v.to_array();
-    dst[off..off + n].copy_from_slice(&out.as_slice()[..n]);
+fn eval_binary_slice<E: Real, F: Function2<E>>(f: &F, a: &[E], b: &[E], dst: &mut [E]) {
+    assert_eq!(a.len(), b.len(), "eval_slice: length mismatch");
+    assert_eq!(a.len(), dst.len(), "eval_slice: length mismatch");
+    let lanes = <E::Widest as Simd>::LANES;
+    let rem = a.len() % lanes;
+    let end = a.len() - rem;
+    let (a_head, a_tail) = a.split_at(end);
+    let (b_head, b_tail) = b.split_at(end);
+    let (d_head, d_tail) = dst.split_at_mut(end);
+
+    for ((a_chunk, b_chunk), d_chunk) in a_head
+        .chunks_exact(lanes)
+        .zip(b_head.chunks_exact(lanes))
+        .zip(d_head.chunks_exact_mut(lanes))
+    {
+        let mut arr_a = <E::Widest as Simd>::Floats::filled_default();
+        let mut arr_b = <E::Widest as Simd>::Floats::filled_default();
+        arr_a.as_mut_slice().copy_from_slice(a_chunk);
+        arr_b.as_mut_slice().copy_from_slice(b_chunk);
+        let v = f.eval(
+            <E::Widest as Simd>::from_array(arr_a),
+            <E::Widest as Simd>::from_array(arr_b),
+        );
+        d_chunk.copy_from_slice(v.to_array().as_slice());
+    }
+    for ((x, y), d) in a_tail.iter().zip(b_tail.iter()).zip(d_tail.iter_mut()) {
+        *d = f.eval::<E>(*x, *y);
+    }
+}
+
+#[inline(always)]
+fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(
+    f: &F,
+    src: &[E],
+    y: E,
+    dst: &mut [E],
+) {
+    assert_eq!(src.len(), dst.len(), "eval_slice_scalar: length mismatch");
+    let lanes = <E::Widest as Simd>::LANES;
+    let rem = src.len() % lanes;
+    let end = src.len() - rem;
+    let (s_head, s_tail) = src.split_at(end);
+    let (d_head, d_tail) = dst.split_at_mut(end);
+    let y_splat = <E::Widest as Simd>::splat(y);
+
+    for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
+        let mut arr = <E::Widest as Simd>::Floats::filled_default();
+        arr.as_mut_slice().copy_from_slice(s_chunk);
+        let v = f.eval(<E::Widest as Simd>::from_array(arr), y_splat);
+        d_chunk.copy_from_slice(v.to_array().as_slice());
+    }
+    for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
+        *d = f.eval::<E>(*s, y);
+    }
+}
+
+#[inline(always)]
+fn eval_pair_slice<E: Real, F: FunctionPair<E>>(
+    f: &F,
+    src: &[E],
+    first: &mut [E],
+    second: &mut [E],
+) {
+    assert_eq!(src.len(), first.len(), "eval_slice: length mismatch");
+    assert_eq!(src.len(), second.len(), "eval_slice: length mismatch");
+    let lanes = <E::Widest as Simd>::LANES;
+    let rem = src.len() % lanes;
+    let end = src.len() - rem;
+    let (s_head, s_tail) = src.split_at(end);
+    let (f_head, f_tail) = first.split_at_mut(end);
+    let (s2_head, s2_tail) = second.split_at_mut(end);
+
+    for ((s_chunk, f_chunk), s2_chunk) in s_head
+        .chunks_exact(lanes)
+        .zip(f_head.chunks_exact_mut(lanes))
+        .zip(s2_head.chunks_exact_mut(lanes))
+    {
+        let mut arr = <E::Widest as Simd>::Floats::filled_default();
+        arr.as_mut_slice().copy_from_slice(s_chunk);
+        let (v1, v2) = f.eval(<E::Widest as Simd>::from_array(arr));
+        f_chunk.copy_from_slice(v1.to_array().as_slice());
+        s2_chunk.copy_from_slice(v2.to_array().as_slice());
+    }
+    for ((s, f1), f2) in s_tail.iter().zip(f_tail.iter_mut()).zip(s2_tail.iter_mut()) {
+        let (a, b) = f.eval::<E>(*s);
+        *f1 = a;
+        *f2 = b;
+    }
+}
+
+#[inline(always)]
+fn eval_2pair_slice<E: Real, F: Function2Pair<E>>(
+    f: &F,
+    a: &[E],
+    b: &[E],
+    first: &mut [E],
+    second: &mut [E],
+) {
+    assert_eq!(a.len(), b.len(), "eval_slice: length mismatch");
+    assert_eq!(a.len(), first.len(), "eval_slice: length mismatch");
+    assert_eq!(a.len(), second.len(), "eval_slice: length mismatch");
+    let lanes = <E::Widest as Simd>::LANES;
+    let rem = a.len() % lanes;
+    let end = a.len() - rem;
+    let (a_head, a_tail) = a.split_at(end);
+    let (b_head, b_tail) = b.split_at(end);
+    let (f_head, f_tail) = first.split_at_mut(end);
+    let (s2_head, s2_tail) = second.split_at_mut(end);
+
+    for (((a_chunk, b_chunk), f_chunk), s2_chunk) in a_head
+        .chunks_exact(lanes)
+        .zip(b_head.chunks_exact(lanes))
+        .zip(f_head.chunks_exact_mut(lanes))
+        .zip(s2_head.chunks_exact_mut(lanes))
+    {
+        let mut arr_a = <E::Widest as Simd>::Floats::filled_default();
+        let mut arr_b = <E::Widest as Simd>::Floats::filled_default();
+        arr_a.as_mut_slice().copy_from_slice(a_chunk);
+        arr_b.as_mut_slice().copy_from_slice(b_chunk);
+        let (v1, v2) = f.eval(
+            <E::Widest as Simd>::from_array(arr_a),
+            <E::Widest as Simd>::from_array(arr_b),
+        );
+        f_chunk.copy_from_slice(v1.to_array().as_slice());
+        s2_chunk.copy_from_slice(v2.to_array().as_slice());
+    }
+    for (((x, y), f1), f2) in a_tail
+        .iter()
+        .zip(b_tail.iter())
+        .zip(f_tail.iter_mut())
+        .zip(s2_tail.iter_mut())
+    {
+        let (p, q) = f.eval::<E>(*x, *y);
+        *f1 = p;
+        *f2 = q;
+    }
 }
 
 /// What every one-argument function object implements.
@@ -101,27 +237,13 @@ pub trait Function<E: Real = f64>: Copy {
     /// If `src` and `dst` have different lengths.
     #[inline]
     fn eval_slice(&self, src: &[E], dst: &mut [E]) {
-        assert_eq!(src.len(), dst.len(), "eval_slice: length mismatch");
-        strided::<E>(src.len(), |i, n| {
-            if n == 1 {
-                dst[i] = self.eval::<E>(src[i]);
-            } else {
-                scatter(self.eval(gather::<E::Widest>(src, i, n)), dst, i, n);
-            }
-        });
+        eval_unary_slice(self, src, dst);
     }
 
     /// Apply in place.
     #[inline]
     fn eval_in_place(&self, buf: &mut [E]) {
-        strided::<E>(buf.len(), |i, n| {
-            if n == 1 {
-                buf[i] = self.eval::<E>(buf[i]);
-            } else {
-                let v = self.eval(gather::<E::Widest>(buf, i, n));
-                scatter(v, buf, i, n);
-            }
-        });
+        eval_unary_in_place(self, buf);
     }
 }
 
@@ -136,16 +258,7 @@ pub trait Function2<E: Real = f64>: Copy {
     /// If the three slices do not all have the same length.
     #[inline]
     fn eval_slice(&self, a: &[E], b: &[E], dst: &mut [E]) {
-        assert_eq!(a.len(), b.len(), "eval_slice: length mismatch");
-        assert_eq!(a.len(), dst.len(), "eval_slice: length mismatch");
-        strided::<E>(a.len(), |i, n| {
-            if n == 1 {
-                dst[i] = self.eval::<E>(a[i], b[i]);
-            } else {
-                let v = self.eval(gather::<E::Widest>(a, i, n), gather::<E::Widest>(b, i, n));
-                scatter(v, dst, i, n);
-            }
-        });
+        eval_binary_slice(self, a, b, dst);
     }
 
     /// Apply with a scalar second argument, `dst[i] = f(src[i], y)`.
@@ -156,18 +269,7 @@ pub trait Function2<E: Real = f64>: Copy {
     /// If `src` and `dst` have different lengths.
     #[inline]
     fn eval_slice_scalar(&self, src: &[E], y: E, dst: &mut [E]) {
-        assert_eq!(src.len(), dst.len(), "eval_slice_scalar: length mismatch");
-        strided::<E>(src.len(), |i, n| {
-            if n == 1 {
-                dst[i] = self.eval::<E>(src[i], y);
-            } else {
-                let v = self.eval(
-                    gather::<E::Widest>(src, i, n),
-                    <E::Widest as Simd>::splat(y),
-                );
-                scatter(v, dst, i, n);
-            }
-        });
+        eval_binary_slice_scalar(self, src, y, dst);
     }
 }
 
@@ -182,19 +284,7 @@ pub trait FunctionPair<E: Real = f64>: Copy {
     /// If the three slices do not all have the same length.
     #[inline]
     fn eval_slice(&self, src: &[E], first: &mut [E], second: &mut [E]) {
-        assert_eq!(src.len(), first.len(), "eval_slice: length mismatch");
-        assert_eq!(src.len(), second.len(), "eval_slice: length mismatch");
-        strided::<E>(src.len(), |i, n| {
-            if n == 1 {
-                let (a, b) = self.eval::<E>(src[i]);
-                first[i] = a;
-                second[i] = b;
-            } else {
-                let (a, b) = self.eval(gather::<E::Widest>(src, i, n));
-                scatter(a, first, i, n);
-                scatter(b, second, i, n);
-            }
-        });
+        eval_pair_slice(self, src, first, second);
     }
 }
 
@@ -214,20 +304,7 @@ pub trait Function2Pair<E: Real = f64>: Copy {
     /// If the four slices do not all have the same length.
     #[inline]
     fn eval_slice(&self, a: &[E], b: &[E], first: &mut [E], second: &mut [E]) {
-        assert_eq!(a.len(), b.len(), "eval_slice: length mismatch");
-        assert_eq!(a.len(), first.len(), "eval_slice: length mismatch");
-        assert_eq!(a.len(), second.len(), "eval_slice: length mismatch");
-        strided::<E>(a.len(), |i, n| {
-            if n == 1 {
-                let (p, q) = self.eval::<E>(a[i], b[i]);
-                first[i] = p;
-                second[i] = q;
-            } else {
-                let (p, q) = self.eval(gather::<E::Widest>(a, i, n), gather::<E::Widest>(b, i, n));
-                scatter(p, first, i, n);
-                scatter(q, second, i, n);
-            }
-        });
+        eval_2pair_slice(self, a, b, first, second);
     }
 }
 

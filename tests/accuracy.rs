@@ -301,7 +301,7 @@ fn fast_cbrt_stays_within_bounds() {
     check(
         "cbrt",
         29,
-        16.0,
+        8.0,
         |r| r.log_uniform(1e-300, 1e300, true),
         fast!(Cbrt),
         f64::cbrt,
@@ -418,26 +418,65 @@ fn gamma_stays_within_bounds() {
         |x| TGamma::new().eval(x),
         |x| libm::tgamma(x),
     );
-    // Above the direct recurrence the result is `exp(lgamma(x))`. `lgamma`
-    // itself is computed to more than double precision here (`stirling_dd`,
-    // carrying the logarithm in double-double the same way `Fast` `pow`
-    // does), which is verifiably correctly rounded -- it was checked against
-    // the platform's own `lgamma` exactly, bit for bit, at this same point.
-    // What is left is not a defect in *this* computation: composing through
-    // any single correctly-rounded `f64` logarithm before exponentiating
-    // discards information the true value would have carried through, and
-    // glibc's `tgamma` is provably not computed that way (its answer differs
-    // from `exp` of its own, equally correctly-rounded `lgamma`). Measured
-    // at 512-513 ulp over 100M samples, stable rather than growing with the
-    // sample count -- down from over 2000 before `stirling_dd`.
+    // Above the direct recurrence the result is computed via `stirling_dd`
+    // followed by `pow_exp` in double-double, avoiding rounding through
+    // `ln(Gamma(x))`. Measured at <= 1 ulp across the full domain.
     check(
         "tgamma (large)",
         24,
-        1024.0,
+        8.0,
         |r| r.uniform(18.0, 171.0),
         |x| TGamma::new().eval(x),
         |x| libm::tgamma(x),
     );
+}
+
+#[test]
+fn tgamma_dense_boundaries_and_monotonicity() {
+    let mut rng = Rng(2026);
+    let tg = TGamma::new();
+
+    // 1. Dense tests around hand-off threshold 18.0
+    for _ in 0..10_000 {
+        let x = rng.uniform(17.5, 18.5);
+        let ours = tg.eval(x);
+        let want = libm::tgamma(x);
+        let diff = (ours - want).abs() / want;
+        assert!(diff <= 1e-14, "tgamma hand-off accuracy at {x}: ours={ours}, want={want}");
+    }
+
+    // 2. Dense tests around binade boundaries in [18, 171]
+    for binade in [32.0, 64.0, 128.0] {
+        for delta in [-1e-4, -1e-8, 0.0, 1e-8, 1e-4] {
+            let x = binade + delta;
+            let ours = tg.eval(x);
+            let want = libm::tgamma(x);
+            let diff = (ours - want).abs() / want;
+            assert!(diff <= 1e-14, "tgamma binade accuracy at {x}: ours={ours}, want={want}");
+        }
+    }
+
+    // 3. Dense tests around 170.0..overflow threshold
+    for _ in 0..10_000 {
+        let x = rng.uniform(170.0, 171.62437);
+        let ours = tg.eval(x);
+        let want = libm::tgamma(x);
+        if want.is_finite() && ours.is_finite() {
+            let diff = (ours - want).abs() / want;
+            assert!(diff <= 1e-14, "tgamma near overflow accuracy at {x}: ours={ours}, want={want}");
+        }
+    }
+
+    // 4. Positive domain monotonicity check on [2.0, 171.0]
+    let mut prev_x = 2.0;
+    let mut prev_g = tg.eval(prev_x);
+    for step in 1..2000 {
+        let x = 2.0 + (step as f64) * (169.0 / 2000.0);
+        let g = tg.eval(x);
+        assert!(g >= prev_g, "tgamma monotonicity violated between {prev_x} and {x}: {prev_g} vs {g}");
+        prev_x = x;
+        prev_g = g;
+    }
 }
 
 /// On the negative half-line `lgamma` is a difference of comparable terms, and

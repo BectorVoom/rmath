@@ -620,16 +620,9 @@ delegate! { /// `log2(x)`, the platform's.
 log2 => log2 }
 
 /// `atanh(x)`, matching Rust's `f64::atanh`.
-///
-/// **Rust's, not the C library's**, and for this one function of the inverse
-/// hyperbolic family they differ. Rust does not forward `atanh` to `libm`; it
-/// evaluates `0.5 * ln_1p(2x / (1 - x))` itself, which disagrees with glibc's
-/// `atanh` on roughly one input in ten. Matching Rust is the right choice here
-/// for the same reason it is for [`cbrt`]: the call the caller was already
-/// making is `f64::atanh`.
 #[inline(always)]
 pub fn atanh(x: f64) -> f64 {
-    f64::atanh(x)
+    0.5 * log1p(2.0 * x / (1.0 - x))
 }
 
 // ---------------------------------------------------------------------------

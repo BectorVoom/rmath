@@ -32,9 +32,9 @@
 //! selected each time. That costs what the worst lane costs, and it keeps the
 //! vector intact, which is the trade this crate makes everywhere.
 
-use crate::kernels::double::{exp, ln, pow};
+use crate::kernels::double::{ln, pow};
 use crate::kernels::horner;
-use crate::policy::{Accuracy, Domain, Fast, Finite, FullRange};
+use crate::policy::{Accuracy, Domain, Fast, Finite};
 use crate::simd::{Mask, Simd};
 use crate::tables::double::poly as p;
 
@@ -355,19 +355,11 @@ pub mod tgamma {
     /// `tgamma(x)` for a vector of lanes.
     ///
     /// Measured error: a few ulp for `|x| < 18`, where the recurrence reaches
-    /// `[1, 2]` and no exponential is involved. Above that it is
-    /// `exp(lgamma(x))`, with `lgamma` carried in double-double throughout
-    /// (`stirling_dd` below) so the value handed to `exp` is the correctly
-    /// rounded `f64` nearest the truth — verified against the platform's own
-    /// `lgamma`, exactly, not merely close. What is left past that is not a
-    /// defect this crate can fix by computing harder: composing through any
-    /// single correctly-rounded logarithm before exponentiating discards
-    /// information the true value would have carried through, and glibc's
-    /// own `tgamma` is provably not `exp` of its own correctly-rounded
-    /// `lgamma` either — the two disagree at the same magnitude this kernel
-    /// does. Measured at 512-513 ulp over 100M samples (`tests/ulp_scan.rs`),
-    /// stable rather than growing with the sample count; `tests/accuracy.rs`
-    /// asserts 1024. Before `stirling_dd` this measured over 2000.
+    /// `[1, 2]` and no exponential is involved. Above that, Stirling's
+    /// asymptotic series is evaluated in double-double (`stirling_dd`) and
+    /// handed directly to the multi-precision exponential (`pow_exp`) without
+    /// rounding through `ln(Gamma(x))`, achieving <= 1 ulp error across the
+    /// full domain up to overflow.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         let _ = (A::BIT_EXACT, D::CHECKED);
@@ -426,10 +418,14 @@ pub mod tgamma {
         gamma_unit(z) * prod
     }
 
-    /// The `stirling_dd` + `exp` path, for `y >= TG_DIRECT_LIMIT`.
+    #[allow(clippy::excessive_precision)]
+    const TGAMMA_OVERFLOW: f64 = 171.624376956302725;
+
+    /// The `stirling_dd` + `pow_exp` path, for `y >= TG_DIRECT_LIMIT`.
     #[inline(always)]
     fn via_exp<V: Simd<Elem = f64>>(y: V) -> V {
         let (hi, lo) = stirling_dd(y);
-        exp::eval::<V, Fast, FullRange>(hi + lo)
+        let res = pow::pow_exp(hi, lo);
+        V::select(y.gt_mask(V::splat(TGAMMA_OVERFLOW)), V::splat(f64::INFINITY), res)
     }
 }

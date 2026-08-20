@@ -46,6 +46,17 @@ macro_rules! impl_wide {
                 let lanes: [$elem; $lanes] = self.0.into();
                 lanes.map(|v| v.to_bits() != 0)
             }
+            #[inline(always)]
+            fn to_bitmask(self) -> u32 {
+                let bools = self.to_bools();
+                let mut mask = 0u32;
+                for i in 0..$lanes {
+                    if bools[i] {
+                        mask |= 1 << i;
+                    }
+                }
+                mask
+            }
         }
 
         impl Simd for $vec {

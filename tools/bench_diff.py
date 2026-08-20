@@ -6,13 +6,10 @@
     RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench -- --csv=after.csv
     python3 tools/bench_diff.py before.csv after.csv
 
-Each row is `function,metric,speedup` (speedup over the scalar libm call, so
-higher is better and the two files must come from the same corpus — a `pow`
-row from a stale before.csv is not comparable to a rerun with a different
-corpus). Prints every row that moved past `--threshold` (default 3%) either
-way, sorted worst regression first, and exits 1 if any regression exceeds it
--- for wiring into a "did I just make something slower" check without eyeballing
-a 60-row table.
+Each row is `function,metric,speedup[,ns_per_elem]`.
+Rejects comparison if metadata (corpus, size, lanes, fma) does not match
+unless `--ignore-metadata` is provided.
+Reports relative and absolute movement, sorted worst regression first.
 """
 
 from __future__ import annotations
@@ -21,14 +18,58 @@ import csv
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
+from typing import NamedTuple
 
 
-def load(path: Path) -> dict[tuple[str, str], float]:
-    rows: dict[tuple[str, str], float] = {}
-    with path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            rows[(row["function"], row["metric"])] = float(row["speedup"])
-    return rows
+class Record(NamedTuple):
+    speedup: float
+    ns_per_elem: float | None
+
+
+def load(path: Path) -> tuple[dict[str, str], dict[tuple[str, str], Record]]:
+    metadata: dict[str, str] = {}
+    rows: dict[tuple[str, str], Record] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    data_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            comment = stripped.lstrip("#").strip()
+            if ":" in comment:
+                k, v = comment.split(":", 1)
+                metadata[k.strip()] = v.strip()
+        elif stripped:
+            data_lines.append(stripped)
+
+    reader = csv.DictReader(data_lines)
+    for row in reader:
+        fn = row["function"]
+        metric = row["metric"]
+        speedup = float(row["speedup"])
+        ns = float(row["ns_per_elem"]) if "ns_per_elem" in row and row["ns_per_elem"] else None
+        rows[(fn, metric)] = Record(speedup=speedup, ns_per_elem=ns)
+    return metadata, rows
+
+
+def check_metadata(m_before: dict[str, str], m_after: dict[str, str], ignore: bool) -> bool:
+    critical_keys = ["corpus", "size", "widest_f64_lanes", "widest_f32_lanes", "fma"]
+    mismatches = []
+    for k in critical_keys:
+        v_before = m_before.get(k)
+        v_after = m_after.get(k)
+        if v_before is not None and v_after is not None and v_before != v_after:
+            mismatches.append((k, v_before, v_after))
+
+    if mismatches:
+        print("ERROR: Incomparable benchmark metadata:")
+        for k, vb, va in mismatches:
+            print(f"  {k}: before='{vb}' vs after='{va}'")
+        if not ignore:
+            print("Pass --ignore-metadata to override.")
+            return False
+        else:
+            print("Proceeding anyway due to --ignore-metadata.")
+    return True
 
 
 def main() -> int:
@@ -41,9 +82,19 @@ def main() -> int:
         default=0.03,
         help="fractional change to report (default 0.03 = 3%%)",
     )
+    ap.add_argument(
+        "--ignore-metadata",
+        action="store_true",
+        help="allow comparing benchmarks run with different metadata/corpora",
+    )
     args = ap.parse_args()
 
-    before, after = load(args.before), load(args.after)
+    meta_b, before = load(args.before)
+    meta_a, after = load(args.after)
+
+    if not check_metadata(meta_b, meta_a, args.ignore_metadata):
+        return 2
+
     keys = sorted(set(before) & set(after))
     missing_before = sorted(set(after) - set(before))
     missing_after = sorted(set(before) - set(after))
@@ -51,9 +102,9 @@ def main() -> int:
     moved = []
     for key in keys:
         b, a = before[key], after[key]
-        if b == 0:
+        if b.speedup == 0:
             continue
-        delta = (a - b) / b
+        delta = (a.speedup - b.speedup) / b.speedup
         if abs(delta) >= args.threshold:
             moved.append((delta, key, b, a))
     moved.sort()  # worst regression (most negative delta) first
@@ -63,9 +114,26 @@ def main() -> int:
         return 0
 
     if moved:
-        print(f"{'function':<12} {'metric':<10} {'before':>8} {'after':>8} {'delta':>8}")
-        for delta, (fn, metric), b, a in moved:
-            print(f"{fn:<12} {metric:<10} {b:>7.2f}x {a:>7.2f}x {delta:>+7.1%}")
+        has_ns = any(b.ns_per_elem is not None and a.ns_per_elem is not None for _, _, b, a in moved)
+        if has_ns:
+            print(
+                f"{'function':<24} {'metric':<10} {'before':>8} {'after':>8} {'speedup_d':>10} {'ns_before':>10} {'ns_after':>10} {'ns_d':>8}"
+            )
+            for delta, (fn, metric), b, a in moved:
+                nb = f"{b.ns_per_elem:.2f}" if b.ns_per_elem is not None else "-"
+                na = f"{a.ns_per_elem:.2f}" if a.ns_per_elem is not None else "-"
+                ns_d = (
+                    f"{(a.ns_per_elem - b.ns_per_elem) / b.ns_per_elem:>+7.1%}"
+                    if (b.ns_per_elem and a.ns_per_elem)
+                    else "-"
+                )
+                print(
+                    f"{fn:<24} {metric:<10} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta:>+9.1%} {nb:>10} {na:>10} {ns_d:>8}"
+                )
+        else:
+            print(f"{'function':<24} {'metric':<10} {'before':>8} {'after':>8} {'delta':>8}")
+            for delta, (fn, metric), b, a in moved:
+                print(f"{fn:<24} {metric:<10} {b.speedup:>7.2f}x {a.speedup:>7.2f}x {delta:>+7.1%}")
 
     for fn, metric in missing_before:
         print(f"new row (no baseline): {fn} {metric}")

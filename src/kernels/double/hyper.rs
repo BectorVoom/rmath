@@ -304,10 +304,29 @@ pub mod acosh {
 pub mod atanh {
     use super::*;
 
+    const ATANH_TINY: f64 = f64::from_bits(0x3c90000000000000); // 2^-54
+
     /// `atanh(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
+        if A::BIT_EXACT {
+            let y = bit_exact(x);
+            if D::CHECKED {
+                return crate::simd::patch_lanes(x, y, outside(x, 1.0), reference::atanh);
+            }
+            return y;
+        }
         dispatch::<V, A, D>(x, reference::atanh, fast, |x| outside(x, 1.0))
+    }
+
+    #[inline(always)]
+    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+        let one = V::splat(1.0);
+        let two = V::splat(2.0);
+        let half = V::splat(0.5);
+        let arg = (two * x) / (one - x);
+        let y = half * logx::log1p::eval::<V, BitExact, FullRange>(arg);
+        V::select(x.abs().lt_mask(V::splat(ATANH_TINY)), x, y)
     }
 
     /// Measured error: below 3 ulp over `|x| < 1`.

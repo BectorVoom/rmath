@@ -149,10 +149,9 @@ pub(crate) fn pow_log<V: Simd<Elem = f64>>(x: V) -> (V, V) {
 /// The sign-bias argument the scalar reference carries is absent: a negative
 /// base is a special lane, so the vector path never needs to negate.
 #[inline(always)]
-fn pow_exp<V: Simd<Elem = f64>>(x: V, xtail: V) -> V {
+pub(crate) fn pow_exp<V: Simd<Elem = f64>>(x: V, xtail: V) -> V {
     let shift = V::splat(et::SHIFT);
     let kd_s = x.mul_add(V::splat(et::INVLN2N), shift);
-    let ki = kd_s.to_bits();
     let kd = kd_s - shift;
     let r = kd.mul_add(
         V::splat(et::NEGLN2LON),
@@ -161,14 +160,29 @@ fn pow_exp<V: Simd<Elem = f64>>(x: V, xtail: V) -> V {
 
     let mut tail_bits = V::Bits::filled_default();
     let mut scale_bits = V::Bits::filled_default();
+    let mut big_scale_a = V::Floats::filled_default();
+    let kd_arr = kd.to_array();
     for i in 0..V::LANES {
-        let k = ki.as_slice()[i];
-        let idx = ((k % 128) * 2) as usize;
+        let k = kd_arr.as_slice()[i] as i64;
+        let idx = ((k.rem_euclid(128)) * 2) as usize;
         tail_bits.as_mut_slice()[i] = et::TAB[idx];
-        scale_bits.as_mut_slice()[i] = et::TAB[idx + 1].wrapping_add(k << 45);
+        if k >= 1024 * 128 {
+            big_scale_a.as_mut_slice()[i] = 4.0;
+            let k_adj = (k - 256) as u64;
+            scale_bits.as_mut_slice()[i] = et::TAB[idx + 1].wrapping_add(k_adj << 45);
+        } else if k >= 1023 * 128 {
+            big_scale_a.as_mut_slice()[i] = 2.0;
+            let k_adj = (k - 128) as u64;
+            scale_bits.as_mut_slice()[i] = et::TAB[idx + 1].wrapping_add(k_adj << 45);
+        } else {
+            big_scale_a.as_mut_slice()[i] = 1.0;
+            let k_u = k as u64;
+            scale_bits.as_mut_slice()[i] = et::TAB[idx + 1].wrapping_add(k_u << 45);
+        }
     }
     let tail = V::from_bits(tail_bits);
     let scale = V::from_bits(scale_bits);
+    let big_scale = V::from_array(big_scale_a);
 
     let r2 = r * r;
     let p23 = V::splat(et::C3).mul_add(r, V::splat(et::C2));
@@ -176,7 +190,9 @@ fn pow_exp<V: Simd<Elem = f64>>(x: V, xtail: V) -> V {
     let p45 = r.mul_add(V::splat(et::C5), V::splat(et::C4));
     let t = p23.mul_add(r2, s);
     let tmp = p45.mul_add(r2 * r2, t);
-    scale.mul_add(tmp, scale)
+    let res = scale.mul_add(tmp, scale) * big_scale;
+    let is_overflow = x.gt_mask(V::splat(709.782712893384));
+    V::select(is_overflow, V::splat(f64::INFINITY), res)
 }
 
 /// `y * log2(x)`, to double precision, for the `Fast` range test.

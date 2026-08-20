@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Pass `--csv=PATH` (or bare `--csv` for stdout) to also emit every row as
-//! `function,metric,speedup`, machine-readable input for
+//! `function,metric,speedup,ns_per_elem`, machine-readable input for
 //! `tools/bench_diff.py`. The pretty tables below are unaffected either way.
 //!
 //! `target-cpu=native` matters and is not a detail: without the `fma` target
@@ -15,22 +15,16 @@
 //! measure. The harness says so at startup rather than silently reporting bad
 //! numbers.
 //!
-//! Method: best-of-N over a buffer larger than L2, timing `eval_slice`
+//! Method: best-of-N over a buffer, timing `eval_slice`
 //! against a plain scalar loop over the same data. Best-of rather than mean,
 //! because the quantity of interest is the achievable rate and the noise here
 //! is all one-directional.
 //!
-//! # Reading the table
-//!
-//! The baseline column is the platform's scalar routine, in nanoseconds per
-//! element. The rest are speedups over it — above 1.00 is faster than the
-//! `libm` call it replaces.
-//!
-//! `BitExact` is only expected to win for the functions with a vectorised
-//! schedule. For the delegating ones it evaluates the same scalar routine one
-//! lane at a time, so parity is the *ceiling* there, and `Fast` is where the
-//! vector path lives. The crate documentation has the per-function table; this
-//! is the measurement behind it.
+//! # Options
+//! - `--size=N`: custom buffer size (default 1048576)
+//! - `--corpus=NAME`: `default`, `in-domain`, `boundary`, `random-bit`, `coherent`, `special`
+//! - `--suite=NAME`: `default`, `traversal`, `repair`, `all`
+//! - `--csv=PATH` or `--csv`: emit CSV output with metadata header
 
 use rmath::prelude::*;
 use std::time::Instant;
@@ -51,37 +45,45 @@ mod libm {
     }
 }
 
-const N: usize = 1 << 20;
+const DEFAULT_N: usize = 1 << 20;
 const REPS: usize = 8;
 
-/// Every `(function, metric, speedup)` triple printed this run, for `--csv`.
-///
-/// A global rather than an accumulator threaded through every row-printing
-/// site: the recorder is purely additive and this is a benchmark binary, so
-/// the shared mutable state buys real simplicity here in a way it would not
-/// in the library. `Mutex` rather than `RefCell` only because a `static`
-/// demands `Sync`; there is no contention to speak of.
-static RECORD: std::sync::Mutex<Vec<(&'static str, &'static str, f64)>> =
+/// Every `(function, metric, speedup, ns_per_elem)` printed this run, for `--csv`.
+static RECORD: std::sync::Mutex<Vec<(String, String, f64, f64)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Record one measurement alongside printing it, for `--csv` / `tools/bench_diff.py`.
-fn record(function: &'static str, metric: &'static str, speedup: f64) {
-    RECORD.lock().unwrap().push((function, metric, speedup));
+fn record(function: impl Into<String>, metric: impl Into<String>, speedup: f64, ns_per_elem: f64) {
+    RECORD
+        .lock()
+        .unwrap()
+        .push((function.into(), metric.into(), speedup, ns_per_elem));
 }
 
 /// Write every recorded row as CSV — to a file if `--csv=PATH` was given, to
 /// stdout if bare `--csv` was given, and not at all otherwise.
-///
-/// Kept a separate, explicit pass over the whole run's data rather than
-/// streamed row by row: the pretty tables above are what a human reads while
-/// the benchmark runs, and the CSV is what `tools/bench_diff.py` reads
-/// afterwards, so interleaving them would make either harder to follow.
-fn write_csv() {
+fn write_csv(corpus: &str, size: usize) {
     let flag = std::env::args().find(|a| a == "--csv" || a.starts_with("--csv="));
     let Some(flag) = flag else { return };
-    let mut out = String::from("function,metric,speedup\n");
-    for (function, metric, speedup) in RECORD.lock().unwrap().iter() {
-        out.push_str(&format!("{function},{metric},{speedup}\n"));
+    let mut out = String::new();
+    out.push_str(&format!("# target_arch: {}\n", std::env::consts::ARCH));
+    out.push_str(&format!(
+        "# widest_f64_lanes: {}\n",
+        <rmath::Widest as Simd>::LANES
+    ));
+    out.push_str(&format!(
+        "# widest_f32_lanes: {}\n",
+        <rmath::WidestF32 as Simd>::LANES
+    ));
+    out.push_str(&format!("# fma: {}\n", cfg!(target_feature = "fma")));
+    out.push_str(&format!("# size: {}\n", size));
+    out.push_str(&format!("# corpus: {}\n", corpus));
+    if let Some(flags) = option_env!("RUSTFLAGS") {
+        out.push_str(&format!("# rustflags: {}\n", flags));
+    }
+    out.push_str("function,metric,speedup,ns_per_elem\n");
+    for (function, metric, speedup, ns) in RECORD.lock().unwrap().iter() {
+        out.push_str(&format!("{function},{metric},{speedup:.4},{ns:.4}\n"));
     }
     if let Some(path) = flag.strip_prefix("--csv=") {
         std::fs::write(path, out).expect("writing --csv output");
@@ -91,6 +93,7 @@ fn write_csv() {
     }
 }
 
+#[derive(Clone)]
 struct Rng(u64);
 
 impl Rng {
@@ -111,6 +114,9 @@ impl Rng {
 }
 
 fn time(src: &[f64], dst: &mut [f64], mut run: impl FnMut(&[f64], &mut [f64])) -> f64 {
+    if src.is_empty() {
+        return 0.0;
+    }
     run(src, dst);
     let mut best = f64::INFINITY;
     for _ in 0..REPS {
@@ -138,6 +144,9 @@ fn time_pair(
     b: &mut [f64],
     mut run: impl FnMut(&[f64], &mut [f64], &mut [f64]),
 ) -> f64 {
+    if src.is_empty() {
+        return 0.0;
+    }
     run(src, a, b);
     let mut best = f64::INFINITY;
     for _ in 0..REPS {
@@ -173,10 +182,10 @@ macro_rules! row {
             base / tc,
             base / te
         );
-        record($name, "exact", base / ta);
-        record($name, "exact/F", base / tb);
-        record($name, "fast", base / tc);
-        record($name, "fast/F", base / te);
+        record($name, "exact", base / ta, ta);
+        record($name, "exact/F", base / tb, tb);
+        record($name, "fast", base / tc, tc);
+        record($name, "fast/F", base / te, te);
     }};
 }
 
@@ -206,11 +215,151 @@ macro_rules! row_pair {
             base / tc,
             base / te
         );
-        record($name, "exact", base / ta);
-        record($name, "exact/F", base / tb);
-        record($name, "fast", base / tc);
-        record($name, "fast/F", base / te);
+        record($name, "exact", base / ta, ta);
+        record($name, "exact/F", base / tb, tb);
+        record($name, "fast", base / tc, tc);
+        record($name, "fast/F", base / te, te);
     }};
+}
+
+struct Corpora {
+    expargs: Vec<f64>,
+    posargs: Vec<f64>,
+    angargs: Vec<f64>,
+    unitargs: Vec<f64>,
+    hypargs: Vec<f64>,
+    erfargs: Vec<f64>,
+    erfcargs: Vec<f64>,
+    besselargs: Vec<f64>,
+}
+
+fn generate_corpora(profile: &str, n: usize) -> Corpora {
+    let mut rng = Rng(0x243F_6A88_85A3_08D3);
+    match profile {
+        "in-domain" => Corpora {
+            expargs: (0..n).map(|_| rng.uniform(-20.0, 20.0)).collect(),
+            posargs: (0..n).map(|_| rng.uniform(0.1, 100.0)).collect(),
+            angargs: (0..n).map(|_| rng.uniform(-std::f64::consts::PI, std::f64::consts::PI)).collect(),
+            unitargs: (0..n).map(|_| rng.uniform(-0.9, 0.9)).collect(),
+            hypargs: (0..n).map(|_| rng.uniform(-5.0, 5.0)).collect(),
+            erfargs: (0..n).map(|_| rng.uniform(-3.0, 3.0)).collect(),
+            erfcargs: (0..n).map(|_| rng.uniform(-3.0, 10.0)).collect(),
+            besselargs: (0..n).map(|_| rng.uniform(0.5, 30.0)).collect(),
+        },
+        "boundary" => {
+            let special_vals = [
+                0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 1e-15, -1e-15,
+                f64::MIN_POSITIVE, 709.78, -708.39, f64::MAX,
+            ];
+            let build_vec = |rng: &mut Rng, lo: f64, hi: f64| -> Vec<f64> {
+                (0..n)
+                    .map(|i| {
+                        if i % 8 < special_vals.len() && i % 8 != 0 {
+                            special_vals[i % special_vals.len()]
+                        } else {
+                            rng.uniform(lo, hi)
+                        }
+                    })
+                    .collect()
+            };
+            Corpora {
+                expargs: build_vec(&mut rng, -700.0, 700.0),
+                posargs: build_vec(&mut rng, 1e-300, 1e300),
+                angargs: build_vec(&mut rng, -1e15, 1e15),
+                unitargs: build_vec(&mut rng, -1.0, 1.0),
+                hypargs: build_vec(&mut rng, -700.0, 700.0),
+                erfargs: build_vec(&mut rng, -6.0, 6.0),
+                erfcargs: build_vec(&mut rng, -6.0, 25.0),
+                besselargs: build_vec(&mut rng, 0.0, 100.0),
+            }
+        }
+        "random-bit" => {
+            let build_vec = |rng: &mut Rng| -> Vec<f64> {
+                (0..n).map(|_| f64::from_bits(rng.next())).collect()
+            };
+            Corpora {
+                expargs: build_vec(&mut rng),
+                posargs: build_vec(&mut rng),
+                angargs: build_vec(&mut rng),
+                unitargs: build_vec(&mut rng),
+                hypargs: build_vec(&mut rng),
+                erfargs: build_vec(&mut rng),
+                erfcargs: build_vec(&mut rng),
+                besselargs: build_vec(&mut rng),
+            }
+        }
+        "coherent" | "sorted" => {
+            let mut c = Corpora {
+                expargs: (0..n).map(|i| -40.0 + 80.0 * (i as f64 / n.max(1) as f64)).collect(),
+                posargs: (0..n).map(|i| ((1e-12f64).ln() + ((1e12f64).ln() - (1e-12f64).ln()) * (i as f64 / n.max(1) as f64)).exp()).collect(),
+                angargs: (0..n).map(|i| -1e4 + 2e4 * (i as f64 / n.max(1) as f64)).collect(),
+                unitargs: (0..n).map(|i| -1.0 + 2.0 * (i as f64 / n.max(1) as f64)).collect(),
+                hypargs: (0..n).map(|i| -20.0 + 40.0 * (i as f64 / n.max(1) as f64)).collect(),
+                erfargs: (0..n).map(|i| -6.0 + 12.0 * (i as f64 / n.max(1) as f64)).collect(),
+                erfcargs: (0..n).map(|i| -6.0 + 31.0 * (i as f64 / n.max(1) as f64)).collect(),
+                besselargs: (0..n).map(|i| 60.0 * (i as f64 / n.max(1) as f64)).collect(),
+            };
+            c.expargs.sort_by(|a, b| a.total_cmp(b));
+            c.posargs.sort_by(|a, b| a.total_cmp(b));
+            c.angargs.sort_by(|a, b| a.total_cmp(b));
+            c.unitargs.sort_by(|a, b| a.total_cmp(b));
+            c.hypargs.sort_by(|a, b| a.total_cmp(b));
+            c.erfargs.sort_by(|a, b| a.total_cmp(b));
+            c.erfcargs.sort_by(|a, b| a.total_cmp(b));
+            c.besselargs.sort_by(|a, b| a.total_cmp(b));
+            c
+        }
+        "special" | "mixed-special" => {
+            let specials = [
+                0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+                f64::MIN_POSITIVE * 0.25, f64::MAX, -f64::MAX,
+            ];
+            let build_vec = |rng: &mut Rng, lo: f64, hi: f64| -> Vec<f64> {
+                (0..n)
+                    .map(|i| {
+                        if i % 4 == 0 {
+                            specials[(i / 4) % specials.len()]
+                        } else {
+                            rng.uniform(lo, hi)
+                        }
+                    })
+                    .collect()
+            };
+            Corpora {
+                expargs: build_vec(&mut rng, -40.0, 40.0),
+                posargs: build_vec(&mut rng, 0.1, 1000.0),
+                angargs: build_vec(&mut rng, -1e4, 1e4),
+                unitargs: build_vec(&mut rng, -1.0, 1.0),
+                hypargs: build_vec(&mut rng, -20.0, 20.0),
+                erfargs: build_vec(&mut rng, -6.0, 6.0),
+                erfcargs: build_vec(&mut rng, -6.0, 25.0),
+                besselargs: build_vec(&mut rng, 0.0, 60.0),
+            }
+        }
+        _ => Corpora {
+            // Default
+            expargs: (0..n).map(|_| rng.uniform(-40.0, 40.0)).collect(),
+            posargs: (0..n)
+                .map(|_| rng.uniform((1e-12f64).ln(), (1e12f64).ln()).exp())
+                .collect(),
+            angargs: (0..n).map(|_| rng.uniform(-1e4, 1e4)).collect(),
+            unitargs: (0..n).map(|_| rng.uniform(-1.0, 1.0)).collect(),
+            hypargs: (0..n).map(|_| rng.uniform(-20.0, 20.0)).collect(),
+            erfargs: (0..n).map(|_| rng.uniform(-6.0, 6.0)).collect(),
+            erfcargs: (0..n).map(|_| rng.uniform(-6.0, 25.0)).collect(),
+            besselargs: (0..n).map(|_| rng.uniform(0.0, 60.0)).collect(),
+        },
+    }
+}
+
+fn parse_arg(prefix: &str) -> Option<String> {
+    std::env::args().find_map(|a| {
+        if a.starts_with(prefix) {
+            Some(a.strip_prefix(prefix).unwrap().to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn main() {
@@ -228,125 +377,125 @@ fn main() {
         cfg!(target_feature = "fma")
     );
 
-    let mut rng = Rng(0x243F_6A88_85A3_08D3);
-    // Exponential arguments: a range that neither overflows nor is trivially tiny.
-    let expargs: Vec<f64> = (0..N).map(|_| rng.uniform(-40.0, 40.0)).collect();
-    // Positive magnitudes spanning many decades, as physical data tends to be.
-    let posargs: Vec<f64> = (0..N)
-        .map(|_| rng.uniform((1e-12f64).ln(), (1e12f64).ln()).exp())
-        .collect();
-    // Angles, in the range a reduction can handle cheaply.
-    let angargs: Vec<f64> = (0..N).map(|_| rng.uniform(-1e4, 1e4)).collect();
-    // The unit interval, for the inverse trigonometric functions.
-    let unitargs: Vec<f64> = (0..N).map(|_| rng.uniform(-1.0, 1.0)).collect();
-    // Moderate arguments for the hyperbolic family.
-    let hypargs: Vec<f64> = (0..N).map(|_| rng.uniform(-20.0, 20.0)).collect();
-    let mut dst = vec![0.0; N];
-    let mut dst2 = vec![0.0; N];
+    let n: usize = parse_arg("--size=")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_N);
+    let corpus_name = parse_arg("--corpus=")
+        .or_else(|| parse_arg("--profile="))
+        .unwrap_or_else(|| "default".to_string());
+    let suite = parse_arg("--suite=").unwrap_or_else(|| "default".to_string());
 
-    header();
-    row!("exp", &expargs, &mut dst, f64::exp, Exp);
-    row!("exp2", &expargs, &mut dst, f64::exp2, Exp2);
-    row!("expm1", &expargs, &mut dst, f64::exp_m1, Expm1);
-    row!("ln", &posargs, &mut dst, f64::ln, Ln);
-    row!("log2", &posargs, &mut dst, f64::log2, Log2);
-    row!("log10", &posargs, &mut dst, f64::log10, Log10);
-    row!("log1p", &posargs, &mut dst, f64::ln_1p, Log1p);
-    row!("cbrt", &posargs, &mut dst, f64::cbrt, Cbrt);
-    row!("sqrt", &posargs, &mut dst, f64::sqrt, Sqrt);
+    let corpora = generate_corpora(&corpus_name, n);
+    let mut dst = vec![0.0; n];
+    let mut dst2 = vec![0.0; n];
 
-    header();
-    row!("sin", &angargs, &mut dst, f64::sin, Sin);
-    row!("cos", &angargs, &mut dst, f64::cos, Cos);
-    row_pair!(
-        "sincos",
-        &angargs,
-        &mut dst,
-        &mut dst2,
-        f64::sin_cos,
-        SinCos
-    );
-    row!("tan", &angargs, &mut dst, f64::tan, Tan);
-    row!("asin", &unitargs, &mut dst, f64::asin, Asin);
-    row!("acos", &unitargs, &mut dst, f64::acos, Acos);
-    row!("atan", &angargs, &mut dst, f64::atan, Atan);
+    if suite == "default" || suite == "all" || suite == "standard" {
+        header();
+        row!("exp", &corpora.expargs, &mut dst, f64::exp, Exp);
+        row!("exp2", &corpora.expargs, &mut dst, f64::exp2, Exp2);
+        row!("expm1", &corpora.expargs, &mut dst, f64::exp_m1, Expm1);
+        row!("ln", &corpora.posargs, &mut dst, f64::ln, Ln);
+        row!("log2", &corpora.posargs, &mut dst, f64::log2, Log2);
+        row!("log10", &corpora.posargs, &mut dst, f64::log10, Log10);
+        row!("log1p", &corpora.posargs, &mut dst, f64::ln_1p, Log1p);
+        row!("cbrt", &corpora.posargs, &mut dst, f64::cbrt, Cbrt);
+        row!("sqrt", &corpora.posargs, &mut dst, f64::sqrt, Sqrt);
 
-    header();
-    row!("sinh", &hypargs, &mut dst, f64::sinh, Sinh);
-    row!("cosh", &hypargs, &mut dst, f64::cosh, Cosh);
-    row!("tanh", &hypargs, &mut dst, f64::tanh, Tanh);
-    row!("asinh", &hypargs, &mut dst, f64::asinh, Asinh);
-    row!("acosh", &posargs, &mut dst, f64::acosh, Acosh);
-    row!("atanh", &unitargs, &mut dst, f64::atanh, Atanh);
+        header();
+        row!("sin", &corpora.angargs, &mut dst, f64::sin, Sin);
+        row!("cos", &corpora.angargs, &mut dst, f64::cos, Cos);
+        row_pair!(
+            "sincos",
+            &corpora.angargs,
+            &mut dst,
+            &mut dst2,
+            f64::sin_cos,
+            SinCos
+        );
+        row!("tan", &corpora.angargs, &mut dst, f64::tan, Tan);
+        row!("asin", &corpora.unitargs, &mut dst, f64::asin, Asin);
+        row!("acos", &corpora.unitargs, &mut dst, f64::acos, Acos);
+        row!("atan", &corpora.angargs, &mut dst, f64::atan, Atan);
 
-    header();
-    // `erf`'s argument is interesting only on about [-6, 6]; outside it the
-    // answer is +-1 and every implementation short-circuits.
-    let erfargs: Vec<f64> = (0..N).map(|_| rng.uniform(-6.0, 6.0)).collect();
-    // `erfc`'s tail is the half that matters, so the corpus leans into it.
-    let erfcargs: Vec<f64> = (0..N).map(|_| rng.uniform(-6.0, 25.0)).collect();
-    let besselargs: Vec<f64> = (0..N).map(|_| rng.uniform(0.0, 60.0)).collect();
-    row!("exp10", &expargs, &mut dst, |x| libm::exp10(x), Exp10);
-    row!("erf", &erfargs, &mut dst, |x| libm::erf(x), Erf);
-    row!("erfc", &erfcargs, &mut dst, |x| libm::erfc(x), Erfc);
+        header();
+        row!("sinh", &corpora.hypargs, &mut dst, f64::sinh, Sinh);
+        row!("cosh", &corpora.hypargs, &mut dst, f64::cosh, Cosh);
+        row!("tanh", &corpora.hypargs, &mut dst, f64::tanh, Tanh);
+        row!("asinh", &corpora.hypargs, &mut dst, f64::asinh, Asinh);
+        row!("acosh", &corpora.posargs, &mut dst, f64::acosh, Acosh);
+        row!("atanh", &corpora.unitargs, &mut dst, f64::atanh, Atanh);
 
-    header();
-    row!("j0", &besselargs, &mut dst, |x| libm::j0(x), J0);
-    row!("j1", &besselargs, &mut dst, |x| libm::j1(x), J1);
-    row!("y0", &besselargs, &mut dst, |x| libm::y0(x), Y0);
-    row!("y1", &besselargs, &mut dst, |x| libm::y1(x), Y1);
+        header();
+        row!("exp10", &corpora.expargs, &mut dst, |x| libm::exp10(x), Exp10);
+        row!("erf", &corpora.erfargs, &mut dst, |x| libm::erf(x), Erf);
+        row!("erfc", &corpora.erfcargs, &mut dst, |x| libm::erfc(x), Erfc);
 
-    header();
-    row!("floor", &expargs, &mut dst, f64::floor, Floor);
-    row!("round", &expargs, &mut dst, f64::round, Round);
-    row!("trunc", &expargs, &mut dst, f64::trunc, Trunc);
+        header();
+        row!("j0", &corpora.besselargs, &mut dst, |x| libm::j0(x), J0);
+        row!("j1", &corpora.besselargs, &mut dst, |x| libm::j1(x), J1);
+        row!("y0", &corpora.besselargs, &mut dst, |x| libm::y0(x), Y0);
+        row!("y1", &corpora.besselargs, &mut dst, |x| libm::y1(x), Y1);
 
-    // Binary functions and the Gamma pair do not fit the unary macro.
-    println!(
-        "\n{:<10} {:>10} {:>9} {:>9}",
-        "function", "libm ns", "exact", "fast"
-    );
-    println!("{}", "-".repeat(42));
-    binary(
-        "pow",
-        &posargs,
-        &expargs,
-        &mut dst,
-        f64::powf,
-        Pow::new(),
-        Pow::builder().accuracy(Fast).domain(FullRange).build(),
-    );
-    binary(
-        "atan2",
-        &angargs,
-        &posargs,
-        &mut dst,
-        f64::atan2,
-        Atan2::new(),
-        Atan2::builder().accuracy(Fast).domain(FullRange).build(),
-    );
-    binary(
-        "hypot",
-        &posargs,
-        &angargs,
-        &mut dst,
-        f64::hypot,
-        Hypot::new(),
-        Hypot::builder().accuracy(Fast).domain(FullRange).build(),
-    );
+        header();
+        row!("floor", &corpora.expargs, &mut dst, f64::floor, Floor);
+        row!("round", &corpora.expargs, &mut dst, f64::round, Round);
+        row!("trunc", &corpora.expargs, &mut dst, f64::trunc, Trunc);
 
-    println!("\n{:<10} {:>10} {:>9}", "function", "libm ns", "rmath");
-    println!("{}", "-".repeat(32));
-    gamma("lgamma", &hypargs, &mut dst);
-    let mut grng = Rng(0x9E37_79B9_7F4A_7C15);
-    let tgargs_direct: Vec<f64> = (0..N).map(|_| grng.uniform(0.0, 18.0)).collect();
-    let tgargs_stirling: Vec<f64> = (0..N).map(|_| grng.uniform(18.0, 171.0)).collect();
-    tgamma_bench("tgamma (direct)", &tgargs_direct, &mut dst);
-    tgamma_bench("tgamma (stirling)", &tgargs_stirling, &mut dst);
+        // Binary functions and the Gamma pair do not fit the unary macro.
+        println!(
+            "\n{:<10} {:>10} {:>9} {:>9}",
+            "function", "libm ns", "exact", "fast"
+        );
+        println!("{}", "-".repeat(42));
+        binary(
+            "pow",
+            &corpora.posargs,
+            &corpora.expargs,
+            &mut dst,
+            f64::powf,
+            Pow::new(),
+            Pow::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+        binary(
+            "atan2",
+            &corpora.angargs,
+            &corpora.posargs,
+            &mut dst,
+            f64::atan2,
+            Atan2::new(),
+            Atan2::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+        binary(
+            "hypot",
+            &corpora.posargs,
+            &corpora.angargs,
+            &mut dst,
+            f64::hypot,
+            Hypot::new(),
+            Hypot::builder().accuracy(Fast).domain(FullRange).build(),
+        );
 
-    single_precision();
+        println!("\n{:<10} {:>10} {:>9}", "function", "libm ns", "rmath");
+        println!("{}", "-".repeat(32));
+        gamma("lgamma", &corpora.hypargs, &mut dst);
+        let mut grng = Rng(0x9E37_79B9_7F4A_7C15);
+        let tgargs_direct: Vec<f64> = (0..n).map(|_| grng.uniform(0.0, 18.0)).collect();
+        let tgargs_stirling: Vec<f64> = (0..n).map(|_| grng.uniform(18.0, 171.0)).collect();
+        tgamma_bench("tgamma (direct)", &tgargs_direct, &mut dst);
+        tgamma_bench("tgamma (stirling)", &tgargs_stirling, &mut dst);
 
-    write_csv();
+        single_precision(n);
+    }
+
+    if suite == "traversal" || suite == "all" {
+        traversal_benchmarks();
+    }
+
+    if suite == "repair" || suite == "all" {
+        repair_benchmarks(n);
+    }
+
+    write_csv(&corpus_name, n);
 }
 
 fn binary<A: Function2<f64>, B: Function2<f64>>(
@@ -359,7 +508,6 @@ fn binary<A: Function2<f64>, B: Function2<f64>>(
     fast: B,
 ) {
     let base = {
-        let t = Instant::now();
         let mut best = f64::INFINITY;
         for _ in 0..REPS {
             let t0 = Instant::now();
@@ -368,7 +516,6 @@ fn binary<A: Function2<f64>, B: Function2<f64>>(
             }
             best = best.min(t0.elapsed().as_secs_f64());
         }
-        let _ = t;
         best * 1e9 / xs.len() as f64
     };
     type Binary<'a> = &'a dyn Fn(&[f64], &[f64], &mut [f64]);
@@ -388,8 +535,8 @@ fn binary<A: Function2<f64>, B: Function2<f64>>(
         base / a,
         base / b
     );
-    record(name, "exact", base / a);
-    record(name, "fast", base / b);
+    record(name, "exact", base / a, a);
+    record(name, "fast", base / b, b);
 }
 
 fn gamma(name: &'static str, src: &[f64], dst: &mut [f64]) {
@@ -404,7 +551,7 @@ fn gamma(name: &'static str, src: &[f64], dst: &mut [f64]) {
     let k = LGamma::new();
     let t = time(src, dst, |s, d| k.eval_slice(s, d));
     println!("{name:<10} {base:>10.2} {:>8.2}x", base / t);
-    record(name, "rmath", base / t);
+    record(name, "rmath", base / t, t);
 }
 
 /// Separate from [`gamma`]: shows the `TG_DIRECT_LIMIT` guard's win directly
@@ -422,21 +569,21 @@ fn tgamma_bench(name: &'static str, src: &[f64], dst: &mut [f64]) {
     let k = TGamma::new();
     let t = time(src, dst, |s, d| k.eval_slice(s, d));
     println!("{name:<10} {base:>10.2} {:>8.2}x", base / t);
-    record(name, "rmath", base / t);
+    record(name, "rmath", base / t, t);
 }
 
-fn single_precision() {
+fn single_precision(n: usize) {
     println!(
         "\nsingle precision\n{:<10} {:>10} {:>9} {:>9}",
         "function", "libm ns", "exact", "fast"
     );
     println!("{}", "-".repeat(42));
     let mut rng = Rng(0xB5AD_4ECE_DA10_80CC);
-    let e: Vec<f32> = (0..N).map(|_| rng.uniform(-40.0, 40.0) as f32).collect();
-    let p: Vec<f32> = (0..N)
+    let e: Vec<f32> = (0..n).map(|_| rng.uniform(-40.0, 40.0) as f32).collect();
+    let p: Vec<f32> = (0..n)
         .map(|_| rng.uniform((1e-12f64).ln(), (1e12f64).ln()).exp() as f32)
         .collect();
-    let mut d = vec![0.0f32; N];
+    let mut d = vec![0.0f32; n];
 
     macro_rules! row32 {
         ($name:literal, $src:expr, $scalar:expr, $obj:ident) => {{
@@ -449,7 +596,7 @@ fn single_precision() {
                     }
                     best = best.min(t.elapsed().as_secs_f64());
                 }
-                best * 1e9 / N as f64
+                best * 1e9 / n as f64
             };
             let mut run = |f: &dyn Fn(&[f32], &mut [f32])| {
                 let mut best = f64::INFINITY;
@@ -458,7 +605,7 @@ fn single_precision() {
                     f($src, &mut d);
                     best = best.min(t.elapsed().as_secs_f64());
                 }
-                best * 1e9 / N as f64
+                best * 1e9 / n as f64
             };
             let a = $obj::new();
             let c = $obj::builder().accuracy(Fast).domain(FullRange).build();
@@ -470,8 +617,8 @@ fn single_precision() {
                 base / ta,
                 base / tc
             );
-            record($name, "exact", base / ta);
-            record($name, "fast", base / tc);
+            record($name, "exact", base / ta, ta);
+            record($name, "fast", base / tc, tc);
         }};
     }
     row32!("expf", &e, f32::exp, Exp);
@@ -480,27 +627,155 @@ fn single_precision() {
     row32!("log2f", &p, f32::log2, Log2);
     row32!("sqrtf", &p, f32::sqrt, Sqrt);
     row32!("cbrtf", &p, f32::cbrt, Cbrt);
-    // Not `&e`: that corpus is +-40, and `tanh` saturates to +-1 (indistinguishable
-    // at `f32` precision) by about +-9 -- `src/kernels/single/tanh.rs` routes
-    // anything past that to the scalar reference, same as every other kernel's
-    // rare tail, so a +-40 corpus would spend ~78% of its lanes there and
-    // measure the reference call's cost, not the native kernel's.
-    let tanh32args: Vec<f32> = (0..N).map(|_| rng.uniform(-9.0, 9.0) as f32).collect();
+    let tanh32args: Vec<f32> = (0..n).map(|_| rng.uniform(-9.0, 9.0) as f32).collect();
     row32!("tanhf", &tanh32args, f32::tanh, Tanh);
-    // `TRIG_LIMIT` is ~804 (`src/kernels/single/trig.rs`); stay inside it for
-    // the same corpus-artifact reason as `tanhf` above.
-    let ang32: Vec<f32> = (0..N).map(|_| rng.uniform(-700.0, 700.0) as f32).collect();
+    let ang32: Vec<f32> = (0..n).map(|_| rng.uniform(-700.0, 700.0) as f32).collect();
     row32!("sinf", &ang32, f32::sin, Sin);
     row32!("cosf", &ang32, f32::cos, Cos);
     row32!("tanf", &ang32, f32::tan, Tan);
-    let erf32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 6.0) as f32).collect();
-    let erfc32: Vec<f32> = (0..N).map(|_| rng.uniform(-6.0, 10.0) as f32).collect();
-    // Not `&e`: that corpus is +-40, which straddles `exp10f`'s +-38 main-path
-    // limit (`src/kernels/single/exp10.rs`), so roughly 5% of its lanes would
-    // take the scalar repair under both policies and understate both numbers
-    // identically -- a corpus artifact, not a cost of either kernel.
-    let exp10args: Vec<f32> = (0..N).map(|_| rng.uniform(-35.0, 35.0) as f32).collect();
+    let erf32: Vec<f32> = (0..n).map(|_| rng.uniform(-6.0, 6.0) as f32).collect();
+    let erfc32: Vec<f32> = (0..n).map(|_| rng.uniform(-6.0, 10.0) as f32).collect();
+    let exp10args: Vec<f32> = (0..n).map(|_| rng.uniform(-35.0, 35.0) as f32).collect();
     row32!("exp10f", &exp10args, |x| libm::exp10f(x), Exp10);
     row32!("erff", &erf32, |x| libm::erff(x), Erf);
     row32!("erfcf", &erfc32, |x| libm::erfcf(x), Erfc);
+}
+
+fn traversal_benchmarks() {
+    println!("\ntraversal and buffer shapes (ns/elem)");
+    println!("{:<24} {:>10} {:>10} {:>10} {:>10} {:>10}", "workload", "len=1", "len=7", "len=8", "len=64", "len=4096");
+    println!("{}", "-".repeat(78));
+
+    let lanes = <rmath::Widest as Simd>::LANES;
+    let lens = [1, lanes.saturating_sub(1).max(1), lanes, 64, 4096];
+    let exp = Exp::new();
+    let pow = Pow::new();
+    let sincos = SinCos::new();
+
+    let bench_lens = |name: &str, mut run: Box<dyn FnMut(usize) -> f64>| {
+        let times: Vec<f64> = lens.iter().map(|&len| run(len)).collect();
+        println!(
+            "{:<24} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+            name, times[0], times[1], times[2], times[3], times[4]
+        );
+        for (&len, &t) in lens.iter().zip(times.iter()) {
+            record(format!("{name}_len{len}"), "ns_per_elem", 1.0, t);
+        }
+    };
+
+    bench_lens("unary_eval_slice", Box::new(|len| {
+        let src = vec![1.5f64; len];
+        let mut dst = vec![0.0f64; len];
+        let mut best = f64::INFINITY;
+        for _ in 0..1000 {
+            let t = Instant::now();
+            exp.eval_slice(&src, &mut dst);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best * 1e9 / len as f64
+    }));
+
+    bench_lens("unary_in_place", Box::new(|len| {
+        let mut buf = vec![1.5f64; len];
+        let mut best = f64::INFINITY;
+        for _ in 0..1000 {
+            let t = Instant::now();
+            exp.eval_in_place(&mut buf);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best * 1e9 / len as f64
+    }));
+
+    bench_lens("binary_eval_slice", Box::new(|len| {
+        let a = vec![2.0f64; len];
+        let b = vec![3.0f64; len];
+        let mut dst = vec![0.0f64; len];
+        let mut best = f64::INFINITY;
+        for _ in 0..1000 {
+            let t = Instant::now();
+            pow.eval_slice(&a, &b, &mut dst);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best * 1e9 / len as f64
+    }));
+
+    bench_lens("binary_scalar_second", Box::new(|len| {
+        let a = vec![2.0f64; len];
+        let mut dst = vec![0.0f64; len];
+        let mut best = f64::INFINITY;
+        for _ in 0..1000 {
+            let t = Instant::now();
+            pow.eval_slice_scalar(&a, 3.0, &mut dst);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best * 1e9 / len as f64
+    }));
+
+    bench_lens("pair_eval_slice", Box::new(|len| {
+        let src = vec![1.0f64; len];
+        let mut d1 = vec![0.0f64; len];
+        let mut d2 = vec![0.0f64; len];
+        let mut best = f64::INFINITY;
+        for _ in 0..1000 {
+            let t = Instant::now();
+            sincos.eval_slice(&src, &mut d1, &mut d2);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best * 1e9 / len as f64
+    }));
+}
+
+fn repair_benchmarks(n: usize) {
+    println!("\nscalar repair density overhead (ns/elem)");
+    println!("{:<20} {:>10} {:>10} {:>10} {:>10}", "kernel", "0% repair", "1-lane", "25% repair", "100% repair");
+    println!("{}", "-".repeat(64));
+
+    let lanes = <rmath::Widest as Simd>::LANES;
+    let exp = Exp::new();
+    let erf = Erf::new();
+    let sin = Sin::new();
+
+    let run_density = |name: &str, make_vec: &dyn Fn(f64) -> Vec<f64>| {
+        let densities = [0.0, 1.0 / (lanes as f64), 0.25, 1.0];
+        let mut times = [0.0; 4];
+        for (i, &d) in densities.iter().enumerate() {
+            let src = make_vec(d);
+            let mut dst = vec![0.0; n];
+            let mut best = f64::INFINITY;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                match name {
+                    "exp" => exp.eval_slice(&src, &mut dst),
+                    "erf" => erf.eval_slice(&src, &mut dst),
+                    "sin" => sin.eval_slice(&src, &mut dst),
+                    _ => {}
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            times[i] = best * 1e9 / n as f64;
+            record(format!("repair_{name}_{:.0}pct", d * 100.0), "ns_per_elem", 1.0, times[i]);
+        }
+        println!(
+            "{:<20} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+            name, times[0], times[1], times[2], times[3]
+        );
+    };
+
+    // exp repairs on x > 709.7 or x < -745.0 or NaN
+    run_density("exp", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { 750.0 } else { 1.5 }).collect()
+    });
+
+    // erf repairs on |x| >= 6.0 or special
+    run_density("erf", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { 10.0 } else { 1.5 }).collect()
+    });
+
+    // sin repairs on |x| >= 804.0 (for bit exact reduction)
+    run_density("sin", &|pct| {
+        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
+        (0..n).map(|i| if step > 0 && i % step == 0 { 10000.0 } else { 1.5 }).collect()
+    });
 }

@@ -313,6 +313,33 @@ fn corpus_hyper(seed: u64) -> Vec<f64> {
     v
 }
 
+fn corpus_atanh(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        f64::from_bits(0x3c90000000000000), // 2^-54 tiny
+        -1.0,
+        1.0,
+        0.5,
+        -0.5,
+        0.0,
+        -0.0,
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..800_000 {
+        v.push(rng.uniform(-0.9999, 0.9999));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-1.5, 1.5));
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
 fn corpus_expm1(seed: u64) -> Vec<f64> {
     let mut rng = Rng(seed);
     let mut v = universal();
@@ -1002,6 +1029,16 @@ fn reference_tan_matches_platform_libm() {
 }
 
 #[test]
+fn reference_atanh_matches_rust() {
+    assert_reference(
+        "atanh",
+        &corpus_atanh(0x9E37_79B9_7F4A_7C20),
+        reference::atanh,
+        f64::atanh,
+    );
+}
+
+#[test]
 fn reference_log10_matches_platform_libm() {
     assert_reference(
         "log10",
@@ -1164,6 +1201,12 @@ fn cos_bit_exact_at_every_width() {
 fn tan_bit_exact_at_every_width() {
     let vals = corpus_tan(0x0BAD_C0DE_DEAD_BEEF);
     check_all_widths!("tan", &vals, f64::tan, Tan::new());
+}
+
+#[test]
+fn atanh_bit_exact_at_every_width() {
+    let vals = corpus_atanh(0xFEED_FACE_CAFE_B0BA);
+    check_all_widths!("atanh", &vals, f64::atanh, Atanh::new());
 }
 
 #[test]

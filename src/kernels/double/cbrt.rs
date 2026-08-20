@@ -85,7 +85,7 @@ const K: u64 = 0x553e_f0fe_6100_07d0;
 ///
 /// Measured error: 8 ulp worst case, stable from 100M to 500M samples
 /// (`tests/ulp_scan.rs::scan_cbrt`, against `f64::cbrt` at extreme
-/// magnitudes) — asserted at 16 in `tests/accuracy.rs` for headroom.
+/// magnitudes) — asserted at 8 in `tests/accuracy.rs`.
 ///
 /// Four Newton steps, not `f32`'s three: there is no wider type to run them
 /// in here, so convergence has to clear `f64`'s deeper mantissa on its own.

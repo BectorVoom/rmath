@@ -88,6 +88,8 @@ pub trait Mask: Copy {
     fn not(self) -> Self;
     /// Unpack to booleans, for driving a per-lane fallback.
     fn to_bools(self) -> Self::Bools;
+    /// Bitmask of lanes set (bit `i` is 1 if lane `i` is set).
+    fn to_bitmask(self) -> u32;
 
     /// True if no lane is set.
     #[inline(always)]
@@ -407,13 +409,16 @@ pub fn patch_lanes<V: Simd>(
     if mask.none() {
         return y;
     }
+    if mask.all() {
+        return map_lanes(x, reference);
+    }
     let xs = x.to_array();
     let mut ys = y.to_array();
-    let flags = mask.to_bools();
-    for i in 0..V::LANES {
-        if flags.as_slice()[i] {
-            ys.as_mut_slice()[i] = reference(xs.as_slice()[i]);
-        }
+    let mut bits = mask.to_bitmask();
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        ys.as_mut_slice()[i] = reference(xs.as_slice()[i]);
+        bits &= bits - 1;
     }
     V::from_array(ys)
 }
@@ -430,14 +435,17 @@ pub fn patch_lanes2<V: Simd>(
     if mask.none() {
         return z;
     }
+    if mask.all() {
+        return map_lanes2(x, y, reference);
+    }
     let xs = x.to_array();
     let ys = y.to_array();
     let mut zs = z.to_array();
-    let flags = mask.to_bools();
-    for i in 0..V::LANES {
-        if flags.as_slice()[i] {
-            zs.as_mut_slice()[i] = reference(xs.as_slice()[i], ys.as_slice()[i]);
-        }
+    let mut bits = mask.to_bitmask();
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        zs.as_mut_slice()[i] = reference(xs.as_slice()[i], ys.as_slice()[i]);
+        bits &= bits - 1;
     }
     V::from_array(zs)
 }

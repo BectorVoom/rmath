@@ -39,6 +39,10 @@ impl Mask for bool {
     fn to_bools(self) -> Self::Bools {
         [self]
     }
+    #[inline(always)]
+    fn to_bitmask(self) -> u32 {
+        self as u32
+    }
 }
 
 macro_rules! impl_scalar {
