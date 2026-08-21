@@ -13,6 +13,7 @@ fn test_fast_free_functions_f64() {
     assert!((fast::erf(x) - 0.8427007929497148).abs() < 1e-14);
     assert!((fast::erfc(x) - 0.15729920705028513).abs() < 1e-14);
     assert!((fast::cbrt(27.0_f64) - 3.0).abs() < 1e-14);
+    assert_eq!(fast::abs(-5.0_f64), 5.0_f64);
 
     let (s, c) = fast::sincos(x);
     assert!((s - x.sin()).abs() < 1e-14);

@@ -19,6 +19,15 @@ use crate::simd::Simd;
 // 1-Argument Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `abs(x)`.
+#[inline(always)]
+pub fn abs<V: Simd>(x: V) -> V
+where
+    Abs<Fast, FullRange>: Function<V::Elem>,
+{
+    <Abs<Fast, FullRange> as Function<V::Elem>>::eval(&Abs::default(), x)
+}
+
 /// `acos(x)`, fast approximation.
 #[inline(always)]
 pub fn acos<V: Simd>(x: V) -> V

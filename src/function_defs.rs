@@ -139,6 +139,24 @@ math_fn! {
     /// `sqrt(x)`, correctly rounded.
 }
 
+math_fn! {
+    /// Absolute value, `|x|`.
+    ///
+    /// ```
+    /// use rmath::prelude::*;
+    ///
+    /// let f = Abs::new();
+    /// assert_eq!(f.eval(-5.0_f64), 5.0);
+    /// assert_eq!(f.eval(-5.0_f32), 5.0);
+    /// ```
+    name: Abs,
+    builder: AbsBuilder,
+    free: abs,
+    k64: crate::kernels::exact::abs,
+    k32: crate::kernels::exact::abs,
+    /// `abs(x)`, absolute value.
+}
+
 // ---------------------------------------------------------------------------
 // Exact: rounding, sign and exponent manipulation.
 //

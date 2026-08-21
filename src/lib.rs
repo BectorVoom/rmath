@@ -212,7 +212,7 @@ pub mod simd;
 pub mod tables;
 
 pub use function::{
-    Acos, AcosBuilder, Acosh, AcoshBuilder, Asin, AsinBuilder, Asinh, AsinhBuilder, Atan, Atan2,
+    Abs, AbsBuilder, Acos, AcosBuilder, Acosh, AcoshBuilder, Asin, AsinBuilder, Asinh, AsinhBuilder, Atan, Atan2,
     Atan2Builder, AtanBuilder, Atanh, AtanhBuilder, Cbrt, CbrtBuilder, Ceil, CeilBuilder, CopySign,
     CopySignBuilder, Cos, CosBuilder, Cosh, CoshBuilder, Exp, Exp2, Exp2Builder, ExpBuilder, Expm1,
     Expm1Builder, Floor, FloorBuilder, Fmod, FmodBuilder, Frexp, FrexpBuilder, Function, Function2,
@@ -220,7 +220,7 @@ pub use function::{
     Log1p, Log1pBuilder, Log2, Log2Builder, Log10, Log10Builder, NextAfter, NextAfterBuilder, Pow,
     PowBuilder, Remainder, RemainderBuilder, Round, RoundBuilder, Sin, SinBuilder, SinCos,
     SinCosBuilder, Sinh, SinhBuilder, Sqrt, SqrtBuilder, TGamma, TGammaBuilder, Tan, TanBuilder,
-    Tanh, TanhBuilder, Trunc, TruncBuilder, Widest, WidestF32, acos, acosh, asin, asinh, atan,
+    Tanh, TanhBuilder, Trunc, TruncBuilder, Widest, WidestF32, abs, acos, acosh, asin, asinh, atan,
     atan2, atanh, cbrt, ceil, copysign, cos, cosh, exp, exp2, expm1, floor, fmod, frexp, hypot,
     ldexp, lgamma, ln, log1p, log2, log10, nextafter, pow, remainder, round, sin, sincos, sinh,
     sqrt, tan, tanh, tgamma, trunc,
@@ -242,7 +242,7 @@ pub use simd::{Real, Simd};
 pub mod prelude {
     pub use crate::fast;
     pub use crate::function::{
-        Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Ceil, CopySign, Cos, Cosh, Erf, Erfc,
+        Abs, Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Ceil, CopySign, Cos, Cosh, Erf, Erfc,
         Exp, Exp2, Exp10, Expm1, Fdim, Floor, Fmax, Fmin, Fmod, Frexp, Hypot, Ilogb, J0, J1, Jn,
         LGamma, LGammaR, Ldexp, Ln, Log1p, Log2, Log10, Modf, NextAfter, Pow, Remainder, Remquo,
         Rint, Round, Scalbn, Sin, SinCos, Sinh, Sqrt, TGamma, Tan, Tanh, Trunc, Y0, Y1, Yn,

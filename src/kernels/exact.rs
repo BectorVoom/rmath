@@ -105,6 +105,11 @@ unary_vector! {
     sqrt, |x| x.sqrt()
 }
 
+unary_vector! {
+    /// Absolute value of `x`.
+    abs, |x| x.abs()
+}
+
 /// `x` rounded to the nearest integer, ties away from zero.
 ///
 /// Ties *away*, matching `f64::round` and C's `round` — not the ties-to-even
