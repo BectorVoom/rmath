@@ -1,6 +1,6 @@
 # Speed and precision optimisation plan, cycle 4
 
-Status: draft
+Status: executed
 Prepared: 2026-08-26
 Scope: the optimisation cycle after [`OPTIMIZATION_PLAN_3.md`](OPTIMIZATION_PLAN_3.md)
 (2026-08-25), whose phases were executed in commits `1908e5b` through
