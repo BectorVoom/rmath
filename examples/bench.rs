@@ -279,7 +279,9 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
         "in-domain" => Corpora {
             expargs: (0..n).map(|_| rng.uniform(-20.0, 20.0)).collect(),
             posargs: (0..n).map(|_| rng.uniform(0.1, 100.0)).collect(),
-            angargs: (0..n).map(|_| rng.uniform(-std::f64::consts::PI, std::f64::consts::PI)).collect(),
+            angargs: (0..n)
+                .map(|_| rng.uniform(-std::f64::consts::PI, std::f64::consts::PI))
+                .collect(),
             unitargs: (0..n).map(|_| rng.uniform(-0.9, 0.9)).collect(),
             hypargs: (0..n).map(|_| rng.uniform(-5.0, 5.0)).collect(),
             erfargs: (0..n).map(|_| rng.uniform(-3.0, 3.0)).collect(),
@@ -288,8 +290,20 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
         },
         "boundary" => {
             let special_vals = [
-                0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 1e-15, -1e-15,
-                f64::MIN_POSITIVE, 709.78, -708.39, f64::MAX,
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                0.5,
+                -0.5,
+                2.0,
+                -2.0,
+                1e-15,
+                -1e-15,
+                f64::MIN_POSITIVE,
+                709.78,
+                -708.39,
+                f64::MAX,
             ];
             let build_vec = |rng: &mut Rng, lo: f64, hi: f64| -> Vec<f64> {
                 (0..n)
@@ -330,14 +344,34 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
         }
         "coherent" | "sorted" => {
             let mut c = Corpora {
-                expargs: (0..n).map(|i| -40.0 + 80.0 * (i as f64 / n.max(1) as f64)).collect(),
-                posargs: (0..n).map(|i| ((1e-12f64).ln() + ((1e12f64).ln() - (1e-12f64).ln()) * (i as f64 / n.max(1) as f64)).exp()).collect(),
-                angargs: (0..n).map(|i| -1e4 + 2e4 * (i as f64 / n.max(1) as f64)).collect(),
-                unitargs: (0..n).map(|i| -1.0 + 2.0 * (i as f64 / n.max(1) as f64)).collect(),
-                hypargs: (0..n).map(|i| -20.0 + 40.0 * (i as f64 / n.max(1) as f64)).collect(),
-                erfargs: (0..n).map(|i| -6.0 + 12.0 * (i as f64 / n.max(1) as f64)).collect(),
-                erfcargs: (0..n).map(|i| -6.0 + 31.0 * (i as f64 / n.max(1) as f64)).collect(),
-                besselargs: (0..n).map(|i| 60.0 * (i as f64 / n.max(1) as f64)).collect(),
+                expargs: (0..n)
+                    .map(|i| -40.0 + 80.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                posargs: (0..n)
+                    .map(|i| {
+                        ((1e-12f64).ln()
+                            + ((1e12f64).ln() - (1e-12f64).ln()) * (i as f64 / n.max(1) as f64))
+                            .exp()
+                    })
+                    .collect(),
+                angargs: (0..n)
+                    .map(|i| -1e4 + 2e4 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                unitargs: (0..n)
+                    .map(|i| -1.0 + 2.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                hypargs: (0..n)
+                    .map(|i| -20.0 + 40.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                erfargs: (0..n)
+                    .map(|i| -6.0 + 12.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                erfcargs: (0..n)
+                    .map(|i| -6.0 + 31.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
+                besselargs: (0..n)
+                    .map(|i| 60.0 * (i as f64 / n.max(1) as f64))
+                    .collect(),
             };
             c.expargs.sort_by(|a, b| a.total_cmp(b));
             c.posargs.sort_by(|a, b| a.total_cmp(b));
@@ -351,8 +385,14 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
         }
         "special" | "mixed-special" => {
             let specials = [
-                0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
-                f64::MIN_POSITIVE * 0.25, f64::MAX, -f64::MAX,
+                0.0,
+                -0.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                f64::MIN_POSITIVE * 0.25,
+                f64::MAX,
+                -f64::MAX,
             ];
             let build_vec = |rng: &mut Rng, lo: f64, hi: f64| -> Vec<f64> {
                 (0..n)
@@ -466,7 +506,13 @@ fn main() {
         row!("atanh", &corpora.unitargs, &mut dst, f64::atanh, Atanh);
 
         header();
-        row!("exp10", &corpora.expargs, &mut dst, |x| libm::exp10(x), Exp10);
+        row!(
+            "exp10",
+            &corpora.expargs,
+            &mut dst,
+            |x| libm::exp10(x),
+            Exp10
+        );
         row!("erf", &corpora.erfargs, &mut dst, |x| libm::erf(x), Erf);
         row!("erfc", &corpora.erfcargs, &mut dst, |x| libm::erfc(x), Erfc);
 
@@ -737,7 +783,15 @@ fn traversal_benchmarks() {
     println!("\ntraversal and buffer shapes (ns/elem)");
     println!(
         "{:<30} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "workload", "len=0", "len=1", "len=lanes-1", "len=lanes", "len=lanes+1", "len=64", "len=4096", "len=65536"
+        "workload",
+        "len=0",
+        "len=1",
+        "len=lanes-1",
+        "len=lanes",
+        "len=lanes+1",
+        "len=64",
+        "len=4096",
+        "len=65536"
     );
     println!("{}", "-".repeat(102));
 
@@ -780,7 +834,10 @@ fn traversal_benchmarks() {
     };
 
     let bench_lens = |name: &str, mut make_runner: Box<dyn FnMut(usize) -> Box<dyn FnMut()>>| {
-        let times: Vec<f64> = lens.iter().map(|&len| time_iters(len, make_runner(len))).collect();
+        let times: Vec<f64> = lens
+            .iter()
+            .map(|&len| time_iters(len, make_runner(len)))
+            .collect();
         println!(
             "{:<30} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
             name, times[0], times[1], times[2], times[3], times[4], times[5], times[6], times[7]
@@ -791,121 +848,157 @@ fn traversal_benchmarks() {
     };
 
     // Identity floor benchmarks
-    bench_lens("identity_unary", Box::new(|len| {
-        let src = vec![1.5f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            identity.eval_slice(&src, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_unary",
+        Box::new(|len| {
+            let src = vec![1.5f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                identity.eval_slice(&src, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("identity_in_place", Box::new(|len| {
-        let mut buf = vec![1.5f64; len];
-        Box::new(move || {
-            identity.eval_in_place(&mut buf);
-            std::hint::black_box(buf.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_in_place",
+        Box::new(|len| {
+            let mut buf = vec![1.5f64; len];
+            Box::new(move || {
+                identity.eval_in_place(&mut buf);
+                std::hint::black_box(buf.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("identity_binary", Box::new(|len| {
-        let a = vec![2.0f64; len];
-        let b = vec![3.0f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            identity2.eval_slice(&a, &b, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_binary",
+        Box::new(|len| {
+            let a = vec![2.0f64; len];
+            let b = vec![3.0f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                identity2.eval_slice(&a, &b, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("identity_scalar_second", Box::new(|len| {
-        let a = vec![2.0f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            identity2.eval_slice_scalar(&a, 3.0, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_scalar_second",
+        Box::new(|len| {
+            let a = vec![2.0f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                identity2.eval_slice_scalar(&a, 3.0, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("identity_pair", Box::new(|len| {
-        let src = vec![1.0f64; len];
-        let mut d1 = vec![0.0f64; len];
-        let mut d2 = vec![0.0f64; len];
-        Box::new(move || {
-            identity_pair.eval_slice(&src, &mut d1, &mut d2);
-            std::hint::black_box(d1.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_pair",
+        Box::new(|len| {
+            let src = vec![1.0f64; len];
+            let mut d1 = vec![0.0f64; len];
+            let mut d2 = vec![0.0f64; len];
+            Box::new(move || {
+                identity_pair.eval_slice(&src, &mut d1, &mut d2);
+                std::hint::black_box(d1.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("identity_2pair", Box::new(|len| {
-        let a = vec![1.0f64; len];
-        let b = vec![2.0f64; len];
-        let mut d1 = vec![0.0f64; len];
-        let mut d2 = vec![0.0f64; len];
-        Box::new(move || {
-            identity_2pair.eval_slice(&a, &b, &mut d1, &mut d2);
-            std::hint::black_box(d1.first().copied());
-        })
-    }));
+    bench_lens(
+        "identity_2pair",
+        Box::new(|len| {
+            let a = vec![1.0f64; len];
+            let b = vec![2.0f64; len];
+            let mut d1 = vec![0.0f64; len];
+            let mut d2 = vec![0.0f64; len];
+            Box::new(move || {
+                identity_2pair.eval_slice(&a, &b, &mut d1, &mut d2);
+                std::hint::black_box(d1.first().copied());
+            })
+        }),
+    );
 
     // Real kernels
-    bench_lens("sqrt_unary", Box::new(|len| {
-        let src = vec![4.0f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            sqrt.eval_slice(&src, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "sqrt_unary",
+        Box::new(|len| {
+            let src = vec![4.0f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                sqrt.eval_slice(&src, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("floor_unary", Box::new(|len| {
-        let src = vec![4.5f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            floor.eval_slice(&src, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "floor_unary",
+        Box::new(|len| {
+            let src = vec![4.5f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                floor.eval_slice(&src, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("exp_unary", Box::new(|len| {
-        let src = vec![1.5f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            exp.eval_slice(&src, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "exp_unary",
+        Box::new(|len| {
+            let src = vec![1.5f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                exp.eval_slice(&src, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("pow_binary", Box::new(|len| {
-        let a = vec![2.0f64; len];
-        let b = vec![3.0f64; len];
-        let mut dst = vec![0.0f64; len];
-        Box::new(move || {
-            pow.eval_slice(&a, &b, &mut dst);
-            std::hint::black_box(dst.first().copied());
-        })
-    }));
+    bench_lens(
+        "pow_binary",
+        Box::new(|len| {
+            let a = vec![2.0f64; len];
+            let b = vec![3.0f64; len];
+            let mut dst = vec![0.0f64; len];
+            Box::new(move || {
+                pow.eval_slice(&a, &b, &mut dst);
+                std::hint::black_box(dst.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("sincos_pair", Box::new(|len| {
-        let src = vec![1.0f64; len];
-        let mut d1 = vec![0.0f64; len];
-        let mut d2 = vec![0.0f64; len];
-        Box::new(move || {
-            sincos.eval_slice(&src, &mut d1, &mut d2);
-            std::hint::black_box(d1.first().copied());
-        })
-    }));
+    bench_lens(
+        "sincos_pair",
+        Box::new(|len| {
+            let src = vec![1.0f64; len];
+            let mut d1 = vec![0.0f64; len];
+            let mut d2 = vec![0.0f64; len];
+            Box::new(move || {
+                sincos.eval_slice(&src, &mut d1, &mut d2);
+                std::hint::black_box(d1.first().copied());
+            })
+        }),
+    );
 
-    bench_lens("remquo_2pair", Box::new(|len| {
-        let a = vec![5.0f64; len];
-        let b = vec![2.0f64; len];
-        let mut d1 = vec![0.0f64; len];
-        let mut d2 = vec![0.0f64; len];
-        Box::new(move || {
-            remquo.eval_slice(&a, &b, &mut d1, &mut d2);
-            std::hint::black_box(d1.first().copied());
-        })
-    }));
+    bench_lens(
+        "remquo_2pair",
+        Box::new(|len| {
+            let a = vec![5.0f64; len];
+            let b = vec![2.0f64; len];
+            let mut d1 = vec![0.0f64; len];
+            let mut d2 = vec![0.0f64; len];
+            Box::new(move || {
+                remquo.eval_slice(&a, &b, &mut d1, &mut d2);
+                std::hint::black_box(d1.first().copied());
+            })
+        }),
+    );
 }
 
 fn repair_benchmarks(n: usize) {
@@ -975,43 +1068,109 @@ fn repair_benchmarks(n: usize) {
 
     // exp repairs on x > 709.7 or x < -745.0 or NaN
     run_density("exp", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { 750.0 } else { 1.5 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| {
+                if step > 0 && i % step == 0 {
+                    750.0
+                } else {
+                    1.5
+                }
+            })
+            .collect()
     });
 
     // erf repairs on |x| >= 6.0 or special
     run_density("erf", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { 10.0 } else { 1.5 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| if step > 0 && i % step == 0 { 10.0 } else { 1.5 })
+            .collect()
     });
 
     // sin repairs on |x| >= 804.0 (for bit exact reduction)
     run_density("sin", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { 10000.0 } else { 1.5 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| {
+                if step > 0 && i % step == 0 {
+                    10000.0
+                } else {
+                    1.5
+                }
+            })
+            .collect()
     });
 
     // pow repairs on non-normal/extreme
     run_density("pow", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { f64::NAN } else { 2.0 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| {
+                if step > 0 && i % step == 0 {
+                    f64::NAN
+                } else {
+                    2.0
+                }
+            })
+            .collect()
     });
 
     // atan2 repairs on zero/infinite/NaN
     run_density("atan2", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { 0.0 } else { 2.0 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| if step > 0 && i % step == 0 { 0.0 } else { 2.0 })
+            .collect()
     });
 
     // sincos repairs on large angles
     run_density("sincos", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { 1e8 } else { 1.5 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| if step > 0 && i % step == 0 { 1e8 } else { 1.5 })
+            .collect()
     });
 
     // modf repairs on inf/nan
     run_density("modf", &|pct| {
-        let step = if pct <= 0.0 { usize::MAX } else { (1.0 / pct).round() as usize };
-        (0..n).map(|i| if step > 0 && i % step == 0 { f64::INFINITY } else { 1.5 }).collect()
+        let step = if pct <= 0.0 {
+            usize::MAX
+        } else {
+            (1.0 / pct).round() as usize
+        };
+        (0..n)
+            .map(|i| {
+                if step > 0 && i % step == 0 {
+                    f64::INFINITY
+                } else {
+                    1.5
+                }
+            })
+            .collect()
     });
 }
