@@ -126,8 +126,8 @@ def main() -> int:
                         "cmd": cmd,
                     })
 
-    # Check for exact > fast inversions
-    print("\nChecking for exact > fast inversions across matrix runs...")
+    # Check for exact > fast inversions and Finite < FullRange inversions
+    print("\nChecking for inversions across matrix runs...")
     inversions = 0
     for r in runs:
         if r["suite"] != "default":
@@ -150,14 +150,35 @@ def main() -> int:
                 exact_spd = m_map["exact"]
                 fast_spd = m_map["fast"]
                 # Exclude hardware instructions (sqrt) or within 5% noise margin
-                if fn not in ("sqrt", "sqrtf", "floor", "trunc", "round") and exact_spd > fast_spd * 1.05:
+                if fn not in ("sqrt", "sqrtf", "floor", "trunc", "round", "abs", "ceil") and exact_spd > fast_spd * 1.05:
                     print(
-                        f"  [INVERSION] {fn} on corpus='{r['corpus']}', size={r['size']}: "
+                        f"  [INVERSION exact > fast] {fn} on corpus='{r['corpus']}', size={r['size']}: "
                         f"exact {exact_spd:.2f}x > fast {fast_spd:.2f}x (artifact or coherence bypass)"
                     )
                     inversions += 1
+
+            # Check if Finite is unexpectedly slower than FullRange by > 10%
+            if fn not in ("sqrt", "sqrtf", "floor", "trunc", "round", "abs", "ceil"):
+                if "exact" in m_map and "exact/F" in m_map:
+                    exact_spd = m_map["exact"]
+                    exact_f_spd = m_map["exact/F"]
+                    if exact_f_spd < exact_spd * 0.90:
+                        print(
+                            f"  [INVERSION Finite < FullRange] {fn} (exact) on corpus='{r['corpus']}', size={r['size']}: "
+                            f"exact/F {exact_f_spd:.2f}x < exact {exact_spd:.2f}x (wiring bug or adversarial noise)"
+                        )
+                        inversions += 1
+                if "fast" in m_map and "fast/F" in m_map:
+                    fast_spd = m_map["fast"]
+                    fast_f_spd = m_map["fast/F"]
+                    if fast_f_spd < fast_spd * 0.90:
+                        print(
+                            f"  [INVERSION Finite < FullRange] {fn} (fast) on corpus='{r['corpus']}', size={r['size']}: "
+                            f"fast/F {fast_f_spd:.2f}x < fast {fast_spd:.2f}x (wiring bug or adversarial noise)"
+                        )
+                        inversions += 1
     if inversions == 0:
-        print("  No unexpected exact > fast inversions found.")
+        print("  No unexpected inversions found.")
 
     manifest = {
         "commit": commit,

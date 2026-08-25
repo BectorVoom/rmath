@@ -1121,6 +1121,12 @@ widening whenever the f64 kernel does more than the f32 result needs.
     is 98% memory bandwidth traversal rather than kernel arithmetic. Closed with Documented Accept in README
     explaining parity at 4096 (~1.00–1.08x) and memory bandwidth ceiling at 1M (~0.73x–1.05x). Rewrote `src/function.rs`
     slice traversal loops into direct index stepping.
+  - **Cycle 3 S3: Repair path on boundary corpus & extended inversion diagnostics (`bench_matrix.py`).**
+    Attributed `exp2` boundary corpus throughput (0.57x exact, 0.95x `Fast/FullRange` vs 3.72x `Fast/Finite`)
+    to the fact that the adversarial `[-700, 700]` boundary corpus places ~27% of lane inputs in `|x| >= 512`,
+    causing ~92% of 8-lane SIMD vectors to trip the `outside(x, 512.0)` repair mask and invoke scalar repair.
+    Closed with corpus-annotated Documented Accept. Extended `tools/bench_matrix.py` to check and report both
+    `exact > fast` and `Finite < FullRange` inversions across all matrix runs.
 
 ## 7. Suggested sequencing
 
