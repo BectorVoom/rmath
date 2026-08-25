@@ -842,6 +842,71 @@ fn corpus_pow(seed: u64) -> (Vec<f64>, Vec<f64>) {
     (xs, ys)
 }
 
+/// `asinh`'s bands: 0.0, tiny cutoff (2^-60 scaling), the four polynomial
+/// thresholds, the small/table boundary, 1.0, the large-argument threshold,
+/// the huge cutoff, and inf/nan specials.
+fn corpus_asinh(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        0.0,
+        f64::from_bits(0x3e57137449123ef7), // tiny cutoff: (-2^-60).mul_add(x, x)
+        f64::from_bits(0x3e5a000000000000), // poly band 1 / 2
+        f64::from_bits(0x3f30000000000000), // poly band 2 / 3
+        f64::from_bits(0x3f93000000000000), // poly band 3 / 4
+        f64::from_bits(0x3fbb000000000000), // poly / table log-tail boundary
+        f64::from_bits(0x3ff0000000000000), // 1.0
+        f64::from_bits(0x4190000000000000), // table / large
+        f64::from_bits(0x4330000000000000), // large / huge
+        f64::from_bits(0x7ff0000000000000), // inf
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-10.0, 10.0));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.log_uniform(1e-300, 1e300, true));
+    }
+    for _ in 0..200_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
+/// `acosh`'s bands: 1.0, the near-1 z-series cutoff, the five table / polynomial
+/// band thresholds, and inf/nan specials.
+fn corpus_acosh(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        1.0,
+        f64::from_bits(0x3ff0000000000000), // 1.0
+        f64::from_bits(0x3ff1e83e425aee63), // near-1 z-series / table band 1
+        f64::from_bits(0x405bf00000000000), // table band 1 / 2
+        f64::from_bits(0x4087100000000000), // table band 2 / 3
+        f64::from_bits(0x40e0100000000000), // table band 3 / 4
+        f64::from_bits(0x41ea000000000000), // table band 4 / 5
+        f64::from_bits(0x7ff0000000000000), // inf
+    ] {
+        v.extend(around(c));
+    }
+    for _ in 0..200_000 {
+        v.push(rng.uniform(1.0, 1.1)); // dense near 1.0 singular boundary
+    }
+    for _ in 0..400_000 {
+        v.push(rng.log_uniform(1.0, 1e300, false));
+    }
+    for _ in 0..200_000 {
+        v.push(rng.uniform(1.0, 100.0));
+    }
+    for _ in 0..200_000 {
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
 fn assert_reference(
     name: &str,
     vals: &[f64],
@@ -1255,6 +1320,18 @@ fn tanh_bit_exact_at_every_width() {
 fn pow_bit_exact_at_every_width() {
     let (xs, ys) = corpus_pow(0x5DEE_CE66_D1B5_4A3B);
     check_all_widths2!("pow", &xs, &ys, f64::powf, Pow::new());
+}
+
+#[test]
+fn asinh_bit_exact_at_every_width() {
+    let vals = corpus_asinh(0x5DEE_CE66_D1B5_4A3C);
+    check_all_widths!("asinh", &vals, f64::asinh, Asinh::new());
+}
+
+#[test]
+fn acosh_bit_exact_at_every_width() {
+    let vals = corpus_acosh(0x5DEE_CE66_D1B5_4A3D);
+    check_all_widths!("acosh", &vals, f64::acosh, Acosh::new());
 }
 
 /// `sincos` must agree with `sin`/`cos` taken separately at every width — the

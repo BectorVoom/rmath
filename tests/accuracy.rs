@@ -288,14 +288,9 @@ fn fast_exponentials_stay_within_bounds() {
     check("exp2", 28, 2.0, e, fast!(Exp2), f64::exp2);
 }
 
-/// `cbrt`'s `Fast` policy used to be a no-op — `BitExact` and `Fast` ran the
-/// same correctly-rounded algorithm, deliberately (see the module doc's
-/// history). This is its first divergent bound: a native seed-plus-Newton
-/// kernel with no double-double step, measured at 8 ulp worst case, stable
-/// from 100M to 500M samples at extreme magnitudes
-/// (`tests/ulp_scan.rs::scan_cbrt`) — looser than most `Fast` bounds in this
-/// file because there is no wider type to widen into and refine `r` in, the
-/// way the `f32` kernel does; see `src/kernels/double/cbrt.rs::fast` for why.
+/// `cbrt`'s `Fast` policy: a native seed-plus-Newton kernel with FMA residual
+/// compensation, measured at 1 ulp worst case, stable from 100M to 500M samples
+/// at extreme magnitudes (`tests/ulp_scan.rs::scan_cbrt`), asserted at 4 ulp.
 #[test]
 fn fast_cbrt_stays_within_bounds() {
     check(

@@ -165,7 +165,7 @@ test, and the guarantee becomes yours to keep.
 `Fast`'s bound is per function, measured against the platform and asserted in
 `tests/accuracy.rs`, so a kernel change that loosens one fails the build rather
 than quietly invalidating this file. Most are within **4 ulp** — including the
-whole inverse trigonometric family, `asin` through `atan2`; `asinh` and `pow`
+whole inverse trigonometric family, `asin` through `atan2`, and `cbrt`; `asinh` and `pow`
 are within **8**. `pow` is the function that has to work for that number — `y`
 multiplies the error in
 `log2 x` as well as its value, so its table-free logarithm is carried in
@@ -439,15 +439,13 @@ Known limitations, in rough order of how much they would be missed:
 - **`lgamma` on the negative half-line** is a difference of comparable terms
   near its zeros, where relative error is unbounded for any implementation. The
   bound there is stated as absolute (below 1e-12), not relative.
-- **`tgamma` above 18** is `exp(lgamma(x))`, with `lgamma` carried in
-  double-double so the value handed to `exp` is the correctly rounded `f64`
-  nearest the truth — verified against the platform's own `lgamma` exactly.
-  What is left (measured at 512-513 ulp near the overflow threshold, down
-  from over 2000) is not fixable by computing harder: composing through any
-  single correctly-rounded logarithm before exponentiating discards
-  information the true value carried, and glibc's own `tgamma` is provably
-  not `exp` of its own correctly-rounded `lgamma` either. Below 18 the
-  recurrence reaches `[1, 2]` directly and it is within 16.
+- **`tgamma` above 18** uses `stirling_dd` to compute `ln(Gamma(x))` in
+  double-double, passing `(hi, lo)` directly to the vectorised `pow_exp`
+  kernel — keeping the high precision all the way through exponentiation
+  rather than compressing to single `f64` beforehand. Measured at **<= 2 ulp**
+  for large arguments and **<= 1 ulp** near the overflow threshold over 100M
+  samples (`tests/ulp_scan.rs::scan_gamma`). Below 18 the recurrence reaches
+  `[1, 2]` directly.
 - **The single-precision Bessel functions are scalar under `BitExact`.** glibc
   repairs them near each zero with one of 64 tabulated polynomials, and beyond
   the 64th zero with an asymptotic form behind a 192-bit Payne-Hanek

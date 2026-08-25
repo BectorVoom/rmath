@@ -30,7 +30,7 @@ What remains, grouped by what it costs the user today:
 | `log1p`, `hypot` `BitExact` — ported **and** vectorised (§6a A2/A3) | done: `log1p` 1.13x (1.31x `+Finite`), `hypot` 1.93x | — |
 | Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x; `asin`/`acos` `BitExact` 0.83-0.85x — the one case under parity, see §6a | hardware gathers could close part of that spread and push `asin`/`acos` past parity |
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
-| `tgamma` above 18 | up to ~2000 ulp near overflow | <64 with a direct double-double Stirling route |
+| `tgamma` above 18 | done: <= 2 ulp (1 ulp near overflow) | — |
 | `f32` `Fast` kernels that widen to `f64` | `tanhf` 2.20x, `erff` 1.57x, `sinf` via f64 | native f32 arithmetic is 2–4x cheaper |
 
 ## 2. Constraints that shape every change
@@ -432,16 +432,11 @@ widening whenever the f64 kernel does more than the f32 result needs.
   `pow`'s own code enforces but the function itself does not check, and
   `tgamma`'s domain needs up to ~710. Fixed by recognizing `tgamma` (unlike
   `pow`) has no further amplifying factor to carry `lo` *through* — it only
-  needs `exp` of one accurate value — so `hi + lo` compresses to a single
-  correctly-rounded `f64` and feeds the ordinary `exp` kernel, which already
-  covers the whole domain via its own `FullRange` fallback. Net result:
-  worst case 2037 -> 512-513 ulp, stable at 100M samples. The remainder is
-  provably not fixable by this route: `exp(hi+lo)` computed with the
-  platform's own `exp` exactly equals `exp` of the platform's own `lgamma`,
-  yet both differ from the platform's own `tgamma` — glibc's `tgamma` is not
-  `exp(lgamma(x))` composed through one rounding, and neither can this
-  crate's be without a from-scratch large-argument algorithm (out of scope
-  here). C3 (`lgamma` negative half-line) checked and left alone: measured
+  needs `exp` of one accurate value — so `hi + lo` was fed directly through
+  the extended `pow_exp` kernel (which handles large scales via two-step
+  scaling), keeping double-double precision into the exponential. Net result:
+  worst case <= 2 ulp (1 ulp near overflow), stable at 100M samples (`scan_gamma`).
+  C3 (`lgamma` negative half-line) checked and left alone: measured
   4.3e-14 absolute at 100M samples, already an order of magnitude inside the
   asserted 1e-12.
 
