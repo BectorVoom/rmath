@@ -1127,6 +1127,16 @@ widening whenever the f64 kernel does more than the f32 result needs.
     causing ~92% of 8-lane SIMD vectors to trip the `outside(x, 512.0)` repair mask and invoke scalar repair.
     Closed with corpus-annotated Documented Accept. Extended `tools/bench_matrix.py` to check and report both
     `exact > fast` and `Finite < FullRange` inversions across all matrix runs.
+  - **Cycle 3 S5: `acosh` coherent corpus regression resolution.**
+    Added a band-uniform bypass for `is_b1` (`[1.087, 7000.0)` vs `[7000.0, inf)`) inside `bands_1_to_5`.
+    When all lanes land in Bands 2..5 (the coherent corpus regime), the kernel skips `wh.sqrt()` and the two
+    vector divisions entirely, lifting coherent corpus throughput from 0.82x to 1.22x (`+Finite`) / 0.87x exact,
+    while in-domain throughput remains strong at 2.07x exact / 7.62x fast.
+  - **Cycle 3 P2: `pow` extreme-exponent corpus (8 asserted / 5 measured).**
+    Added the second-order `pl_ln2` correction term `pl_ln2.mul_add(pl_ln2 * 0.5, pl_ln2)` to `pow::fast`'s
+    exponential combine. Verified at 10M samples in `scan_pow` (2 ulp on wide/moderate/near-1-big-y, 5 ulp
+    on extreme exponent) with 8 ulp asserted headroom, with `pow` measuring 1.94x exact / 2.73x fast and
+    no degradation to `tgamma` (10.20x).
 
 ## 7. Suggested sequencing
 

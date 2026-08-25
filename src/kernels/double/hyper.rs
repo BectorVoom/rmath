@@ -562,35 +562,58 @@ pub mod acosh {
     fn bands_1_to_5<V: Simd<Elem = f64>>(x: V) -> (V, V::Mask) {
         let one = V::splat(1.0);
         let x_bits = x.to_bits();
-
-        // Band 1: [1.087, 7000.0)
         let x2h = x * x;
-        let wh = x2h - one;
-        let wl = x.mul_add(x, -x2h);
-        let sh = wh.sqrt();
-        let ish = V::splat(0.5) / wh;
-        let sl = (wl - sh.mul_add(sh, -wh)) * (sh * ish);
-        let th = x + sh;
-        let tl = sh - (th - x) + sl;
-        let g1 = tl / th;
-        let th_bits = th.to_bits();
-
-        // Bands 2..5 polynomials on z = 1 / (x * x)
-        let z = one / x2h;
-        let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
-        let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
-        let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
-        let g5 = V::splat(0.0);
-
-        let is_b2 = x.lt_mask(V::splat(f64::from_bits(BAND2_CUTOFF)));
-        let is_b3 = x.lt_mask(V::splat(f64::from_bits(BAND3_CUTOFF)));
-        let is_b4 = x.lt_mask(V::splat(f64::from_bits(BAND4_CUTOFF)));
-        let g_high = V::select(is_b4, g4, g5);
-        let g_mid = V::select(is_b3, g3, g_high);
-        let g_poly = V::select(is_b2, g2, g_mid);
 
         let is_b1 = x.lt_mask(V::splat(f64::from_bits(BAND1_CUTOFF)));
-        let g = V::select(is_b1, g1, g_poly);
+        let (th, g) = if is_b1.all() {
+            let wh = x2h - one;
+            let wl = x.mul_add(x, -x2h);
+            let sh = wh.sqrt();
+            let ish = V::splat(0.5) / wh;
+            let sl = (wl - sh.mul_add(sh, -wh)) * (sh * ish);
+            let th = x + sh;
+            let tl = sh - (th - x) + sl;
+            let g1 = tl / th;
+            (th, g1)
+        } else if is_b1.none() {
+            let z = one / x2h;
+            let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
+            let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
+            let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
+            let g5 = V::splat(0.0);
+
+            let is_b2 = x.lt_mask(V::splat(f64::from_bits(BAND2_CUTOFF)));
+            let is_b3 = x.lt_mask(V::splat(f64::from_bits(BAND3_CUTOFF)));
+            let is_b4 = x.lt_mask(V::splat(f64::from_bits(BAND4_CUTOFF)));
+            let g_high = V::select(is_b4, g4, g5);
+            let g_mid = V::select(is_b3, g3, g_high);
+            let g_poly = V::select(is_b2, g2, g_mid);
+            (x, g_poly)
+        } else {
+            let wh = x2h - one;
+            let wl = x.mul_add(x, -x2h);
+            let sh = wh.sqrt();
+            let ish = V::splat(0.5) / wh;
+            let sl = (wl - sh.mul_add(sh, -wh)) * (sh * ish);
+            let th = x + sh;
+            let tl = sh - (th - x) + sl;
+            let g1 = tl / th;
+
+            let z = one / x2h;
+            let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
+            let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
+            let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
+            let g5 = V::splat(0.0);
+
+            let is_b2 = x.lt_mask(V::splat(f64::from_bits(BAND2_CUTOFF)));
+            let is_b3 = x.lt_mask(V::splat(f64::from_bits(BAND3_CUTOFF)));
+            let is_b4 = x.lt_mask(V::splat(f64::from_bits(BAND4_CUTOFF)));
+            let g_high = V::select(is_b4, g4, g5);
+            let g_mid = V::select(is_b3, g3, g_high);
+            let g_poly = V::select(is_b2, g2, g_mid);
+            (th, V::select(is_b1, g1, g_poly))
+        };
+        let th_bits = th.to_bits();
 
         let mut t_val_arr = V::Bits::filled_default();
         let mut ed_arr = V::Floats::filled_default();

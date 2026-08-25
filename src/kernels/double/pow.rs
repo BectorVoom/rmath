@@ -320,8 +320,9 @@ fn fast<V: Simd<Elem = f64>>(x: V, y: V) -> V {
     let ph = y * lhi;
     let pl = y.mul_add(lhi, -ph) + y * llo;
 
-    // 2^(ph + pl) = 2^ph * (1 + pl ln2 + ...). `|pl|` is below an ulp of `ph`,
-    // so the first-order term is enough to carry the low part back.
+    // 2^(ph + pl) = 2^ph * (1 + pl ln2 + 0.5 (pl ln2)^2 + ...).
+    let pl_ln2 = pl * V::splat(core::f64::consts::LN_2);
+    let corr = pl_ln2.mul_add(pl_ln2 * V::splat(0.5), pl_ln2);
     let s = exp2::eval::<V, Fast, Finite>(ph);
-    s.mul_add(pl * V::splat(core::f64::consts::LN_2), s)
+    s.mul_add(corr, s)
 }
