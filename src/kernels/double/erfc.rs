@@ -52,24 +52,30 @@ const ASYMPT_MAX: f64 = f64::from_bits(0x4039db1bb14e15ca);
 /// `erfc(x)` for a vector of lanes.
 #[inline(always)]
 pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-    let (h, l, err) = fast(x);
-
-    if !A::BIT_EXACT {
-        let y = h + l;
-        return if D::CHECKED {
-            patch_lanes(x, y, outside(x), reference)
-        } else {
-            y
-        };
-    }
-
-    let left = h + (l - err);
-    let right = h + (l + err);
-    let mut repair = left.eq_mask(right).not();
     if D::CHECKED {
-        repair = repair.or(outside(x));
+        let out = outside(x);
+        if out.all() {
+            return crate::simd::map_lanes(x, reference);
+        }
+        let (h, l, err) = fast(x);
+        if !A::BIT_EXACT {
+            return patch_lanes(x, h + l, out, reference);
+        }
+        let left = h + (l - err);
+        let right = h + (l + err);
+        let repair = left.eq_mask(right).not().or(out);
+        return patch_lanes(x, left, repair, reference);
     }
-    patch_lanes(x, left, repair, reference)
+
+    let (h, l, err) = fast(x);
+    if !A::BIT_EXACT {
+        h + l
+    } else {
+        let left = h + (l - err);
+        let right = h + (l + err);
+        let repair = left.eq_mask(right).not();
+        patch_lanes(x, left, repair, reference)
+    }
 }
 
 /// Lanes outside the fast path's range, and NaN.

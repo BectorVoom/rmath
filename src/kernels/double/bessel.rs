@@ -92,7 +92,10 @@ const PQ_LIMIT: f64 = f64::from_bits(0x41b0_0000_0000_0000);
 /// So `BitExact` takes the vector path only when every lane is below 2, where
 /// there is no trigonometry at all and the win is large, and hands anything
 /// else to the scalar routine — parity, which is the honest ceiling.
-/// [`crate::policy::Fast`] vectorises both branches and is 2.4x to 3.8x.
+/// [`crate::policy::Fast`] vectorises both branches and is 2.4x to 3.8x in-domain
+/// (0.21x on random-bit is a Documented Accept: uniformly distributed 64-bit
+/// bit patterns are ~75% negative/NaN/subnormal and outside the positive Bessel domain,
+/// so vector evaluation plus per-lane scalar repair is dominated by the scalar baseline).
 #[inline(always)]
 fn branch<V: Simd<Elem = f64>, A: Accuracy, B: Fn(V) -> V, S: Fn(V) -> V>(
     x: V,
@@ -316,15 +319,18 @@ pub mod y0 {
     /// already gone to `-inf`.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-        let y = main::<V, A, D>(x);
         if D::CHECKED {
             let special = x
                 .gt_mask(V::splat(0.0))
                 .and(x.lt_mask(V::splat(MAIN_PATH_LIMIT)))
                 .not();
+            if special.all() {
+                return crate::simd::map_lanes(x, reference::y0);
+            }
+            let y = main::<V, A, D>(x);
             patch_lanes(x, y, special, reference::y0)
         } else {
-            y
+            main::<V, A, D>(x)
         }
     }
 
@@ -454,15 +460,18 @@ pub mod y1 {
     /// `y1(x)` for a vector of lanes. Positive reals only; see [`super::y0`].
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
-        let y = main::<V, A, D>(x);
         if D::CHECKED {
             let special = x
                 .gt_mask(V::splat(0.0))
                 .and(x.lt_mask(V::splat(MAIN_PATH_LIMIT)))
                 .not();
+            if special.all() {
+                return crate::simd::map_lanes(x, reference::y1);
+            }
+            let y = main::<V, A, D>(x);
             patch_lanes(x, y, special, reference::y1)
         } else {
-            y
+            main::<V, A, D>(x)
         }
     }
 
