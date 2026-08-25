@@ -38,7 +38,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE = "https://raw.githubusercontent.com/ARM-software/optimized-routines/master/math"
+ARM_COMMIT = "67126040cf80f956676fbf473c2d9bebdb475283"
+BASE = f"https://raw.githubusercontent.com/ARM-software/optimized-routines/{ARM_COMMIT}/math"
 
 # The `#if` environment the C build would have for the double-precision,
 # N = 128 configuration. Both double tables are selected by these.
@@ -597,7 +598,8 @@ TARGETS = [
 # `N`-style build-time parameter, unlike `exp_data.c`/`log_data.c`.
 # --------------------------------------------------------------------------
 
-GLIBC_BASE = "https://raw.githubusercontent.com/bminor/glibc/master/sysdeps/ieee754/dbl-64"
+GLIBC_COMMIT = "04e750e75b73957cf1c791535a3f4319534a52fc"
+GLIBC_BASE = f"https://raw.githubusercontent.com/bminor/glibc/{GLIBC_COMMIT}/sysdeps/ieee754/dbl-64"
 
 TRIG_HEADER = """\
 //! {title}

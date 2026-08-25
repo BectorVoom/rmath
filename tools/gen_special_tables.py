@@ -34,7 +34,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE = "https://raw.githubusercontent.com/bminor/glibc/master/sysdeps/ieee754"
+GLIBC_COMMIT = "04e750e75b73957cf1c791535a3f4319534a52fc"
+BASE = f"https://raw.githubusercontent.com/bminor/glibc/{GLIBC_COMMIT}/sysdeps/ieee754"
 
 FILES = {
     "s_erf_data.c": "dbl-64",
