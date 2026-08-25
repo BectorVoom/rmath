@@ -1101,6 +1101,19 @@ widening whenever the f64 kernel does more than the f32 result needs.
     `pow_exp` were paying cost on every `pow` call. Hoisted behind a whole-vector
     `kd.gt_mask(...)` guard, eliminating the per-lane comparison overhead for ordinary inputs.
     Moved `pow` exact from 1.47x to **1.84x**.
+  - **Cycle 3 S1: `exp2` exact throughput gap diagnosis.**
+    Documented that the 1.72x (`exp2`) vs 3.02x (`exp`) ratio gap is driven by:
+    (1) scalar glibc `exp2` baseline being 1.62 ns vs `exp`'s 2.17 ns (34% faster scalar baseline);
+    (2) glibc's `exp2` having no `_fma` ifunc on x86-64, forcing the bit-exact vector kernel
+    to execute 14 separate unfused ops (8 muls, 6 adds; ~1.01 ns/elem) instead of 7 fused FMAs (~0.78 ns/elem).
+    In absolute time, vector `exp2` is only 0.23 ns/elem slower than `exp`, but against the faster
+    denominator this yields 1.72x vs 3.02x.
+  - **Cycle 3 S3.2: `Finite` slower than `FullRange` triage on exact group.**
+    All IEEE-754 exact group functions (`floor`, `round`, `trunc`, `sqrt`, `ceil`, `abs`) execute
+    identical instructions under both `FullRange` and `Finite` policies. The observed occasional inversions
+    at 1M buffer size are attributed entirely to memory-bound execution dispersion (confirmed by Phase-0
+    dispersion measurement showing up to 130% variation on 1M identical-binary runs). Simplified `unary_vector!`
+    macro to eliminate function pointer coercion.
 
 ## 7. Suggested sequencing
 

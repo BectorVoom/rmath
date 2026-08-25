@@ -11,6 +11,18 @@
 //! `addsd`, two roundings where [`super::exp`] has one. Fusing here would be
 //! *more* accurate and would stop matching. See [`crate::reference::exp2`].
 //!
+//! ### Throughput gap vs `exp` (1.72x vs 3.02x)
+//! Although `exp2` has a simpler reduction than `exp` (no `InvLn2N` multiply),
+//! its speedup ratio is lower due to two structural factors:
+//! 1. **Baseline denominator difference**: scalar glibc `exp2` is ~1.62 ns vs scalar
+//!    `exp`'s ~2.17 ns (~34% faster scalar baseline).
+//! 2. **Kernel arithmetic and no-FMA constraint**: `exp2`'s bit-exact vector kernel
+//!    must execute 14 separate unfused serial operations (8 multiplies, 6 adds) rather
+//!    than the 7 fused FMAs in `exp`, requiring ~1.01 ns/elem vs ~0.78 ns/elem for `exp`.
+//! In absolute time, vector `exp2` (1.01 ns/elem) is only 0.23 ns/elem slower than
+//! vector `exp` (0.78 ns/elem), but the faster baseline produces a ratio of
+//! `1.62 / 1.01 = 1.60x–1.72x` for `exp2` vs `2.17 / 0.78 = 2.78x–3.02x` for `exp`.
+//!
 //! `Finite` means `|x| < 512`.
 
 use crate::kernels::double::dd::a_mul;

@@ -63,7 +63,7 @@ fn is_nan<E: Real>(x: E) -> bool {
 }
 
 macro_rules! unary_vector {
-    ($(#[$doc:meta])* $name:ident, $body:expr) => {
+    ($(#[$doc:meta])* $name:ident, $method:ident) => {
         $(#[$doc])*
         pub mod $name {
             use super::*;
@@ -72,8 +72,7 @@ macro_rules! unary_vector {
             #[inline(always)]
             pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
                 let _ = (A::BIT_EXACT, D::CHECKED);
-                let f: fn(V) -> V = $body;
-                f(x)
+                x.$method()
             }
         }
     };
@@ -81,17 +80,17 @@ macro_rules! unary_vector {
 
 unary_vector! {
     /// Largest integer not greater than `x`.
-    floor, |x| x.floor()
+    floor, floor
 }
 
 unary_vector! {
     /// Smallest integer not less than `x`.
-    ceil, |x| x.ceil()
+    ceil, ceil
 }
 
 unary_vector! {
     /// `x` truncated towards zero.
-    trunc, |x| x.trunc()
+    trunc, trunc
 }
 
 unary_vector! {
@@ -102,12 +101,12 @@ unary_vector! {
     /// this crate runs on implements it as a single instruction that already
     /// handles zero, infinity, NaN and negatives to specification. There is no
     /// reference to match — the hardware is the reference.
-    sqrt, |x| x.sqrt()
+    sqrt, sqrt
 }
 
 unary_vector! {
     /// Absolute value of `x`.
-    abs, |x| x.abs()
+    abs, abs
 }
 
 /// `x` rounded to the nearest integer, ties away from zero.
@@ -452,7 +451,7 @@ unary_vector! {
     /// reachable from safe Rust. Unlike [`round`] it breaks ties to even, and
     /// unlike `nearbyint` it is allowed to raise the inexact flag, which
     /// nothing here observes.
-    rint, |x| x.round_ties_even()
+    rint, round_ties_even
 }
 
 /// `x * 2^n`, with `n` carried in float lanes.
