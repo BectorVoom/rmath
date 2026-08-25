@@ -274,7 +274,52 @@ pub mod log1p {
     #[allow(unused_assignments)]
     #[inline(always)]
     fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
-        let ix = x.to_bits();
+        const TINY_CUT: f64 = f64::from_bits(0x3e20_0000_0000_0000); // 2^-29
+        const TINY_TINY_CUT: f64 = f64::from_bits(0x3c90_0000_0000_0000); // 2^-54
+        const DIRECT_LO: f64 = f64::from_bits(0xbfd2_bec3_0000_0000); // -0.292893...
+        const DIRECT_HI: f64 = f64::from_bits(0x3fda_8279_ffff_ffff); // 0.414213...
+
+        let is_direct = x.gt_mask(V::splat(DIRECT_LO)).and(x.lt_mask(V::splat(DIRECT_HI)));
+        if is_direct.all() {
+            let is_tiny = x.abs().lt_mask(V::splat(TINY_CUT));
+            if is_tiny.all() {
+                let is_tiny_tiny = x.abs().lt_mask(V::splat(TINY_TINY_CUT));
+                return V::select(is_tiny_tiny, x, (x * x).mul_add(V::splat(-0.5), x));
+            }
+            let f = x;
+            let s = f / (V::splat(2.0) + f);
+            let z = s * s;
+            let r2 = z.mul_add(V::splat(LP[2]), V::splat(LP[1]));
+            let z2 = z * z;
+            let r2z2 = r2 * z2;
+            let z4 = z2 * z2;
+            let r3 = z.mul_add(V::splat(LP[4]), V::splat(LP[3]));
+            let z6 = z4 * z2;
+            let r4 = z.mul_add(V::splat(LP[6]), V::splat(LP[5]));
+            let acc0 = z.mul_add(V::splat(LP[0]), r2z2);
+            let acc1 = z4.mul_add(r3, acc0);
+            let r = z6.mul_add(r4, acc1);
+            let hfsq = V::splat(0.5) * f * f;
+            let res = f - (hfsq - s * (hfsq + r));
+            if is_tiny.none() {
+                return res;
+            }
+            let is_tiny_tiny = x.abs().lt_mask(V::splat(TINY_TINY_CUT));
+            let tiny_res = V::select(is_tiny_tiny, x, (x * x).mul_add(V::splat(-0.5), x));
+            return V::select(is_tiny, tiny_res, res);
+        }
+
+        let one = V::splat(1.0);
+        let is_large = x.abs().ge_mask(V::splat(f64::from_bits(0x4340_0000_0000_0000))); // >= 2^53
+        let uu = one + x;
+        let u = V::select(is_large, x, uu);
+        let c_pos = (one - (uu - x)) / uu;
+        let c_neg = (x - (uu - one)) / uu;
+
+        let u_bits = u.to_bits();
+        let u_bits_slice = u_bits.as_slice();
+        let c_pos_arr = c_pos.to_array();
+        let c_neg_arr = c_neg.to_array();
         let xs = x.to_array();
 
         let mut f0_a = V::Floats::filled_default();
@@ -287,92 +332,59 @@ pub mod log1p {
 
         for i in 0..V::LANES {
             let xi = xs.as_slice()[i];
-            let bits = ix.as_slice()[i];
-            let hx = (bits >> 32) as i32;
-            let ax = (hx & 0x7fffffff) as u32;
+            let bits = u_bits_slice[i];
+            let huw = (bits >> 32) as i32;
+            let xi_bits = xi.to_bits();
+            let hx = (xi_bits >> 32) as i32;
+            let ax = (hx & 0x7fff_ffff) as u32;
 
-            let mut k = 1i32;
-            let mut c = 0.0f64;
-            let mut hu: u32;
-            let f0: f64;
-
-            if hx < 0x3FDA827A {
-                // x < 0.41422
-                if ax < 0x3e200000 {
+            if hx < 0x3FDA_827A {
+                if ax < 0x3e20_0000 {
                     // |x| < 2^-29
                     is_tiny_a.as_mut_slice()[i] = 1.0;
-                    tiny_res_a.as_mut_slice()[i] = if ax < 0x3c900000 {
-                        // |x| < 2^-54
+                    tiny_res_a.as_mut_slice()[i] = if ax < 0x3c90_0000 {
                         xi
                     } else {
                         (xi * xi).mul_add(-0.5, xi)
                     };
-                    f0 = 0.0;
-                    k = 0;
-                    hu = 1;
-                } else if hx > 0 || hx <= 0xbfd2bec3u32 as i32 {
-                    // -0.2929 < x < 0.41422: direct, no reduction needed.
-                    k = 0;
-                    hu = 1;
-                    f0 = xi;
-                } else {
-                    // -0.41422 <= x <= -0.2929: reduce
-                    let uu = 1.0 + xi;
-                    let huw = (uu.to_bits() >> 32) as i32;
-                    k = (huw >> 20) - 1023;
-                    c = if k > 0 {
-                        1.0 - (uu - xi)
-                    } else {
-                        xi - (uu - 1.0)
-                    };
-                    c /= uu;
-                    let u = uu;
-                    hu = (huw as u32) & 0x000fffff;
-                    let low32 = u.to_bits() & 0xffff_ffff;
-                    let u_norm;
-                    if hu < 0x6a09e {
-                        u_norm = f64::from_bits(((hu | 0x3ff00000) as u64) << 32 | low32);
-                    } else {
-                        k += 1;
-                        u_norm = f64::from_bits(((hu | 0x3fe00000) as u64) << 32 | low32);
-                        hu = (0x00100000u32.wrapping_sub(hu)) >> 2;
-                    }
-                    f0 = u_norm - 1.0;
+                    f0_a.as_mut_slice()[i] = 0.0;
+                    kf_a.as_mut_slice()[i] = 0.0;
+                    c_a.as_mut_slice()[i] = 0.0;
+                    hu_zero_a.as_mut_slice()[i] = 0.0;
+                    k_zero_a.as_mut_slice()[i] = 1.0;
+                    continue;
+                } else if hx > 0 || hx <= 0xbfd2_bec3u32 as i32 {
+                    f0_a.as_mut_slice()[i] = xi;
+                    kf_a.as_mut_slice()[i] = 0.0;
+                    c_a.as_mut_slice()[i] = 0.0;
+                    hu_zero_a.as_mut_slice()[i] = 0.0;
+                    k_zero_a.as_mut_slice()[i] = 1.0;
+                    continue;
                 }
-            } else {
-                // x >= 0.41422
-                let u: f64;
-                if hx < 0x43400000 {
-                    let uu = 1.0 + xi;
-                    let huw = (uu.to_bits() >> 32) as i32;
-                    k = (huw >> 20) - 1023;
-                    c = if k > 0 {
-                        1.0 - (uu - xi)
-                    } else {
-                        xi - (uu - 1.0)
-                    };
-                    c /= uu;
-                    u = uu;
-                    hu = (huw as u32) & 0x000fffff;
-                } else {
-                    u = xi;
-                    hu = ((u.to_bits() >> 32) as u32) & 0x000fffff;
-                    k = ((u.to_bits() >> 52) as i32) - 1023;
-                    c = 0.0;
-                }
-                let low32 = u.to_bits() & 0xffff_ffff;
-                let u_norm;
-                if hu < 0x6a09e {
-                    u_norm = f64::from_bits(((hu | 0x3ff00000) as u64) << 32 | low32);
-                } else {
-                    k += 1;
-                    u_norm = f64::from_bits(((hu | 0x3fe00000) as u64) << 32 | low32);
-                    hu = (0x00100000u32.wrapping_sub(hu)) >> 2;
-                }
-                f0 = u_norm - 1.0;
             }
 
-            f0_a.as_mut_slice()[i] = f0;
+            let k_raw = (huw >> 20) - 1023;
+            let mut hu = (huw as u32) & 0x000f_ffff;
+            let low32 = bits & 0xffff_ffff;
+            let mut k = k_raw;
+            let u_norm = if hu < 0x6a09e {
+                f64::from_bits(((hu | 0x3ff0_0000) as u64) << 32 | low32)
+            } else {
+                k += 1;
+                let norm = f64::from_bits(((hu | 0x3fe0_0000) as u64) << 32 | low32);
+                hu = (0x0010_0000u32.wrapping_sub(hu)) >> 2;
+                norm
+            };
+
+            let c = if (xi_bits & 0x7fff_ffff_ffff_ffff) >= 0x4340_0000_0000_0000 {
+                0.0
+            } else if k_raw > 0 {
+                c_pos_arr.as_slice()[i]
+            } else {
+                c_neg_arr.as_slice()[i]
+            };
+
+            f0_a.as_mut_slice()[i] = u_norm - 1.0;
             kf_a.as_mut_slice()[i] = k as f64;
             c_a.as_mut_slice()[i] = c;
             hu_zero_a.as_mut_slice()[i] = if hu == 0 { 1.0 } else { 0.0 };
