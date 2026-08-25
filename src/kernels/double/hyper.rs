@@ -256,13 +256,6 @@ pub mod asinh {
     use super::*;
     use crate::tables::double::asincosh as t;
 
-    #[inline(always)]
-    fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
-        let s = a + b;
-        let l = b - (s - a);
-        (s, l)
-    }
-
     /// `asinh(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
@@ -276,136 +269,195 @@ pub mod asinh {
         dispatch::<V, A, D>(x, reference::asinh, fast, |x| outside(x, SQUARE_LIMIT))
     }
 
+    const ASINH_TINY: u64 = 0x3e57_1374_4912_3ef7;
+    const ASINH_B0_1: u64 = 0x3e5a_0000_0000_0000;
+    const ASINH_B0_2: u64 = 0x3f30_0000_0000_0000;
+    const ASINH_B0_3: u64 = 0x3f93_0000_0000_0000;
+    const ASINH_B0_4: u64 = 0x3fbb_0000_0000_0000;
+
+    const ASINH_B1_CUT: u64 = 0x4190_0000_0000_0000;
+    const ASINH_B2_CUT: u64 = 0x4330_0000_0000_0000;
+
+    const ASINH_C0: f64 = f64::from_bits(0xbfc5555555555555);
+    const ASINH_C1: [f64; 2] = [
+        f64::from_bits(0xbfc5555555555555),
+        f64::from_bits(0x3fb3333327c57c60),
+    ];
+    const ASINH_C2: [f64; 4] = [
+        f64::from_bits(0xbfc5555555555555),
+        f64::from_bits(0x3fb333333332f2ff),
+        f64::from_bits(0xbfa6db6d9a665159),
+        f64::from_bits(0x3f9f186866d775f0),
+    ];
+    const ASINH_C3: [f64; 7] = [
+        f64::from_bits(0xbfc5555555555555),
+        f64::from_bits(0x3fb3333333333310),
+        f64::from_bits(0xbfa6db6db6da466c),
+        f64::from_bits(0x3f9f1c71c2ea7be4),
+        f64::from_bits(0xbf96e8b651b09d72),
+        f64::from_bits(0x3f91c309fc0e69c2),
+        f64::from_bits(0xbf8bab7833c1e000),
+    ];
+
     #[inline(always)]
-    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
-        let xs = x.to_array();
-        let mut ys = V::Floats::filled_default();
-        for i in 0..V::LANES {
-            ys.as_mut_slice()[i] = scalar(xs.as_slice()[i]);
-        }
-        V::from_array(ys)
+    fn band0<V: Simd<Elem = f64>>(x: V) -> (V, V::Mask) {
+        let ax = x.abs();
+        let x2h = x * x;
+        let x3h = x2h * x;
+
+        let sl0 = x3h * V::splat(ASINH_C0);
+        let sl1 = x3h * (V::splat(ASINH_C1[0]) + x2h * V::splat(ASINH_C1[1]));
+        let sl2 = x3h
+            * (V::splat(ASINH_C2[0])
+                + x2h
+                    * (V::splat(ASINH_C2[1])
+                        + x2h * (V::splat(ASINH_C2[2]) + x2h * V::splat(ASINH_C2[3]))));
+        let c1 = V::splat(ASINH_C3[1]) + x2h * V::splat(ASINH_C3[2]);
+        let c3 = V::splat(ASINH_C3[3]) + x2h * V::splat(ASINH_C3[4]);
+        let c5 = V::splat(ASINH_C3[5]) + x2h * V::splat(ASINH_C3[6]);
+        let x4 = x2h * x2h;
+        let sl3 = x3h * (V::splat(ASINH_C3[0]) + x2h * (c1 + x4 * (c3 + x4 * c5)));
+
+        let is_p0 = ax.lt_mask(V::splat(f64::from_bits(ASINH_B0_1)));
+        let is_p1 = ax.lt_mask(V::splat(f64::from_bits(ASINH_B0_2)));
+        let is_p2 = ax.lt_mask(V::splat(f64::from_bits(ASINH_B0_3)));
+
+        let sl_mid = V::select(is_p1, sl1, sl2);
+        let sl_high = V::select(is_p2, sl_mid, sl3);
+        let sl = V::select(is_p0, sl0, sl_high);
+
+        let eps = V::splat(f64::from_bits(0x3c97900000000000)) * x3h.abs();
+        let lb = x + (sl - eps.copysign(x));
+        let ub = x + (sl + eps.copysign(x));
+
+        let is_tiny = ax.lt_mask(V::splat(f64::from_bits(ASINH_TINY)));
+        let tiny_val = (-V::splat(f64::from_bits(0x3c30000000000000))).mul_add(x, x);
+        let is_zero = ax.eq_mask(V::splat(0.0));
+        let tiny_res = V::select(is_zero, x, tiny_val);
+
+        let res = V::select(is_tiny, tiny_res, lb);
+        let valid = is_tiny.or(lb.eq_mask(ub));
+        (res, valid)
     }
 
     #[inline(always)]
-    fn scalar(x: f64) -> f64 {
+    fn bands_1_to_3<V: Simd<Elem = f64>>(x: V) -> (V, V::Mask) {
+        let one = V::splat(1.0);
+        let zero = V::splat(0.0);
         let ax = x.abs();
-        let u = ax.to_bits();
+        let x_bits = ax.to_bits();
 
-        if u < 0x3fbb000000000000 {
-            if u < 0x3e57137449123ef7 {
-                if u == 0 {
-                    return x;
-                }
-                return (-f64::from_bits(0x3c30000000000000)).mul_add(x, x);
-            }
-            let x2h = x * x;
-            let x3h = x2h * x;
-            let sl = if u < 0x3f93000000000000 {
-                if u < 0x3f30000000000000 {
-                    if u < 0x3e5a000000000000 {
-                        x3h * f64::from_bits(0xbfc5555555555555)
-                    } else {
-                        let cl = [
-                            f64::from_bits(0xbfc5555555555555),
-                            f64::from_bits(0x3fb3333327c57c60),
-                        ];
-                        x3h * (cl[0] + x2h * cl[1])
-                    }
-                } else {
-                    let cl = [
-                        f64::from_bits(0xbfc5555555555555),
-                        f64::from_bits(0x3fb333333332f2ff),
-                        f64::from_bits(0xbfa6db6d9a665159),
-                        f64::from_bits(0x3f9f186866d775f0),
-                    ];
-                    x3h * (cl[0] + x2h * (cl[1] + x2h * (cl[2] + x2h * cl[3])))
-                }
+        // Medium branch: u < 0x4190000000000000
+        let x2h = x * x;
+        let x2l = x.mul_add(x, -x2h);
+        let is_lt_one = ax.lt_mask(one);
+        let th0 = one + x2h;
+        let tl0 = x2h - (th0 - one);
+        let th1 = x2h + one;
+        let tl1 = one - (th1 - x2h);
+        let th = V::select(is_lt_one, th0, th1);
+        let tl = V::select(is_lt_one, tl0, tl1) + x2l;
+        let root = th.sqrt();
+        let rs = V::splat(0.5) / th;
+        let root_l = (tl - root.mul_add(root, -th)) * (rs * root);
+        let ah_med = root + ax;
+        let al_med = ax - (ah_med - root) + root_l;
+
+        // Large branch: 0x4190000000000000 <= u < 0x4330000000000000
+        let ah_large = V::splat(2.0) * ax;
+        let al_large = V::splat(0.5) / ax;
+
+        // Huge branch: u >= 0x4330000000000000
+        let ah_huge = ax;
+        let al_huge = zero;
+
+        let is_med = ax.lt_mask(V::splat(f64::from_bits(ASINH_B1_CUT)));
+        let is_large = ax.lt_mask(V::splat(f64::from_bits(ASINH_B2_CUT)));
+
+        let ah = V::select(is_med, ah_med, V::select(is_large, ah_large, ah_huge));
+        let al = V::select(is_med, al_med, V::select(is_large, al_large, al_huge));
+
+        let ah_bits = ah.to_bits();
+        let ah_slice = ah_bits.as_slice();
+        let x_slice = x_bits.as_slice();
+
+        let mut t_val_arr = V::Bits::filled_default();
+        let mut ed_arr = V::Floats::filled_default();
+        let mut r_arr = V::Floats::filled_default();
+        let mut l1_0_arr = V::Floats::filled_default();
+        let mut l1_1_arr = V::Floats::filled_default();
+        let mut l2_0_arr = V::Floats::filled_default();
+        let mut l2_1_arr = V::Floats::filled_default();
+
+        for k_idx in 0..V::LANES {
+            let off: i32 = if x_slice[k_idx] < ASINH_B2_CUT {
+                0x3ff
             } else {
-                let cl = [
-                    f64::from_bits(0xbfc5555555555555),
-                    f64::from_bits(0x3fb3333333333310),
-                    f64::from_bits(0xbfa6db6db6da466c),
-                    f64::from_bits(0x3f9f1c71c2ea7be4),
-                    f64::from_bits(0xbf96e8b651b09d72),
-                    f64::from_bits(0x3f91c309fc0e69c2),
-                    f64::from_bits(0xbf8bab7833c1e000),
-                ];
-                let c1 = cl[1] + x2h * cl[2];
-                let c3 = cl[3] + x2h * cl[4];
-                let c5 = cl[5] + x2h * cl[6];
-                let x4 = x2h * x2h;
-                x3h * (cl[0] + x2h * (c1 + x4 * (c3 + x4 * c5)))
+                0x3fe
             };
-            let eps = f64::from_bits(0x3c97900000000000) * x3h;
-            let lb = x + (sl - eps);
-            let ub = x + (sl + eps);
-            if lb == ub {
-                return lb;
-            }
-            return reference::asinh(x);
+            let mut t_val = ah_slice[k_idx];
+            let ex = (t_val >> 52) as i32;
+            let e = ex - off;
+            ed_arr.as_mut_slice()[k_idx] = e as f64;
+            t_val &= !0u64 >> 12;
+            let i = (t_val >> (52 - 5)) as usize;
+            let d = (t_val & (!0u64 >> 17)) as i64;
+            let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+                >> (52 - 10)) as usize;
+            t_val |= 0x3ffu64 << 52;
+            t_val_arr.as_mut_slice()[k_idx] = t_val;
+
+            let i1 = (j >> 5).min(32);
+            let i2 = j & 0x1f;
+            r_arr.as_mut_slice()[k_idx] = t::R1[i1] * t::R2[i2];
+            l1_0_arr.as_mut_slice()[k_idx] = t::L1[i1][0];
+            l1_1_arr.as_mut_slice()[k_idx] = t::L1[i1][1];
+            l2_0_arr.as_mut_slice()[k_idx] = t::L2[i2][0];
+            l2_1_arr.as_mut_slice()[k_idx] = t::L2[i2][1];
         }
 
-        let mut ah: f64;
-        let mut al: f64;
-        let mut off: i32 = 0x3ff;
-        if u < 0x4190000000000000 {
-            let x2h = x * x;
-            let x2l = x.mul_add(x, -x2h);
-            let (th, mut tl) = if u < 0x3ff0000000000000 {
-                fast_two_sum(1.0, x2h)
-            } else {
-                fast_two_sum(x2h, 1.0)
-            };
-            tl += x2l;
-            ah = th.sqrt();
-            let rs = 0.5 / th;
-            al = (tl - ah.mul_add(ah, -th)) * (rs * ah);
-            let (new_ah, tl_add) = fast_two_sum(ah, ax);
-            ah = new_ah;
-            al += tl_add;
-        } else if u < 0x4330000000000000 {
-            ah = 2.0 * ax;
-            al = 0.5 / ax;
-        } else {
-            if u >= 0x7ff0000000000000 {
-                return x + x;
-            }
-            off = 0x3fe;
-            ah = ax;
-            al = 0.0;
-        }
+        let ed = V::from_array(ed_arr);
+        let t_val_v = V::from_bits(t_val_arr);
+        let r = V::from_array(r_arr);
+        let l1_0 = V::from_array(l1_0_arr);
+        let l1_1 = V::from_array(l1_1_arr);
+        let l2_0 = V::from_array(l2_0_arr);
+        let l2_1 = V::from_array(l2_1_arr);
 
-        let mut t_val = ah.to_bits();
-        let ex = (t_val >> 52) as i32;
-        let e = ex - off;
-        t_val &= !0u64 >> 12;
-        let ed = e as f64;
-        let i = (t_val >> (52 - 5)) as usize;
-        let d = (t_val & (!0u64 >> 17)) as i64;
-        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
-            >> (52 - 10)) as usize;
-        t_val |= 0x3ffu64 << 52;
-        let i1 = (j >> 5).min(32);
-        let i2 = j & 0x1f;
-
-        let r = t::R1[i1] * t::R2[i2];
-        let dx = r.mul_add(f64::from_bits(t_val), -1.0);
+        let dx = r.mul_add(t_val_v, -one);
         let dx2 = dx * dx;
-        let f = dx2 * ((t::C[0] + dx * t::C[1]) + dx2 * ((t::C[2] + dx * t::C[3]) + dx2 * t::C[4]));
+        let t_c = V::splat(t::C[0]) + dx * V::splat(t::C[1]);
+        let t_d = V::splat(t::C[2]) + dx * V::splat(t::C[3]);
+        let f = dx2 * (t_c + dx2 * (t_d + dx2 * V::splat(t::C[4])));
 
-        let l2h = f64::from_bits(0x3fe62e42fefa3800);
-        let l2l = f64::from_bits(0x3d2ef35793c76730);
-        let mut lh = l2h * ed + (t::L1[i1][1] + t::L2[i2][1]);
-        let mut ll = l2l * ed + t::L1[i1][0] + t::L2[i2][0] + al / ah + f + dx;
+        let l2h = V::splat(f64::from_bits(0x3fe62e42fefa3800));
+        let l2l = V::splat(f64::from_bits(0x3d2ef35793c76730));
+        let sgn = V::select(x.lt_mask(zero), V::splat(-1.0), V::splat(1.0));
+        let lh = (l2h * ed + (l1_1 + l2_1)) * sgn;
+        let ll = (l2l * ed + l1_0 + l2_0 + al / ah + f + dx) * sgn;
 
-        let sgn = if x.is_sign_negative() { -1.0 } else { 1.0 };
-        lh *= sgn;
-        ll *= sgn;
-
-        let eps = 1.63e-19;
+        let eps = V::splat(1.63e-19);
         let lb = lh + (ll - eps);
         let ub = lh + (ll + eps);
-        if lb == ub { lb } else { reference::asinh(x) }
+        (lb, lb.eq_mask(ub))
+    }
+
+    #[inline(always)]
+    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+        let ax = x.abs();
+        let is_b0 = ax.lt_mask(V::splat(f64::from_bits(ASINH_B0_4)));
+        let (y, valid) = if is_b0.all() {
+            band0(x)
+        } else if is_b0.none() {
+            bands_1_to_3(x)
+        } else {
+            let (y0, v0) = band0(x);
+            let (y1, v1) = bands_1_to_3(x);
+            let y = V::select(is_b0, y0, y1);
+            let valid = is_b0.and(v0).or(is_b0.not().and(v1));
+            (y, valid)
+        };
+        crate::simd::patch_lanes(x, y, valid.not(), reference::asinh)
     }
 
     /// Measured error: below 3 ulp over `|x| < 1e150`.
@@ -427,13 +479,6 @@ pub mod acosh {
     use super::*;
     use crate::tables::double::asincosh as t;
 
-    #[inline(always)]
-    fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
-        let s = a + b;
-        let l = b - (s - a);
-        (s, l)
-    }
-
     /// `acosh(x)` for a vector of lanes.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
@@ -452,135 +497,178 @@ pub mod acosh {
         })
     }
 
+    const BAND0_CUTOFF: u64 = 0x3ff1_e83e_425a_ee63;
+    const BAND1_CUTOFF: u64 = 0x405b_f000_0000_0000;
+    const BAND2_CUTOFF: u64 = 0x4087_1000_0000_0000;
+    const BAND3_CUTOFF: u64 = 0x40e0_1000_0000_0000;
+    const BAND4_CUTOFF: u64 = 0x41ea_0000_0000_0000;
+
+    const C0: [f64; 9] = [
+        f64::from_bits(0xbfb5555555555555),
+        f64::from_bits(0x3f93333333332f95),
+        f64::from_bits(0xbf76db6db6d5534c),
+        f64::from_bits(0x3f5f1c71c1e04356),
+        f64::from_bits(0xbf46e8b8e3e40d58),
+        f64::from_bits(0x3f31c4ba825ac4fe),
+        f64::from_bits(0xbf1c9045534e6d9e),
+        f64::from_bits(0x3f071fedae26a76b),
+        f64::from_bits(0xbeef1f4f8cc65342),
+    ];
+
+    const C2: [f64; 4] = [
+        f64::from_bits(0x3bd5c4b6148816e2),
+        f64::from_bits(0xbfd000000000005c),
+        f64::from_bits(0xbfb7fffffebf3e6c),
+        f64::from_bits(0xbfaaab6691f2bae7),
+    ];
+
+    const C3: [f64; 3] = [
+        f64::from_bits(0xbbc7f77c8429c6c6),
+        f64::from_bits(0xbfcffffffffff214),
+        f64::from_bits(0xbfb8000268641bfe),
+    ];
+
+    const C4: [f64; 2] = [
+        f64::from_bits(0x3bc7a0ed2effdd10),
+        f64::from_bits(0xbfd000000017d048),
+    ];
+
     #[inline(always)]
-    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
-        let xs = x.to_array();
-        let mut ys = V::Floats::filled_default();
-        for i in 0..V::LANES {
-            ys.as_mut_slice()[i] = scalar(xs.as_slice()[i]);
-        }
-        V::from_array(ys)
+    fn band0<V: Simd<Elem = f64>>(x: V) -> (V, V::Mask) {
+        let one = V::splat(1.0);
+        let z = x - one;
+        let iz = V::splat(-0.25) / z;
+        let zt = V::splat(2.0) * z;
+        let sh = zt.sqrt();
+        let sl = sh.mul_add(sh, -zt) * (sh * iz);
+
+        let z2 = z * z;
+        let z4 = z2 * z2;
+        let t1 = V::splat(C0[1]) + z * V::splat(C0[2]);
+        let t2 = V::splat(C0[3]) + z * V::splat(C0[4]);
+        let t3 = V::splat(C0[5]) + z * V::splat(C0[6]);
+        let t4 = V::splat(C0[7]) + z * V::splat(C0[8]);
+        let poly = V::splat(C0[0]) + z * ((t1 + z2 * t2) + z4 * (t3 + z2 * t4));
+
+        let ds = (sh * z).mul_add(poly, sl);
+        let eps = ds * V::splat(f64::from_bits(0x3cbfe00000000000))
+            - V::splat(f64::from_bits(0x3970000000000000)) * sh;
+        let lb = sh + (ds - eps);
+        let ub = sh + (ds + eps);
+        (lb, lb.eq_mask(ub))
     }
 
     #[inline(always)]
-    fn scalar(x: f64) -> f64 {
-        let ix = x.to_bits();
-        if ix >= 0x7ff0000000000000 {
-            let aix = ix << 1;
-            if ix == 0x7ff0000000000000 || aix > (0x7ffu64 << 53) {
-                return x + x;
-            }
-            return reference::acosh(x);
+    fn bands_1_to_5<V: Simd<Elem = f64>>(x: V) -> (V, V::Mask) {
+        let one = V::splat(1.0);
+        let x_bits = x.to_bits();
+
+        // Band 1: [1.087, 7000.0)
+        let x2h = x * x;
+        let wh = x2h - one;
+        let wl = x.mul_add(x, -x2h);
+        let sh = wh.sqrt();
+        let ish = V::splat(0.5) / wh;
+        let sl = (wl - sh.mul_add(sh, -wh)) * (sh * ish);
+        let th = x + sh;
+        let tl = sh - (th - x) + sl;
+        let g1 = tl / th;
+        let th_bits = th.to_bits();
+
+        // Bands 2..5 polynomials on z = 1 / (x * x)
+        let z = one / x2h;
+        let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
+        let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
+        let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
+        let g5 = V::splat(0.0);
+
+        let is_b2 = x.lt_mask(V::splat(f64::from_bits(BAND2_CUTOFF)));
+        let is_b3 = x.lt_mask(V::splat(f64::from_bits(BAND3_CUTOFF)));
+        let is_b4 = x.lt_mask(V::splat(f64::from_bits(BAND4_CUTOFF)));
+        let g_high = V::select(is_b4, g4, g5);
+        let g_mid = V::select(is_b3, g3, g_high);
+        let g_poly = V::select(is_b2, g2, g_mid);
+
+        let is_b1 = x.lt_mask(V::splat(f64::from_bits(BAND1_CUTOFF)));
+        let g = V::select(is_b1, g1, g_poly);
+
+        let mut t_val_arr = V::Bits::filled_default();
+        let mut ed_arr = V::Floats::filled_default();
+        let mut r_arr = V::Floats::filled_default();
+        let mut l1_0_arr = V::Floats::filled_default();
+        let mut l1_1_arr = V::Floats::filled_default();
+        let mut l2_0_arr = V::Floats::filled_default();
+        let mut l2_1_arr = V::Floats::filled_default();
+
+        let th_slice = th_bits.as_slice();
+        let x_slice = x_bits.as_slice();
+
+        for k_idx in 0..V::LANES {
+            let (mut t_val, off) = if x_slice[k_idx] < BAND1_CUTOFF {
+                (th_slice[k_idx], 0x3ff)
+            } else {
+                (x_slice[k_idx], 0x3fe)
+            };
+            let ex = (t_val >> 52) as i32;
+            let e = ex - off;
+            ed_arr.as_mut_slice()[k_idx] = e as f64;
+            t_val &= !0u64 >> 12;
+            let i = (t_val >> (52 - 5)) as usize;
+            let d = (t_val & (!0u64 >> 17)) as i64;
+            let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+                >> (52 - 10)) as usize;
+            t_val |= 0x3ffu64 << 52;
+            t_val_arr.as_mut_slice()[k_idx] = t_val;
+
+            let i1 = (j >> 5).min(32);
+            let i2 = j & 0x1f;
+            r_arr.as_mut_slice()[k_idx] = t::R1[i1] * t::R2[i2];
+            l1_0_arr.as_mut_slice()[k_idx] = t::L1[i1][0];
+            l1_1_arr.as_mut_slice()[k_idx] = t::L1[i1][1];
+            l2_0_arr.as_mut_slice()[k_idx] = t::L2[i2][0];
+            l2_1_arr.as_mut_slice()[k_idx] = t::L2[i2][1];
         }
 
-        if ix <= 0x3ff0000000000000 {
-            if ix == 0x3ff0000000000000 {
-                return 0.0;
-            }
-            return reference::acosh(x);
-        }
+        let ed = V::from_array(ed_arr);
+        let t_val_v = V::from_bits(t_val_arr);
+        let r = V::from_array(r_arr);
+        let l1_0 = V::from_array(l1_0_arr);
+        let l1_1 = V::from_array(l1_1_arr);
+        let l2_0 = V::from_array(l2_0_arr);
+        let l2_1 = V::from_array(l2_1_arr);
 
-        let g: f64;
-        let mut off: i32 = 0x3fe;
-        let mut t_val: u64 = ix;
-
-        if ix < 0x3ff1e83e425aee63 {
-            let z = x - 1.0;
-            let iz = (-0.25) / z;
-            let zt = 2.0 * z;
-            let sh = zt.sqrt();
-            let sl = sh.mul_add(sh, -zt) * (sh * iz);
-            let cl = [
-                f64::from_bits(0xbfb5555555555555),
-                f64::from_bits(0x3f93333333332f95),
-                f64::from_bits(0xbf76db6db6d5534c),
-                f64::from_bits(0x3f5f1c71c1e04356),
-                f64::from_bits(0xbf46e8b8e3e40d58),
-                f64::from_bits(0x3f31c4ba825ac4fe),
-                f64::from_bits(0xbf1c9045534e6d9e),
-                f64::from_bits(0x3f071fedae26a76b),
-                f64::from_bits(0xbeef1f4f8cc65342),
-            ];
-            let z2 = z * z;
-            let z4 = z2 * z2;
-            let poly = cl[0]
-                + z * (((cl[1] + z * cl[2]) + z2 * (cl[3] + z * cl[4]))
-                    + z4 * ((cl[5] + z * cl[6]) + z2 * (cl[7] + z * cl[8])));
-            let ds = (sh * z).mul_add(poly, sl);
-            let eps =
-                ds * f64::from_bits(0x3cbfe00000000000) - f64::from_bits(0x3970000000000000) * sh;
-            let lb = sh + (ds - eps);
-            let ub = sh + (ds + eps);
-            if lb == ub {
-                return lb;
-            }
-            return reference::acosh(x);
-        } else if ix < 0x405bf00000000000 {
-            off = 0x3ff;
-            let x2h = x * x;
-            let wh = x2h - 1.0;
-            let wl = x.mul_add(x, -x2h);
-            let sh = wh.sqrt();
-            let ish = 0.5 / wh;
-            let sl = (wl - sh.mul_add(sh, -wh)) * (sh * ish);
-            let (th, mut tl) = fast_two_sum(x, sh);
-            tl += sl;
-            t_val = th.to_bits();
-            g = tl / th;
-        } else if ix < 0x4087100000000000 {
-            let cl = [
-                f64::from_bits(0x3bd5c4b6148816e2),
-                f64::from_bits(0xbfd000000000005c),
-                f64::from_bits(0xbfb7fffffebf3e6c),
-                f64::from_bits(0xbfaaab6691f2bae7),
-            ];
-            let z = 1.0 / (x * x);
-            g = cl[0] + z * (cl[1] + z * (cl[2] + z * cl[3]));
-        } else if ix < 0x40e0100000000000 {
-            let cl = [
-                f64::from_bits(0xbbc7f77c8429c6c6),
-                f64::from_bits(0xbfcffffffffff214),
-                f64::from_bits(0xbfb8000268641bfe),
-            ];
-            let z = 1.0 / (x * x);
-            g = cl[0] + z * (cl[1] + z * cl[2]);
-        } else if ix < 0x41ea000000000000 {
-            let cl = [
-                f64::from_bits(0x3bc7a0ed2effdd10),
-                f64::from_bits(0xbfd000000017d048),
-            ];
-            let z = 1.0 / (x * x);
-            g = cl[0] + z * cl[1];
-        } else {
-            g = 0.0;
-        }
-
-        let ex = (t_val >> 52) as i32;
-        let e = ex - off;
-        t_val &= !0u64 >> 12;
-        let ed = e as f64;
-        let i = (t_val >> (52 - 5)) as usize;
-        let d = (t_val & (!0u64 >> 17)) as i64;
-        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
-            >> (52 - 10)) as usize;
-        t_val |= 0x3ffu64 << 52;
-        let i1 = (j >> 5).min(32);
-        let i2 = j & 0x1f;
-
-        let r = t::R1[i1] * t::R2[i2];
-        let dx = r.mul_add(f64::from_bits(t_val), -1.0);
+        let dx = r.mul_add(t_val_v, -one);
         let dx2 = dx * dx;
-        let f = dx2 * ((t::C[0] + dx * t::C[1]) + dx2 * ((t::C[2] + dx * t::C[3]) + dx2 * t::C[4]));
+        let t_c = V::splat(t::C[0]) + dx * V::splat(t::C[1]);
+        let t_d = V::splat(t::C[2]) + dx * V::splat(t::C[3]);
+        let f = dx2 * (t_c + dx2 * (t_d + dx2 * V::splat(t::C[4])));
 
-        let l2h = f64::from_bits(0x3fe62e42fefa3800);
-        let l2l = f64::from_bits(0x3d2ef35793c76730);
-        let lh = l2h * ed + (t::L1[i1][1] + t::L2[i2][1]);
-        let ll = l2l * ed + t::L1[i1][0] + t::L2[i2][0] + g + f + dx;
+        let l2h = V::splat(f64::from_bits(0x3fe62e42fefa3800));
+        let l2l = V::splat(f64::from_bits(0x3d2ef35793c76730));
+        let lh = l2h * ed + (l1_1 + l2_1);
+        let ll = l2l * ed + l1_0 + l2_0 + g + f + dx;
 
-        let eps = 1.63e-19;
+        let eps = V::splat(1.63e-19);
         let lb = lh + (ll - eps);
         let ub = lh + (ll + eps);
-        if lb == ub { lb } else { reference::acosh(x) }
+        (lb, lb.eq_mask(ub))
+    }
+
+    #[inline(always)]
+    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+        let is_b0 = x.lt_mask(V::splat(f64::from_bits(BAND0_CUTOFF)));
+        let (y, valid) = if is_b0.all() {
+            band0(x)
+        } else if is_b0.none() {
+            bands_1_to_5(x)
+        } else {
+            let (y0, v0) = band0(x);
+            let (y1, v1) = bands_1_to_5(x);
+            let y = V::select(is_b0, y0, y1);
+            let valid = is_b0.and(v0).or(is_b0.not().and(v1));
+            (y, valid)
+        };
+        crate::simd::patch_lanes(x, y, valid.not(), reference::acosh)
     }
 
     /// Measured error: below 3 ulp over `1 <= x < 1e150`.
