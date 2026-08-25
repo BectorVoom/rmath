@@ -126,6 +126,39 @@ def main() -> int:
                         "cmd": cmd,
                     })
 
+    # Check for exact > fast inversions
+    print("\nChecking for exact > fast inversions across matrix runs...")
+    inversions = 0
+    for r in runs:
+        if r["suite"] != "default":
+            continue
+        p = Path(r["csv"])
+        if not p.exists():
+            continue
+        lines = [l for l in p.read_text(encoding="utf-8").splitlines() if not l.startswith("#") and l.strip()]
+        import csv
+        reader = csv.DictReader(lines)
+        metrics: dict[str, dict[str, float]] = {}
+        for row in reader:
+            fn = row["function"]
+            m = row["metric"]
+            spd = float(row["speedup"])
+            metrics.setdefault(fn, {})[m] = spd
+
+        for fn, m_map in metrics.items():
+            if "exact" in m_map and "fast" in m_map:
+                exact_spd = m_map["exact"]
+                fast_spd = m_map["fast"]
+                # Exclude hardware instructions (sqrt) or within 5% noise margin
+                if fn not in ("sqrt", "sqrtf", "floor", "trunc", "round") and exact_spd > fast_spd * 1.05:
+                    print(
+                        f"  [INVERSION] {fn} on corpus='{r['corpus']}', size={r['size']}: "
+                        f"exact {exact_spd:.2f}x > fast {fast_spd:.2f}x (artifact or coherence bypass)"
+                    )
+                    inversions += 1
+    if inversions == 0:
+        print("  No unexpected exact > fast inversions found.")
+
     manifest = {
         "commit": commit,
         "timestamp": timestamp,
