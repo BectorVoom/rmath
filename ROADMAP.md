@@ -1155,6 +1155,16 @@ widening whenever the f64 kernel does more than the f32 result needs.
     Ran complete 10M-sample precision scans across all functions and 2.1-billion exhaustive checks for `log2f` and `erff`.
     All functions demonstrated ~2x headroom over asserted bounds (`log2f` 2 ulp / bound 4, `erff` 2 ulp / bound 4,
     `exp`/`exp2` 1 ulp / bound 2, `asinh` 4 ulp / bound 8, `asin` 3 ulp / bound 4, `pow extreme` 5 ulp / bound 8).
+  - **Cycle 4 P1: `pow` extreme-exponent closure.**
+    Re-ran `scan_pow` at 100M samples: wide 2 ulp, moderate 2 ulp, near-1 2 ulp, extreme 5 ulp. Closed and documented:
+    8 ulp on the extreme-exponent corpus is the priced Pareto choice (~2x headroom over 5 ulp measured); the residual
+    worst case is the reduction's structural amplification near `|y·log2 x| ≈ 1020`.
+  - **Cycle 4 P2: Verification-debt sweep.**
+    Ran complete 30M-sample f64 sweeps (`exp2` 1 ulp, `exp` 1 ulp, `exp10` 2 ulp, `cbrt` 1 ulp, `asinh` 4 ulp, `asin` 3 ulp, `acos` 2 ulp, `tgamma` 2 ulp).
+    Extended `scan_single_precision_exhaustive` to all f32 fast kernels across all positive-normal inputs (billions of floats):
+    `log2f` 2 ulp (2.13B checked), `expf` 4 ulp (1.11B checked), `exp2f` 3 ulp (1.12B checked), `exp10f` 3 ulp (1.10B checked),
+    `cbrtf` 1 ulp (2.13B checked), `tanhf` 2 ulp (1.10B checked), `erff` 2 ulp (2.13B checked), `erfcf` 0 ulp (1.08B checked),
+    `j0f` 9 ulp (1.17B checked), `j1f` 9 ulp (1.17B checked). Fixed `k >= 128` multiplication order in `exp2f` and `expf`.
 
 ## 7. Suggested sequencing
 

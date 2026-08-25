@@ -100,10 +100,13 @@ fn fast<V: Simd<Elem = f32>>(x: V) -> V {
         if k <= -127 {
             bits.as_mut_slice()[i] = ((k + 25 + 127) as u32) << 23;
             subnormal_adjust.as_mut_slice()[i] = f32::from_bits(0x3300_0000); // 2^-25
+        } else if k >= 128 {
+            bits.as_mut_slice()[i] = ((k - 1 + 127) as u32) << 23;
+            subnormal_adjust.as_mut_slice()[i] = 2.0;
         } else {
             bits.as_mut_slice()[i] = ((k + 127) as u32) << 23;
             subnormal_adjust.as_mut_slice()[i] = 1.0;
         }
     }
-    (V::from_bits(bits) * V::from_array(subnormal_adjust)) * p
+    V::from_bits(bits) * (V::from_array(subnormal_adjust) * p)
 }

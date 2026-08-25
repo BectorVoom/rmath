@@ -25,6 +25,9 @@ mod libm {
         pub safe fn tgamma(x: f64) -> f64;
         pub safe fn erff(x: f32) -> f32;
         pub safe fn erfcf(x: f32) -> f32;
+        pub safe fn exp10f(x: f32) -> f32;
+        pub safe fn j0f(x: f32) -> f32;
+        pub safe fn j1f(x: f32) -> f32;
     }
 }
 
@@ -391,12 +394,56 @@ fn scan_single_precision_exhaustive() {
         fast32!(Log2),
         f32::log2,
     );
+    scan32_exhaustive(
+        "expf",
+        0x0080_0000,
+        0x42b1_7217, // ~88.72 (overflow limit)
+        fast32!(Exp),
+        f32::exp,
+    );
+    scan32_exhaustive(
+        "exp2f",
+        0x0080_0000,
+        0x4300_0000, // 128.0 (overflow limit)
+        fast32!(Exp2),
+        f32::exp2,
+    );
+    scan32_exhaustive(
+        "exp10f",
+        0x0080_0000,
+        0x421a_209a, // ~38.53 (overflow limit)
+        fast32!(Exp10),
+        |x| libm::exp10f(x),
+    );
+    scan32_exhaustive(
+        "cbrtf",
+        0x0080_0000,
+        0x7f7f_ffff,
+        fast32!(Cbrt),
+        f32::cbrt,
+    );
+    scan32_exhaustive(
+        "tanhf",
+        0x0080_0000,
+        0x4220_0000, // 40.0
+        fast32!(Tanh),
+        f32::tanh,
+    );
     // `erff`'s native `Fast` path (`src/kernels/single/erf.rs`): every
     // positive normal, including the saturation band past `ERF_MAX_BITS`
     // and the `FullRange` patch logic, not just the `fast` function in
     // isolation.
     scan32_exhaustive("erff", 0x0080_0000, 0x7f7f_ffff, fast32!(Erf), |x| {
         libm::erff(x)
+    });
+    scan32_exhaustive("erfcf", 0x0080_0000, 0x4120_0000, fast32!(Erfc), |x| {
+        libm::erfcf(x)
+    });
+    scan32_exhaustive("j0f", 0x0080_0000, 0x4600_0000, fast32!(J0), |x| {
+        libm::j0f(x)
+    });
+    scan32_exhaustive("j1f", 0x0080_0000, 0x4600_0000, fast32!(J1), |x| {
+        libm::j1f(x)
     });
 }
 

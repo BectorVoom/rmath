@@ -19,6 +19,11 @@
 //! its division residue, its scale constants and its first two series terms
 //! exactly (`log2_dd` below), which is what keeps the amplified error within
 //! a few ulp instead of a few dozen.
+//!
+//! 8 ulp on the extreme-exponent corpus is the priced Pareto choice; the next
+//! double-double term was measured at cycle-3 P2 and the residual 5-ulp worst
+//! case is the reduction's structural amplification near `|y·log2 x| ≈ 1020`;
+//! measured at 100 M on 2026-08-26.
 
 use crate::kernels::double::exp2;
 use crate::kernels::{dispatch2, log_poly, log_split, not_normal, not_positive_normal};
