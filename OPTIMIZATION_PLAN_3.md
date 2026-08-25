@@ -1,6 +1,6 @@
 # Speed and precision optimisation plan, cycle 3
 
-Status: proposed
+Status: executed
 Prepared: 2026-08-25
 Scope: the optimisation cycle after [`OPTIMIZATION_PLAN_2.md`](OPTIMIZATION_PLAN_2.md)
 (2026-08-25), whose phases were executed in commits `227584a` through

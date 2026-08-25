@@ -19,6 +19,7 @@
 //! 2. **Kernel arithmetic and no-FMA constraint**: `exp2`'s bit-exact vector kernel
 //!    must execute 14 separate unfused serial operations (8 multiplies, 6 adds) rather
 //!    than the 7 fused FMAs in `exp`, requiring ~1.01 ns/elem vs ~0.78 ns/elem for `exp`.
+//!
 //! In absolute time, vector `exp2` (1.01 ns/elem) is only 0.23 ns/elem slower than
 //! vector `exp` (0.78 ns/elem), but the faster baseline produces a ratio of
 //! `1.62 / 1.01 = 1.60x–1.72x` for `exp2` vs `2.17 / 0.78 = 2.78x–3.02x` for `exp`.

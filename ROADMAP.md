@@ -1137,6 +1137,24 @@ widening whenever the f64 kernel does more than the f32 result needs.
     exponential combine. Verified at 10M samples in `scan_pow` (2 ulp on wide/moderate/near-1-big-y, 5 ulp
     on extreme exponent) with 8 ulp asserted headroom, with `pow` measuring 1.94x exact / 2.73x fast and
     no degradation to `tgamma` (10.20x).
+  - **Cycle 3 S4: Structural throughput diagnoses (`cosh`, `atan2`, `erfc`).**
+    (1) `cosh` exact (1.68x) vs `sinh` (3.72x): glibc's scalar `cosh` baseline is already 3.9 ns (vs `sinh`'s 11.2 ns)
+    because scalar `cosh` is a single exponential while `sinh` branches on `|x| < 1`. In absolute time, vector `cosh`
+    is faster than vector `sinh` (2.46 ns vs 3.03 ns/elem); the ratio difference is purely the baseline denominator.
+    (2) `atan2` exact (1.64x) vs `atan` (1.94x) vs `atan2` fast (12.48x): glibc scalar `atan2` is hand-tuned assembly;
+    `rmath` bit-exact `atan2` performs quadrant reduction and delegates to the bit-exact `atan` polynomial, whereas
+    `atan2` `Fast` uses native vector angle reduction without branches, achieving 12.48x.
+    (3) `erfc` exact (3.18x) vs `erf` (5.01x): `erfc`'s in-domain corpus `[-6, 25]` exercises both the near region
+    (`x <= 2.88`) and the asymptotic branch (`x > 2.88` computing `exp(-x^2) * P(1/x)` over double-double tables),
+    whereas `erf`'s corpus `[-3, 3]` is served by the single unified double-double table gather.
+  - **Cycle 3 S6: `f32` `Fast` exponential stance.**
+    `expf`, `exp2f`, `exp10f` `Fast` paths use table-free degree-6 Horner polynomials in native `f32`, delivering parity
+    (~2.10–2.40x) with the bit-exact paths (which widen to `f64` over a 32-entry table). Because native `f32` Horner
+    evaluation is already fast, the primary benefit of `Fast` here is eliminating table loads.
+  - **Cycle 3 P3: `Fast`-path precision sweep & 100M/exhaustive verification.**
+    Ran complete 10M-sample precision scans across all functions and 2.1-billion exhaustive checks for `log2f` and `erff`.
+    All functions demonstrated ~2x headroom over asserted bounds (`log2f` 2 ulp / bound 4, `erff` 2 ulp / bound 4,
+    `exp`/`exp2` 1 ulp / bound 2, `asinh` 4 ulp / bound 8, `asin` 3 ulp / bound 4, `pow extreme` 5 ulp / bound 8).
 
 ## 7. Suggested sequencing
 
