@@ -782,7 +782,7 @@ impl<E: Real> Function2Pair<E> for Identity2Pair {
 fn traversal_benchmarks() {
     println!("\ntraversal and buffer shapes (ns/elem)");
     println!(
-        "{:<30} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "{:<30} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "workload",
         "len=0",
         "len=1",
@@ -791,14 +791,15 @@ fn traversal_benchmarks() {
         "len=lanes+1",
         "len=64",
         "len=4096",
-        "len=65536"
+        "len=65536",
+        "len=1M"
     );
-    println!("{}", "-".repeat(102));
+    println!("{}", "-".repeat(112));
 
     let lanes = <rmath::Widest as Simd>::LANES;
     let l_minus_1 = lanes.saturating_sub(1).max(1);
     let l_plus_1 = lanes + 1;
-    let lens = [0, 1, l_minus_1, lanes, l_plus_1, 64, 4096, 65536];
+    let lens = [0, 1, l_minus_1, lanes, l_plus_1, 64, 4096, 65536, 1048576];
 
     let identity = Identity;
     let identity2 = Identity2;
@@ -816,7 +817,7 @@ fn traversal_benchmarks() {
         if len == 0 {
             return 0.0;
         }
-        let iters = (65536 / len.max(1)).clamp(10, 10000);
+        let iters = (65536 / len.max(1)).clamp(1, 10000);
         for _ in 0..WARMUP {
             for _ in 0..iters {
                 run();
@@ -839,8 +840,8 @@ fn traversal_benchmarks() {
             .map(|&len| time_iters(len, make_runner(len)))
             .collect();
         println!(
-            "{:<30} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
-            name, times[0], times[1], times[2], times[3], times[4], times[5], times[6], times[7]
+            "{:<30} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+            name, times[0], times[1], times[2], times[3], times[4], times[5], times[6], times[7], times[8]
         );
         for (&len, &t) in lens.iter().zip(times.iter()) {
             record(format!("{name}_len{len}"), "ns_per_elem", 1.0, t);

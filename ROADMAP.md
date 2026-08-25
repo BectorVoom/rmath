@@ -1114,6 +1114,13 @@ widening whenever the f64 kernel does more than the f32 result needs.
     at 1M buffer size are attributed entirely to memory-bound execution dispersion (confirmed by Phase-0
     dispersion measurement showing up to 130% variation on 1M identical-binary runs). Simplified `unary_vector!`
     macro to eliminate function pointer coercion.
+  - **Cycle 3 S2: Exact-group large-buffer traversal diagnosis & Documented Accept.**
+    Extended `traversal.csv` identity ladder to 1M elements. Measured `identity_unary` at 0.43 ns/elem
+    (out-of-place) vs 0.01 ns/elem (in-place), confirming that at 1M elements (16 MB buffer traffic exceeding
+    CPU L2 cache), execution time for single-instruction kernels (`floor`, `sqrt`, `trunc`, `ceil`, `round`)
+    is 98% memory bandwidth traversal rather than kernel arithmetic. Closed with Documented Accept in README
+    explaining parity at 4096 (~1.00–1.08x) and memory bandwidth ceiling at 1M (~0.73x–1.05x). Rewrote `src/function.rs`
+    slice traversal loops into direct index stepping.
 
 ## 7. Suggested sequencing
 

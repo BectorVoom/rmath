@@ -276,7 +276,11 @@ Several of those deserve comment rather than burial:
   vectorises loops containing it, and `rmath` has nothing to add. It is
   included so a pipeline of these functions does not have to break its pattern
   for one member — not because it is faster. The same is true of `floor`,
-  `ceil` and `trunc`.
+  `ceil`, `round` and `trunc`. At small and cache-resident sizes (e.g. 4096 elements),
+  they run at parity (~1.00–1.08x). At 1M elements (16 MB source+destination buffer traffic
+  exceeding L2 cache), out-of-place memory bandwidth dominates execution (~0.43 ns/elem across
+  `identity`, `floor`, and `sqrt` in the traversal diagnostic ladder), measuring ~0.73x–1.05x
+  exact depending on memory-subsystem state.
 - **`acosh` gains far more from `Finite` than anything else** (1.97x to 8.95x).
   Its domain test is two comparisons *and* a NaN-producing branch for `x < 1`,
   which is expensive relative to the small amount of arithmetic that follows.

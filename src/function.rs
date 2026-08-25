@@ -50,17 +50,14 @@ fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
     let lanes = <E::Widest as Simd>::LANES;
     let rem = src.len() % lanes;
     let end = src.len() - rem;
-    let (s_head, s_tail) = src.split_at(end);
-    let (d_head, d_tail) = dst.split_at_mut(end);
 
-    for (s_chunk, d_chunk) in s_head
-        .chunks_exact(lanes)
-        .zip(d_head.chunks_exact_mut(lanes))
-    {
-        let v = f.eval(<E::Widest as Simd>::load_slice(s_chunk));
-        v.store_slice(d_chunk);
+    let mut i = 0;
+    while i < end {
+        let v = f.eval(<E::Widest as Simd>::load_slice(&src[i..i + lanes]));
+        v.store_slice(&mut dst[i..i + lanes]);
+        i += lanes;
     }
-    for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
+    for (s, d) in src[end..].iter().zip(dst[end..].iter_mut()) {
         *d = f.eval::<E>(*s);
     }
 }
@@ -70,13 +67,15 @@ fn eval_unary_in_place<E: Real, F: Function<E>>(f: &F, buf: &mut [E]) {
     let lanes = <E::Widest as Simd>::LANES;
     let rem = buf.len() % lanes;
     let end = buf.len() - rem;
-    let (head, tail) = buf.split_at_mut(end);
 
-    for chunk in head.chunks_exact_mut(lanes) {
+    let mut i = 0;
+    while i < end {
+        let chunk = &mut buf[i..i + lanes];
         let v = f.eval(<E::Widest as Simd>::load_slice(chunk));
         v.store_slice(chunk);
+        i += lanes;
     }
-    for x in tail.iter_mut() {
+    for x in buf[end..].iter_mut() {
         *x = f.eval::<E>(*x);
     }
 }
@@ -88,21 +87,16 @@ fn eval_binary_slice<E: Real, F: Function2<E>>(f: &F, a: &[E], b: &[E], dst: &mu
     let lanes = <E::Widest as Simd>::LANES;
     let rem = a.len() % lanes;
     let end = a.len() - rem;
-    let (a_head, a_tail) = a.split_at(end);
-    let (b_head, b_tail) = b.split_at(end);
-    let (d_head, d_tail) = dst.split_at_mut(end);
 
-    for ((a_chunk, b_chunk), d_chunk) in a_head
-        .chunks_exact(lanes)
-        .zip(b_head.chunks_exact(lanes))
-        .zip(d_head.chunks_exact_mut(lanes))
-    {
-        let va = <E::Widest as Simd>::load_slice(a_chunk);
-        let vb = <E::Widest as Simd>::load_slice(b_chunk);
+    let mut i = 0;
+    while i < end {
+        let va = <E::Widest as Simd>::load_slice(&a[i..i + lanes]);
+        let vb = <E::Widest as Simd>::load_slice(&b[i..i + lanes]);
         let v = f.eval(va, vb);
-        v.store_slice(d_chunk);
+        v.store_slice(&mut dst[i..i + lanes]);
+        i += lanes;
     }
-    for ((x, y), d) in a_tail.iter().zip(b_tail.iter()).zip(d_tail.iter_mut()) {
+    for ((x, y), d) in a[end..].iter().zip(b[end..].iter()).zip(dst[end..].iter_mut()) {
         *d = f.eval::<E>(*x, *y);
     }
 }
@@ -113,19 +107,16 @@ fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(f: &F, src: &[E], y: E, ds
     let lanes = <E::Widest as Simd>::LANES;
     let rem = src.len() % lanes;
     let end = src.len() - rem;
-    let (s_head, s_tail) = src.split_at(end);
-    let (d_head, d_tail) = dst.split_at_mut(end);
     let y_splat = <E::Widest as Simd>::splat(y);
 
-    for (s_chunk, d_chunk) in s_head
-        .chunks_exact(lanes)
-        .zip(d_head.chunks_exact_mut(lanes))
-    {
-        let va = <E::Widest as Simd>::load_slice(s_chunk);
+    let mut i = 0;
+    while i < end {
+        let va = <E::Widest as Simd>::load_slice(&src[i..i + lanes]);
         let v = f.eval(va, y_splat);
-        v.store_slice(d_chunk);
+        v.store_slice(&mut dst[i..i + lanes]);
+        i += lanes;
     }
-    for (s, d) in s_tail.iter().zip(d_tail.iter_mut()) {
+    for (s, d) in src[end..].iter().zip(dst[end..].iter_mut()) {
         *d = f.eval::<E>(*s, y);
     }
 }
@@ -142,21 +133,16 @@ fn eval_pair_slice<E: Real, F: FunctionPair<E>>(
     let lanes = <E::Widest as Simd>::LANES;
     let rem = src.len() % lanes;
     let end = src.len() - rem;
-    let (s_head, s_tail) = src.split_at(end);
-    let (f_head, f_tail) = first.split_at_mut(end);
-    let (s2_head, s2_tail) = second.split_at_mut(end);
 
-    for ((s_chunk, f_chunk), s2_chunk) in s_head
-        .chunks_exact(lanes)
-        .zip(f_head.chunks_exact_mut(lanes))
-        .zip(s2_head.chunks_exact_mut(lanes))
-    {
-        let va = <E::Widest as Simd>::load_slice(s_chunk);
+    let mut i = 0;
+    while i < end {
+        let va = <E::Widest as Simd>::load_slice(&src[i..i + lanes]);
         let (v1, v2) = f.eval(va);
-        v1.store_slice(f_chunk);
-        v2.store_slice(s2_chunk);
+        v1.store_slice(&mut first[i..i + lanes]);
+        v2.store_slice(&mut second[i..i + lanes]);
+        i += lanes;
     }
-    for ((s, f1), f2) in s_tail.iter().zip(f_tail.iter_mut()).zip(s2_tail.iter_mut()) {
+    for ((s, f1), f2) in src[end..].iter().zip(first[end..].iter_mut()).zip(second[end..].iter_mut()) {
         let (a, b) = f.eval::<E>(*s);
         *f1 = a;
         *f2 = b;
@@ -177,28 +163,21 @@ fn eval_2pair_slice<E: Real, F: Function2Pair<E>>(
     let lanes = <E::Widest as Simd>::LANES;
     let rem = a.len() % lanes;
     let end = a.len() - rem;
-    let (a_head, a_tail) = a.split_at(end);
-    let (b_head, b_tail) = b.split_at(end);
-    let (f_head, f_tail) = first.split_at_mut(end);
-    let (s2_head, s2_tail) = second.split_at_mut(end);
 
-    for (((a_chunk, b_chunk), f_chunk), s2_chunk) in a_head
-        .chunks_exact(lanes)
-        .zip(b_head.chunks_exact(lanes))
-        .zip(f_head.chunks_exact_mut(lanes))
-        .zip(s2_head.chunks_exact_mut(lanes))
-    {
-        let va = <E::Widest as Simd>::load_slice(a_chunk);
-        let vb = <E::Widest as Simd>::load_slice(b_chunk);
+    let mut i = 0;
+    while i < end {
+        let va = <E::Widest as Simd>::load_slice(&a[i..i + lanes]);
+        let vb = <E::Widest as Simd>::load_slice(&b[i..i + lanes]);
         let (v1, v2) = f.eval(va, vb);
-        v1.store_slice(f_chunk);
-        v2.store_slice(s2_chunk);
+        v1.store_slice(&mut first[i..i + lanes]);
+        v2.store_slice(&mut second[i..i + lanes]);
+        i += lanes;
     }
-    for (((x, y), f1), f2) in a_tail
+    for (((x, y), f1), f2) in a[end..]
         .iter()
-        .zip(b_tail.iter())
-        .zip(f_tail.iter_mut())
-        .zip(s2_tail.iter_mut())
+        .zip(b[end..].iter())
+        .zip(first[end..].iter_mut())
+        .zip(second[end..].iter_mut())
     {
         let (p, q) = f.eval::<E>(*x, *y);
         *f1 = p;
