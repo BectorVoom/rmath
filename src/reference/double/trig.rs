@@ -352,7 +352,11 @@ pub fn tan(x: f64) -> f64 {
         let da = db + da;
         // EADD(a, da, sum, cc) — the four-part reduction's compensation.
         let sum = b + da;
-        let cc = if b.abs() > da.abs() { (b - sum) + da } else { (da - sum) + b };
+        let cc = if b.abs() > da.abs() {
+            (b - sum) + da
+        } else {
+            (da - sum) + b
+        };
         return tan_sub(t, sum, cc);
     }
     // (VI): `|x| > 1e8` — `__branred`'s Payne-Hanek reduction, not ported,
@@ -371,7 +375,11 @@ pub fn tan(x: f64) -> f64 {
 #[inline(always)]
 fn tan_sub(t: f64, a: f64, da: f64) -> f64 {
     let n = (t.to_bits() & 1) as u32;
-    let (ya, yya, sy) = if a < 0.0 { (-a, -da, -1.0) } else { (a, da, 1.0) };
+    let (ya, yya, sy) = if a < 0.0 {
+        (-a, -da, -1.0)
+    } else {
+        (a, da, 1.0)
+    };
 
     // (VI)/(VIII)/(X): `0 < |y| <= 0.0608` — the odd polynomial, on the
     // signed values.
@@ -386,7 +394,11 @@ fn tan_sub(t: f64, a: f64, da: f64) -> f64 {
         if n & 1 != 0 {
             // EADD(a, t2, b, db); DIV2(1.0, 0.0, b, db, ...) — `-cot`.
             let b = y;
-            let db = if a.abs() > t2.abs() { (a - b) + t2 } else { (t2 - b) + a };
+            let db = if a.abs() > t2.abs() {
+                (a - b) + t2
+            } else {
+                (t2 - b) + a
+            };
             let c = 1.0 / b;
             let u = c * b;
             let uu = c.mul_add(b, -u);

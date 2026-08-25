@@ -426,6 +426,10 @@ pub mod tgamma {
     fn via_exp<V: Simd<Elem = f64>>(y: V) -> V {
         let (hi, lo) = stirling_dd(y);
         let res = pow::pow_exp(hi, lo);
-        V::select(y.gt_mask(V::splat(TGAMMA_OVERFLOW)), V::splat(f64::INFINITY), res)
+        V::select(
+            y.gt_mask(V::splat(TGAMMA_OVERFLOW)),
+            V::splat(f64::INFINITY),
+            res,
+        )
     }
 }

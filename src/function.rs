@@ -53,7 +53,10 @@ fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
     let (s_head, s_tail) = src.split_at(end);
     let (d_head, d_tail) = dst.split_at_mut(end);
 
-    for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
+    for (s_chunk, d_chunk) in s_head
+        .chunks_exact(lanes)
+        .zip(d_head.chunks_exact_mut(lanes))
+    {
         let v = f.eval(<E::Widest as Simd>::load_slice(s_chunk));
         v.store_slice(d_chunk);
     }
@@ -105,12 +108,7 @@ fn eval_binary_slice<E: Real, F: Function2<E>>(f: &F, a: &[E], b: &[E], dst: &mu
 }
 
 #[inline(always)]
-fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(
-    f: &F,
-    src: &[E],
-    y: E,
-    dst: &mut [E],
-) {
+fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(f: &F, src: &[E], y: E, dst: &mut [E]) {
     assert_eq!(src.len(), dst.len(), "eval_slice_scalar: length mismatch");
     let lanes = <E::Widest as Simd>::LANES;
     let rem = src.len() % lanes;
@@ -119,7 +117,10 @@ fn eval_binary_slice_scalar<E: Real, F: Function2<E>>(
     let (d_head, d_tail) = dst.split_at_mut(end);
     let y_splat = <E::Widest as Simd>::splat(y);
 
-    for (s_chunk, d_chunk) in s_head.chunks_exact(lanes).zip(d_head.chunks_exact_mut(lanes)) {
+    for (s_chunk, d_chunk) in s_head
+        .chunks_exact(lanes)
+        .zip(d_head.chunks_exact_mut(lanes))
+    {
         let va = <E::Widest as Simd>::load_slice(s_chunk);
         let v = f.eval(va, y_splat);
         v.store_slice(d_chunk);

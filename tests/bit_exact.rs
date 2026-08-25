@@ -817,13 +817,19 @@ fn corpus_pow(seed: u64) -> (Vec<f64>, Vec<f64>) {
         }
     }
     for _ in 0..400_000 {
-        push(rng.log_uniform(1e-300, 1e300, false), rng.uniform(-40.0, 40.0));
+        push(
+            rng.log_uniform(1e-300, 1e300, false),
+            rng.uniform(-40.0, 40.0),
+        );
     }
     for _ in 0..200_000 {
         push(rng.uniform(0.0, 4.0), rng.uniform(-200.0, 200.0));
     }
     for _ in 0..200_000 {
-        push(rng.log_uniform(1e-320, 1e308, true), rng.log_uniform(1e-320, 1e308, true));
+        push(
+            rng.log_uniform(1e-320, 1e308, true),
+            rng.log_uniform(1e-320, 1e308, true),
+        );
     }
     for _ in 0..200_000 {
         push(f64::from_bits(rng.next()), f64::from_bits(rng.next()));

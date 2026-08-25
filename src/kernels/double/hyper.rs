@@ -305,7 +305,10 @@ pub mod asinh {
                     if u < 0x3e5a000000000000 {
                         x3h * f64::from_bits(0xbfc5555555555555)
                     } else {
-                        let cl = [f64::from_bits(0xbfc5555555555555), f64::from_bits(0x3fb3333327c57c60)];
+                        let cl = [
+                            f64::from_bits(0xbfc5555555555555),
+                            f64::from_bits(0x3fb3333327c57c60),
+                        ];
                         x3h * (cl[0] + x2h * cl[1])
                     }
                 } else {
@@ -379,7 +382,8 @@ pub mod asinh {
         let ed = e as f64;
         let i = (t_val >> (52 - 5)) as usize;
         let d = (t_val & (!0u64 >> 17)) as i64;
-        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16))) >> (52 - 10)) as usize;
+        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+            >> (52 - 10)) as usize;
         t_val |= 0x3ffu64 << 52;
         let i1 = (j >> 5).min(32);
         let i2 = j & 0x1f;
@@ -401,11 +405,7 @@ pub mod asinh {
         let eps = 1.63e-19;
         let lb = lh + (ll - eps);
         let ub = lh + (ll + eps);
-        if lb == ub {
-            lb
-        } else {
-            reference::asinh(x)
-        }
+        if lb == ub { lb } else { reference::asinh(x) }
     }
 
     /// Measured error: below 3 ulp over `|x| < 1e150`.
@@ -503,9 +503,12 @@ pub mod acosh {
             ];
             let z2 = z * z;
             let z4 = z2 * z2;
-            let poly = cl[0] + z * (((cl[1] + z * cl[2]) + z2 * (cl[3] + z * cl[4])) + z4 * ((cl[5] + z * cl[6]) + z2 * (cl[7] + z * cl[8])));
+            let poly = cl[0]
+                + z * (((cl[1] + z * cl[2]) + z2 * (cl[3] + z * cl[4]))
+                    + z4 * ((cl[5] + z * cl[6]) + z2 * (cl[7] + z * cl[8])));
             let ds = (sh * z).mul_add(poly, sl);
-            let eps = ds * f64::from_bits(0x3cbfe00000000000) - f64::from_bits(0x3970000000000000) * sh;
+            let eps =
+                ds * f64::from_bits(0x3cbfe00000000000) - f64::from_bits(0x3970000000000000) * sh;
             let lb = sh + (ds - eps);
             let ub = sh + (ds + eps);
             if lb == ub {
@@ -558,7 +561,8 @@ pub mod acosh {
         let ed = e as f64;
         let i = (t_val >> (52 - 5)) as usize;
         let d = (t_val & (!0u64 >> 17)) as i64;
-        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16))) >> (52 - 10)) as usize;
+        let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+            >> (52 - 10)) as usize;
         t_val |= 0x3ffu64 << 52;
         let i1 = (j >> 5).min(32);
         let i2 = j & 0x1f;
@@ -576,11 +580,7 @@ pub mod acosh {
         let eps = 1.63e-19;
         let lb = lh + (ll - eps);
         let ub = lh + (ll + eps);
-        if lb == ub {
-            lb
-        } else {
-            reference::acosh(x)
-        }
+        if lb == ub { lb } else { reference::acosh(x) }
     }
 
     /// Measured error: below 3 ulp over `1 <= x < 1e150`.

@@ -251,7 +251,9 @@ pub mod log1p {
                 patch_lanes(
                     x,
                     y,
-                    x.gt_mask(V::splat(-1.0)).and(outside(x, f64::MAX).not()).not(),
+                    x.gt_mask(V::splat(-1.0))
+                        .and(outside(x, f64::MAX).not())
+                        .not(),
                     reference::log1p,
                 )
             } else {

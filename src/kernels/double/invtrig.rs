@@ -224,7 +224,11 @@ mod bit_exact {
         }
         let is_sat = u.ge_mask(V::splat(at::E));
         if is_sat.all() {
-            return V::select(x.gt_mask(V::splat(0.0)), V::splat(at::HPI), V::splat(at::MHPI));
+            return V::select(
+                x.gt_mask(V::splat(0.0)),
+                V::splat(at::HPI),
+                V::splat(at::MHPI),
+            );
         }
 
         let taylor = atan_taylor(x, x * x);
@@ -737,7 +741,9 @@ mod bit_exact {
             let r = V::select(k.lt_mask(V::splat(K_TINY)), x, taylor);
             return r.copysign(x);
         }
-        let is_table = k.ge_mask(V::splat(K_TAYLOR)).and(k.lt_mask(V::splat(K_TABLE)));
+        let is_table = k
+            .ge_mask(V::splat(K_TAYLOR))
+            .and(k.lt_mask(V::splat(K_TABLE)));
         if is_table.all() {
             let table = asin_table(u, k);
             return table.copysign(x);
@@ -788,7 +794,9 @@ mod bit_exact {
             let taylor = acos_taylor(x);
             return V::select(k.lt_mask(V::splat(K_ACOS_TINY)), tiny, taylor);
         }
-        let is_table = k.ge_mask(V::splat(K_TAYLOR)).and(k.lt_mask(V::splat(K_TABLE)));
+        let is_table = k
+            .ge_mask(V::splat(K_TAYLOR))
+            .and(k.lt_mask(V::splat(K_TABLE)));
         if is_table.all() {
             return acos_table(x, u, k);
         }

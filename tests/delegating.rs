@@ -173,4 +173,3 @@ suite!(
     unit_corpus(12),
     f64::atanh
 );
-

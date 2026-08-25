@@ -18,7 +18,6 @@
 //! Values are exact bit patterns; the trailing comment is the upstream
 //! hex-float spelling where upstream spells one, otherwise the decimal value.
 
-
 /// `pi`.
 pub const OPI: f64 = f64::from_bits(0x400921fb54442d18);
 
@@ -45,4 +44,3 @@ pub const TWO500: f64 = f64::from_bits(0x5f30000000000000);
 
 /// `2^-500`.
 pub const TWOM500: f64 = f64::from_bits(0x20b0000000000000);
-

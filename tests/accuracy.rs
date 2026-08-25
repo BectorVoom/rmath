@@ -442,7 +442,10 @@ fn tgamma_dense_boundaries_and_monotonicity() {
         let ours = tg.eval(x);
         let want = libm::tgamma(x);
         let diff = (ours - want).abs() / want;
-        assert!(diff <= 1e-14, "tgamma hand-off accuracy at {x}: ours={ours}, want={want}");
+        assert!(
+            diff <= 1e-14,
+            "tgamma hand-off accuracy at {x}: ours={ours}, want={want}"
+        );
     }
 
     // 2. Dense tests around binade boundaries in [18, 171]
@@ -452,7 +455,10 @@ fn tgamma_dense_boundaries_and_monotonicity() {
             let ours = tg.eval(x);
             let want = libm::tgamma(x);
             let diff = (ours - want).abs() / want;
-            assert!(diff <= 1e-14, "tgamma binade accuracy at {x}: ours={ours}, want={want}");
+            assert!(
+                diff <= 1e-14,
+                "tgamma binade accuracy at {x}: ours={ours}, want={want}"
+            );
         }
     }
 
@@ -463,7 +469,10 @@ fn tgamma_dense_boundaries_and_monotonicity() {
         let want = libm::tgamma(x);
         if want.is_finite() && ours.is_finite() {
             let diff = (ours - want).abs() / want;
-            assert!(diff <= 1e-14, "tgamma near overflow accuracy at {x}: ours={ours}, want={want}");
+            assert!(
+                diff <= 1e-14,
+                "tgamma near overflow accuracy at {x}: ours={ours}, want={want}"
+            );
         }
     }
 
@@ -473,7 +482,10 @@ fn tgamma_dense_boundaries_and_monotonicity() {
     for step in 1..2000 {
         let x = 2.0 + (step as f64) * (169.0 / 2000.0);
         let g = tg.eval(x);
-        assert!(g >= prev_g, "tgamma monotonicity violated between {prev_x} and {x}: {prev_g} vs {g}");
+        assert!(
+            g >= prev_g,
+            "tgamma monotonicity violated between {prev_x} and {x}: {prev_g} vs {g}"
+        );
         prev_x = x;
         prev_g = g;
     }

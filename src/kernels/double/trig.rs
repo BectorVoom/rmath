@@ -301,11 +301,7 @@ mod bit_exact {
             fi.as_mut_slice()[i] = t::XFG[j + 1];
             gi.as_mut_slice()[i] = t::XFG[j + 2];
         }
-        (
-            V::from_bits(xi),
-            V::from_bits(fi),
-            V::from_bits(gi),
-        )
+        (V::from_bits(xi), V::from_bits(fi), V::from_bits(gi))
     }
 
     /// `__tan`'s (IV)/(V) common tail, vectorised: `tan` (or `-cot`) of the
@@ -333,11 +329,7 @@ mod bit_exact {
         // EADD(a, t2, b, db): the strict `>` selects the first branch, the
         // equal/unordered case the second — the same mapping as the
         // disassembly's `jbe`.
-        let db = V::select(
-            a.abs().gt_mask(t2.abs()),
-            (a - b) + t2,
-            (t2 - b) + a,
-        );
+        let db = V::select(a.abs().gt_mask(t2.abs()), (a - b) + t2, (t2 - b) + a);
         // DIV2(1.0, 0.0, b, db, ...) — `-cot`. The `+ 0.0` is the `xx` term.
         let c = V::splat(1.0) / b;
         let u = c * b;
@@ -391,11 +383,7 @@ mod bit_exact {
         let db = xn.mul_add(-V::splat(t::PP4), a - b);
         let da = db + da;
         let sum = b + da;
-        let cc = V::select(
-            b.abs().gt_mask(da.abs()),
-            (b - sum) + da,
-            (da - sum) + b,
-        );
+        let cc = V::select(b.abs().gt_mask(da.abs()), (b - sum) + da, (da - sum) + b);
         (t, sum, cc)
     }
 
