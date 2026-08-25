@@ -424,19 +424,18 @@ pub fn patch_lanes<V: Simd>(
     mask: V::Mask,
     reference: impl Fn(V::Elem) -> V::Elem,
 ) -> V {
-    if mask.none() {
+    let bits = mask.to_bitmask();
+    if bits == 0 {
         return y;
-    }
-    if mask.all() {
-        return map_lanes(x, reference);
     }
     let xs = x.to_array();
     let mut ys = y.to_array();
-    let mut bits = mask.to_bitmask();
-    while bits != 0 {
-        let i = bits.trailing_zeros() as usize;
-        ys.as_mut_slice()[i] = reference(xs.as_slice()[i]);
-        bits &= bits - 1;
+    let xs_slice = xs.as_slice();
+    let ys_slice = ys.as_mut_slice();
+    for i in 0..V::LANES {
+        if (bits & (1 << i)) != 0 {
+            ys_slice[i] = reference(xs_slice[i]);
+        }
     }
     V::from_array(ys)
 }
@@ -450,20 +449,20 @@ pub fn patch_lanes2<V: Simd>(
     mask: V::Mask,
     reference: impl Fn(V::Elem, V::Elem) -> V::Elem,
 ) -> V {
-    if mask.none() {
+    let bits = mask.to_bitmask();
+    if bits == 0 {
         return z;
-    }
-    if mask.all() {
-        return map_lanes2(x, y, reference);
     }
     let xs = x.to_array();
     let ys = y.to_array();
     let mut zs = z.to_array();
-    let mut bits = mask.to_bitmask();
-    while bits != 0 {
-        let i = bits.trailing_zeros() as usize;
-        zs.as_mut_slice()[i] = reference(xs.as_slice()[i], ys.as_slice()[i]);
-        bits &= bits - 1;
+    let xs_slice = xs.as_slice();
+    let ys_slice = ys.as_slice();
+    let zs_slice = zs.as_mut_slice();
+    for i in 0..V::LANES {
+        if (bits & (1 << i)) != 0 {
+            zs_slice[i] = reference(xs_slice[i], ys_slice[i]);
+        }
     }
     V::from_array(zs)
 }
@@ -479,22 +478,22 @@ pub fn patch_lanes_pair<V: Simd>(
     mask: V::Mask,
     reference: impl Fn(V::Elem) -> (V::Elem, V::Elem),
 ) -> (V, V) {
-    if mask.none() {
+    let bits = mask.to_bitmask();
+    if bits == 0 {
         return (y1, y2);
-    }
-    if mask.all() {
-        return map_lanes_pair(x, reference);
     }
     let xs = x.to_array();
     let mut ys1 = y1.to_array();
     let mut ys2 = y2.to_array();
-    let mut bits = mask.to_bitmask();
-    while bits != 0 {
-        let i = bits.trailing_zeros() as usize;
-        let (r1, r2) = reference(xs.as_slice()[i]);
-        ys1.as_mut_slice()[i] = r1;
-        ys2.as_mut_slice()[i] = r2;
-        bits &= bits - 1;
+    let xs_slice = xs.as_slice();
+    let ys1_slice = ys1.as_mut_slice();
+    let ys2_slice = ys2.as_mut_slice();
+    for i in 0..V::LANES {
+        if (bits & (1 << i)) != 0 {
+            let (r1, r2) = reference(xs_slice[i]);
+            ys1_slice[i] = r1;
+            ys2_slice[i] = r2;
+        }
     }
     (V::from_array(ys1), V::from_array(ys2))
 }
@@ -508,23 +507,24 @@ pub fn patch_lanes2_pair<V: Simd>(
     mask: V::Mask,
     reference: impl Fn(V::Elem, V::Elem) -> (V::Elem, V::Elem),
 ) -> (V, V) {
-    if mask.none() {
+    let bits = mask.to_bitmask();
+    if bits == 0 {
         return (z1, z2);
-    }
-    if mask.all() {
-        return map_lanes2_pair(x, y, reference);
     }
     let xs = x.to_array();
     let ys = y.to_array();
     let mut zs1 = z1.to_array();
     let mut zs2 = z2.to_array();
-    let mut bits = mask.to_bitmask();
-    while bits != 0 {
-        let i = bits.trailing_zeros() as usize;
-        let (r1, r2) = reference(xs.as_slice()[i], ys.as_slice()[i]);
-        zs1.as_mut_slice()[i] = r1;
-        zs2.as_mut_slice()[i] = r2;
-        bits &= bits - 1;
+    let xs_slice = xs.as_slice();
+    let ys_slice = ys.as_slice();
+    let zs1_slice = zs1.as_mut_slice();
+    let zs2_slice = zs2.as_mut_slice();
+    for i in 0..V::LANES {
+        if (bits & (1 << i)) != 0 {
+            let (r1, r2) = reference(xs_slice[i], ys_slice[i]);
+            zs1_slice[i] = r1;
+            zs2_slice[i] = r2;
+        }
     }
     (V::from_array(zs1), V::from_array(zs2))
 }

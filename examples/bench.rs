@@ -1012,7 +1012,17 @@ fn repair_benchmarks(n: usize) {
 
     let lanes = <rmath::Widest as Simd>::LANES;
     let exp = Exp::new();
+    let exp2 = Exp2::new();
+    let expm1 = Expm1::new();
+    let cosh = Cosh::new();
+    let sinh = Sinh::new();
+    let tanh = Tanh::new();
+    let asinh = Asinh::new();
+    let acosh = Acosh::new();
+    let atanh = Atanh::new();
+    let y0 = Y0::new();
     let erf = Erf::new();
+    let erfc = Erfc::new();
     let sin = Sin::new();
     let pow = Pow::new();
     let atan2 = Atan2::new();
@@ -1030,7 +1040,17 @@ fn repair_benchmarks(n: usize) {
             for _ in 0..WARMUP {
                 match name {
                     "exp" => exp.eval_slice(&src, &mut dst),
+                    "exp2" => exp2.eval_slice(&src, &mut dst),
+                    "expm1" => expm1.eval_slice(&src, &mut dst),
+                    "cosh" => cosh.eval_slice(&src, &mut dst),
+                    "sinh" => sinh.eval_slice(&src, &mut dst),
+                    "tanh" => tanh.eval_slice(&src, &mut dst),
+                    "asinh" => asinh.eval_slice(&src, &mut dst),
+                    "acosh" => acosh.eval_slice(&src, &mut dst),
+                    "atanh" => atanh.eval_slice(&src, &mut dst),
+                    "y0" => y0.eval_slice(&src, &mut dst),
                     "erf" => erf.eval_slice(&src, &mut dst),
+                    "erfc" => erfc.eval_slice(&src, &mut dst),
                     "sin" => sin.eval_slice(&src, &mut dst),
                     "pow" => pow.eval_slice(&src, &src, &mut dst),
                     "atan2" => atan2.eval_slice(&src, &src, &mut dst),
@@ -1043,7 +1063,17 @@ fn repair_benchmarks(n: usize) {
                 let t = Instant::now();
                 match name {
                     "exp" => exp.eval_slice(&src, &mut dst),
+                    "exp2" => exp2.eval_slice(&src, &mut dst),
+                    "expm1" => expm1.eval_slice(&src, &mut dst),
+                    "cosh" => cosh.eval_slice(&src, &mut dst),
+                    "sinh" => sinh.eval_slice(&src, &mut dst),
+                    "tanh" => tanh.eval_slice(&src, &mut dst),
+                    "asinh" => asinh.eval_slice(&src, &mut dst),
+                    "acosh" => acosh.eval_slice(&src, &mut dst),
+                    "atanh" => atanh.eval_slice(&src, &mut dst),
+                    "y0" => y0.eval_slice(&src, &mut dst),
                     "erf" => erf.eval_slice(&src, &mut dst),
+                    "erfc" => erfc.eval_slice(&src, &mut dst),
                     "sin" => sin.eval_slice(&src, &mut dst),
                     "pow" => pow.eval_slice(&src, &src, &mut dst),
                     "atan2" => atan2.eval_slice(&src, &src, &mut dst),
@@ -1067,111 +1097,78 @@ fn repair_benchmarks(n: usize) {
         );
     };
 
-    // exp repairs on x > 709.7 or x < -745.0 or NaN
-    run_density("exp", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| {
-                if step > 0 && i % step == 0 {
-                    750.0
-                } else {
-                    1.5
-                }
-            })
-            .collect()
-    });
+    let make_density_vec = |val_ok: f64, val_bad: f64| -> Box<dyn Fn(f64) -> Vec<f64>> {
+        Box::new(move |pct: f64| {
+            let step = if pct <= 0.0 {
+                usize::MAX
+            } else {
+                (1.0 / pct).round() as usize
+            };
+            (0..n)
+                .map(|i| if step > 0 && i % step == 0 { val_bad } else { val_ok })
+                .collect()
+        })
+    };
 
-    // erf repairs on |x| >= 6.0 or special
-    run_density("erf", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| if step > 0 && i % step == 0 { 10.0 } else { 1.5 })
-            .collect()
-    });
+    run_density("exp", &*make_density_vec(1.5, 750.0));
+    run_density("exp2", &*make_density_vec(1.5, 1100.0));
+    run_density("expm1", &*make_density_vec(1.5, 750.0));
+    run_density("cosh", &*make_density_vec(1.5, 750.0));
+    run_density("sinh", &*make_density_vec(1.5, 750.0));
+    run_density("tanh", &*make_density_vec(1.5, f64::NAN));
+    run_density("asinh", &*make_density_vec(1.5, f64::NAN));
+    run_density("acosh", &*make_density_vec(2.0, 0.5));
+    run_density("atanh", &*make_density_vec(0.5, 1.5));
+    run_density("y0", &*make_density_vec(1.5, 5.0));
+    run_density("erf", &*make_density_vec(1.5, 10.0));
+    run_density("erfc", &*make_density_vec(1.5, 10.0));
+    run_density("sin", &*make_density_vec(1.5, 10000.0));
+    run_density("pow", &*make_density_vec(2.0, f64::NAN));
+    run_density("atan2", &*make_density_vec(2.0, 0.0));
+    run_density("sincos", &*make_density_vec(1.5, 1e8));
+    run_density("modf", &*make_density_vec(1.5, f64::INFINITY));
 
-    // sin repairs on |x| >= 804.0 (for bit exact reduction)
-    run_density("sin", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| {
-                if step > 0 && i % step == 0 {
-                    10000.0
-                } else {
-                    1.5
-                }
-            })
-            .collect()
-    });
+    // S2.1: Instrument density across corpora
+    println!("\nmeasured repair mask fire rates by corpus (%)");
+    println!(
+        "{:<15} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "function", "in-domain", "boundary", "random-bit", "coherent", "mixed-spec"
+    );
+    println!("{}", "-".repeat(78));
 
-    // pow repairs on non-normal/extreme
-    run_density("pow", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| {
-                if step > 0 && i % step == 0 {
-                    f64::NAN
-                } else {
-                    2.0
-                }
-            })
-            .collect()
-    });
+    let corpora_names = ["in-domain", "boundary", "random-bit", "coherent", "mixed-special"];
+    let check_fire = |name: &str, is_bad: &dyn Fn(f64) -> bool| {
+        let mut rates = Vec::new();
+        for &cname in &corpora_names {
+            let corpus = generate_corpora(cname, n);
+            let args = match name {
+                "erf" => &corpus.erfargs,
+                "erfc" => &corpus.erfcargs,
+                "y0" | "y1" | "j0" | "j1" => &corpus.besselargs,
+                "cosh" | "sinh" | "tanh" | "asinh" | "acosh" | "atanh" => &corpus.hypargs,
+                _ => &corpus.expargs,
+            };
+            let bad_count = args.iter().filter(|&&x| is_bad(x)).count();
+            let pct = (bad_count as f64 / args.len() as f64) * 100.0;
+            rates.push(pct);
+            record(format!("mask_fire_{name}_{cname}"), "pct", pct, pct);
+        }
+        println!(
+            "{:<15} {:>11.2}% {:>11.2}% {:>11.2}% {:>11.2}% {:>11.2}%",
+            name, rates[0], rates[1], rates[2], rates[3], rates[4]
+        );
+    };
 
-    // atan2 repairs on zero/infinite/NaN
-    run_density("atan2", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| if step > 0 && i % step == 0 { 0.0 } else { 2.0 })
-            .collect()
-    });
-
-    // sincos repairs on large angles
-    run_density("sincos", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| if step > 0 && i % step == 0 { 1e8 } else { 1.5 })
-            .collect()
-    });
-
-    // modf repairs on inf/nan
-    run_density("modf", &|pct| {
-        let step = if pct <= 0.0 {
-            usize::MAX
-        } else {
-            (1.0 / pct).round() as usize
-        };
-        (0..n)
-            .map(|i| {
-                if step > 0 && i % step == 0 {
-                    f64::INFINITY
-                } else {
-                    1.5
-                }
-            })
-            .collect()
-    });
+    check_fire("exp", &|x| x > 709.78271289338397 || x < -745.1332191019411 || !x.is_finite());
+    check_fire("exp2", &|x| x.abs() >= 1024.0 || !x.is_finite());
+    check_fire("expm1", &|x| x > 709.78271289338397 || !x.is_finite());
+    check_fire("cosh", &|x| x.abs() > 710.4758600739439 || !x.is_finite());
+    check_fire("sinh", &|x| x.abs() > 710.4758600739439 || !x.is_finite());
+    check_fire("tanh", &|x| !x.is_normal() && x != 0.0);
+    check_fire("asinh", &|x| !x.is_normal() && x != 0.0);
+    check_fire("acosh", &|x| x < 1.0 || !x.is_finite());
+    check_fire("atanh", &|x| x.abs() >= 1.0 || !x.is_finite());
+    check_fire("y0", &|x| x <= 0.0 || x >= 2.0 || !x.is_finite());
+    check_fire("erf", &|x| x.abs() >= 6.0 || !x.is_finite());
+    check_fire("erfc", &|x| x.abs() >= 6.0 || !x.is_finite());
 }
