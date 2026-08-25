@@ -94,13 +94,16 @@ unary_vector! {
 }
 
 unary_vector! {
-    /// `sqrt(x)`, correctly rounded.
+    /// `sqrt(x)`, correctly rounded in both single (`sqrtf`) and double (`sqrt`) precision.
     ///
-    /// Both policy axes are no-ops, and unusually that needs no apology:
-    /// IEEE-754 *requires* `sqrt` to be correctly rounded, and every target
-    /// this crate runs on implements it as a single instruction that already
-    /// handles zero, infinity, NaN and negatives to specification. There is no
-    /// reference to match — the hardware is the reference.
+    /// Both policy axes are no-ops: IEEE-754 *requires* square root to be correctly
+    /// rounded in all rounding modes, and every modern architecture implements it as
+    /// a dedicated hardware instruction (`vsqrtpd`/`vsqrtps` or `sqrtsd`/`sqrtss`).
+    ///
+    /// glibc's `sqrt` and `sqrtf` lower to the identical hardware instruction;
+    /// hence `BitExact` matches glibc bit-for-bit across all 2^32 `f32` inputs and all
+    /// `f64` inputs (including signed zeros, subnormals, +inf, negatives returning NaN,
+    /// and quiet/signaling NaNs) with zero scalar repair overhead.
     sqrt, sqrt
 }
 

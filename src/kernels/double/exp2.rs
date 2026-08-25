@@ -24,6 +24,9 @@
 //! vector `exp` (0.78 ns/elem), but the faster baseline produces a ratio of
 //! `1.62 / 1.01 = 1.60x–1.72x` for `exp2` vs `2.17 / 0.78 = 2.78x–3.02x` for `exp`.
 //!
+//! 1 ulp on `exp2` `Fast` is optimal; `pow`'s 2-ulp floor is the product reduction's
+//! unavoidable 1-ulp contribution; no further tightening possible without a double-double product.
+//!
 //! `Finite` means `|x| < 512`.
 
 use crate::kernels::double::dd::a_mul;
