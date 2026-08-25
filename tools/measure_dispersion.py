@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Quantify benchmark dispersion for cheap rows (floor, round, trunc, sqrt)
-across 10 alternating runs on identical binary at sizes 4096 and 1048576.
+"""Quantify benchmark dispersion across 10 alternating runs on identical binary.
+
+Covers cheap rows (floor, round, trunc, sqrt, sqrtf, pow) on in-domain,
+plus targeted corpus-adversarial rows (cosh, expm1 on boundary, erfc, y0 on random-bit,
+acosh on coherent) at sizes 4096 and 1048576.
 """
 
 from __future__ import annotations
 
 import csv
-import io
 import json
 import os
 import subprocess
@@ -49,88 +51,126 @@ def run_bench(size: int, corpus: str = "in-domain") -> dict[str, dict[str, float
             tmp_path.unlink()
 
 
+def stats(vals: list[float]) -> dict[str, float]:
+    if not vals:
+        return {"min": 0.0, "max": 0.0, "median": 0.0, "range": 0.0, "rel_dispersion": 0.0}
+    s_vals = sorted(vals)
+    n = len(s_vals)
+    if n % 2 == 0:
+        med = 0.5 * (s_vals[n // 2 - 1] + s_vals[n // 2])
+    else:
+        med = s_vals[n // 2]
+    mn = s_vals[0]
+    mx = s_vals[-1]
+    rng = mx - mn
+    rel_disp = rng / med if med > 0 else 0.0
+    return {
+        "min": mn,
+        "max": mx,
+        "median": med,
+        "range": rng,
+        "rel_dispersion": rel_disp,
+    }
+
+
 def main() -> int:
-    target_fns = ["floor", "round", "trunc", "sqrt"]
-    sizes = [4096, 1048576]
     reps = 10
+    configs = [
+        # (corpus, size, target_fns)
+        ("in-domain", 4096, ["floor", "round", "trunc", "sqrt", "sqrtf", "pow"]),
+        ("in-domain", 1048576, ["floor", "round", "trunc", "sqrt", "sqrtf", "pow"]),
+        ("boundary", 1048576, ["cosh", "expm1", "pow"]),
+        ("random-bit", 1048576, ["erfc", "y0"]),
+        ("coherent", 1048576, ["acosh"]),
+    ]
 
     print(f"Building benchmark binary...")
     env = dict(os.environ)
     env["RUSTFLAGS"] = "-C target-cpu=native"
     subprocess.run(["cargo", "build", "--release", "--example", "bench"], env=env, check=True)
 
-    results: dict[str, list[dict[str, dict[str, float]]]] = {str(s): [] for s in sizes}
+    # Key: (corpus, size) -> list of run dicts
+    collected: dict[tuple[str, int], list[dict[str, dict[str, float]]]] = {}
 
-    print(f"Running {reps} alternating runs across sizes {sizes}...")
+    print(f"Running {reps} alternating runs across configured targets...")
     for rep in range(reps):
-        for s in sizes:
-            print(f"  Rep {rep+1}/{reps}, size {s}...", flush=True)
-            data = run_bench(s)
-            results[str(s)].append(data)
+        for corpus, size, _ in configs:
+            key = (corpus, size)
+            if key not in collected:
+                collected[key] = []
+            print(f"  Rep {rep+1}/{reps}, corpus={corpus}, size={size}...", flush=True)
+            data = run_bench(size, corpus)
+            collected[key].append(data)
 
     out_csv = Path("bench_results/dispersion.csv")
     out_json = Path("bench_results/dispersion.json")
 
     rows = []
-    summary_data = {}
+    summary_data: dict[str, dict] = {}
 
-    for s in sizes:
-        s_key = str(s)
-        summary_data[s_key] = {}
+    for corpus, size, target_fns in configs:
+        key = (corpus, size)
+        s_key = str(size)
+        runs = collected[key]
+
+        if corpus not in summary_data:
+            summary_data[corpus] = {}
+        if s_key not in summary_data[corpus]:
+            summary_data[corpus][s_key] = {}
+
+        # Also support legacy top-level size key for in-domain
+        if corpus == "in-domain":
+            if s_key not in summary_data:
+                summary_data[s_key] = {}
+
         for fn in target_fns:
-            exact_speedups = [results[s_key][r][fn]["exact_speedup"] for r in range(reps)]
-            exact_ns = [results[s_key][r][fn]["exact_ns"] for r in range(reps)]
-            exact_f_speedups = [results[s_key][r][fn].get("exact/F_speedup", exact_speedups[r]) for r in range(reps)]
-            exact_f_ns = [results[s_key][r][fn].get("exact/F_ns", exact_ns[r]) for r in range(reps)]
+            fn_summary = {}
+            metric_keys = set()
+            for r in runs:
+                if fn in r:
+                    metric_keys.update(r[fn].keys())
 
-            def stats(vals: list[float]) -> dict[str, float]:
-                s_vals = sorted(vals)
-                med = 0.5 * (s_vals[4] + s_vals[5])
-                mn = s_vals[0]
-                mx = s_vals[-1]
-                rng = mx - mn
-                rel_disp = rng / med if med > 0 else 0.0
-                return {
-                    "min": mn,
-                    "max": mx,
-                    "median": med,
-                    "range": rng,
-                    "rel_dispersion": rel_disp,
-                }
+            metrics = set(k.rsplit("_", 1)[0] for k in metric_keys)
+            for m in sorted(metrics):
+                spds = [runs[i][fn][f"{m}_speedup"] for i in range(reps) if fn in runs[i] and f"{m}_speedup" in runs[i][fn]]
+                nss = [runs[i][fn][f"{m}_ns"] for i in range(reps) if fn in runs[i] and f"{m}_ns" in runs[i][fn]]
+                spd_stat = stats(spds)
+                ns_stat = stats(nss)
+                fn_summary[f"{m}_speedup"] = spd_stat
+                fn_summary[f"{m}_ns"] = ns_stat
 
-            fn_stats = {
-                "exact_speedup": stats(exact_speedups),
-                "exact_ns": stats(exact_ns),
-                "exact_f_speedup": stats(exact_f_speedups),
-                "exact_f_ns": stats(exact_f_ns),
-            }
-            summary_data[s_key][fn] = fn_stats
+                rows.append({
+                    "corpus": corpus,
+                    "size": size,
+                    "function": fn,
+                    "metric": m,
+                    "spd_min": f"{spd_stat['min']:.4f}",
+                    "spd_median": f"{spd_stat['median']:.4f}",
+                    "spd_max": f"{spd_stat['max']:.4f}",
+                    "spd_disp_pct": f"{spd_stat['rel_dispersion']*100:.2f}%",
+                    "ns_min": f"{ns_stat['min']:.4f}",
+                    "ns_median": f"{ns_stat['median']:.4f}",
+                    "ns_max": f"{ns_stat['max']:.4f}",
+                    "ns_disp_pct": f"{ns_stat['rel_dispersion']*100:.2f}%",
+                })
 
-            rows.append({
-                "size": s,
-                "function": fn,
-                "exact_spd_min": f"{fn_stats['exact_speedup']['min']:.4f}",
-                "exact_spd_median": f"{fn_stats['exact_speedup']['median']:.4f}",
-                "exact_spd_max": f"{fn_stats['exact_speedup']['max']:.4f}",
-                "exact_spd_disp_pct": f"{fn_stats['exact_speedup']['rel_dispersion']*100:.2f}%",
-                "exact_ns_min": f"{fn_stats['exact_ns']['min']:.4f}",
-                "exact_ns_median": f"{fn_stats['exact_ns']['median']:.4f}",
-                "exact_ns_max": f"{fn_stats['exact_ns']['max']:.4f}",
-                "exact_ns_disp_pct": f"{fn_stats['exact_ns']['rel_dispersion']*100:.2f}%",
-            })
+            summary_data[corpus][s_key][fn] = fn_summary
+            if corpus == "in-domain":
+                summary_data[s_key][fn] = fn_summary
 
-    # Write CSV
     fieldnames = [
+        "corpus",
         "size",
         "function",
-        "exact_spd_min",
-        "exact_spd_median",
-        "exact_spd_max",
-        "exact_spd_disp_pct",
-        "exact_ns_min",
-        "exact_ns_median",
-        "exact_ns_max",
-        "exact_ns_disp_pct",
+        "metric",
+        "spd_min",
+        "spd_median",
+        "spd_max",
+        "spd_disp_pct",
+        "ns_min",
+        "ns_median",
+        "ns_max",
+        "ns_disp_pct",
     ]
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -140,17 +180,16 @@ def main() -> int:
     out_json.write_text(json.dumps(summary_data, indent=2))
     print(f"\nWrote dispersion data to {out_csv} and {out_json}")
 
-    # Print summary table
     print("\nDispersion summary across 10 identical-binary runs:")
-    print(f"{'size':<8} {'function':<8} {'spd min..max (med)':<22} {'spd disp':<10} {'ns min..max (med)':<22} {'ns disp':<10}")
-    print("-" * 82)
+    print(f"{'corpus':<12} {'size':<8} {'function':<8} {'metric':<8} {'spd min..max (med)':<22} {'spd disp':<10} {'ns min..max (med)':<22} {'ns disp':<10}")
+    print("-" * 105)
     for r in rows:
         print(
-            f"{r['size']:<8} {r['function']:<8} "
-            f"{r['exact_spd_min']}..{r['exact_spd_max']} ({r['exact_spd_median']})  "
-            f"{r['exact_spd_disp_pct']:<10} "
-            f"{r['exact_ns_min']}..{r['exact_ns_max']} ({r['exact_ns_median']})  "
-            f"{r['exact_ns_disp_pct']:<10}"
+            f"{r['corpus']:<12} {r['size']:<8} {r['function']:<8} {r['metric']:<8} "
+            f"{r['spd_min']}..{r['spd_max']} ({r['spd_median']})  "
+            f"{r['spd_disp_pct']:<10} "
+            f"{r['ns_min']}..{r['ns_max']} ({r['ns_median']})  "
+            f"{r['ns_disp_pct']:<10}"
         )
 
     return 0

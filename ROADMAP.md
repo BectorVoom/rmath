@@ -1135,7 +1135,7 @@ widening whenever the f64 kernel does more than the f32 result needs.
   - **Cycle 3 P2: `pow` extreme-exponent corpus (8 asserted / 5 measured).**
     Added the second-order `pl_ln2` correction term `pl_ln2.mul_add(pl_ln2 * 0.5, pl_ln2)` to `pow::fast`'s
     exponential combine. Verified at 10M samples in `scan_pow` (2 ulp on wide/moderate/near-1-big-y, 5 ulp
-    on extreme exponent) with 8 ulp asserted headroom, with `pow` measuring 1.94x exact / 2.73x fast and
+    on extreme exponent) with 8 ulp asserted headroom, with `pow` measuring 1.82x exact / 2.55x fast (10-run median; band 1.66–1.82x exact, 2.47–2.62x fast at 1M in-domain) and
     no degradation to `tgamma` (10.20x).
   - **Cycle 3 S4: Structural throughput diagnoses (`cosh`, `atan2`, `erfc`).**
     (1) `cosh` exact (1.68x) vs `sinh` (3.72x): glibc's scalar `cosh` baseline is already 3.9 ns (vs `sinh`'s 11.2 ns)
