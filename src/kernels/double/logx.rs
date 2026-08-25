@@ -271,7 +271,7 @@ pub mod log1p {
     }
 
     /// Replays glibc's `__log1p_fma` schedule lane-parallel, matching [`reference::log1p`].
-    #[allow(unused_assignments)]
+    #[allow(unused_assignments, clippy::needless_range_loop)]
     #[inline(always)]
     fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
         const TINY_CUT: f64 = f64::from_bits(0x3e20_0000_0000_0000); // 2^-29
