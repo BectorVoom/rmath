@@ -1,0 +1,246 @@
+{
+  "4096": {
+    "floor": {
+      "exact_speedup": {
+        "min": 0.9744,
+        "max": 1.1045,
+        "median": 0.99375,
+        "range": 0.1301,
+        "rel_dispersion": 0.1309182389937107
+      },
+      "exact_ns": {
+        "min": 0.0941,
+        "max": 0.1063,
+        "median": 0.09725,
+        "range": 0.012200000000000003,
+        "rel_dispersion": 0.12544987146529565
+      },
+      "exact_f_speedup": {
+        "min": 0.9744,
+        "max": 1.1703,
+        "median": 1.0,
+        "range": 0.19589999999999985,
+        "rel_dispersion": 0.19589999999999985
+      },
+      "exact_f_ns": {
+        "min": 0.0952,
+        "max": 0.1003,
+        "median": 0.0955,
+        "range": 0.005099999999999993,
+        "rel_dispersion": 0.05340314136125648
+      }
+    },
+    "round": {
+      "exact_speedup": {
+        "min": 0.7994,
+        "max": 0.8768,
+        "median": 0.83955,
+        "range": 0.07740000000000002,
+        "rel_dispersion": 0.09219224584598895
+      },
+      "exact_ns": {
+        "min": 0.1174,
+        "max": 0.1467,
+        "median": 0.1205,
+        "range": 0.029299999999999993,
+        "rel_dispersion": 0.2431535269709543
+      },
+      "exact_f_speedup": {
+        "min": 0.7915,
+        "max": 1.0098,
+        "median": 0.83955,
+        "range": 0.21830000000000005,
+        "rel_dispersion": 0.2600202489428861
+      },
+      "exact_f_ns": {
+        "min": 0.1174,
+        "max": 0.1248,
+        "median": 0.1199,
+        "range": 0.00739999999999999,
+        "rel_dispersion": 0.061718098415346034
+      }
+    },
+    "trunc": {
+      "exact_speedup": {
+        "min": 0.9525,
+        "max": 1.0336,
+        "median": 0.9922500000000001,
+        "range": 0.08110000000000006,
+        "rel_dispersion": 0.08173343411438655
+      },
+      "exact_ns": {
+        "min": 0.0941,
+        "max": 0.1089,
+        "median": 0.09720000000000001,
+        "range": 0.014799999999999994,
+        "rel_dispersion": 0.15226337448559663
+      },
+      "exact_f_speedup": {
+        "min": 0.9651,
+        "max": 1.123,
+        "median": 0.993,
+        "range": 0.15790000000000004,
+        "rel_dispersion": 0.15901309164149047
+      },
+      "exact_f_ns": {
+        "min": 0.093,
+        "max": 0.1014,
+        "median": 0.09605,
+        "range": 0.008400000000000005,
+        "rel_dispersion": 0.08745445080687148
+      }
+    },
+    "sqrt": {
+      "exact_speedup": {
+        "min": 0.9974,
+        "max": 1.0059,
+        "median": 1.00425,
+        "range": 0.008500000000000063,
+        "rel_dispersion": 0.008464027881503671
+      },
+      "exact_ns": {
+        "min": 0.4109,
+        "max": 0.4574,
+        "median": 0.41655,
+        "range": 0.046499999999999986,
+        "rel_dispersion": 0.1116312567518905
+      },
+      "exact_f_speedup": {
+        "min": 1.0,
+        "max": 1.0059,
+        "median": 1.0041,
+        "range": 0.005900000000000016,
+        "rel_dispersion": 0.005875908774026508
+      },
+      "exact_f_ns": {
+        "min": 0.411,
+        "max": 0.4574,
+        "median": 0.41595,
+        "range": 0.0464,
+        "rel_dispersion": 0.11155186921504988
+      }
+    }
+  },
+  "1048576": {
+    "floor": {
+      "exact_speedup": {
+        "min": 0.6579,
+        "max": 1.2208,
+        "median": 1.15065,
+        "range": 0.5629000000000001,
+        "rel_dispersion": 0.4892017555294834
+      },
+      "exact_ns": {
+        "min": 0.1833,
+        "max": 0.4067,
+        "median": 0.19955,
+        "range": 0.22340000000000002,
+        "rel_dispersion": 1.1195189175645202
+      },
+      "exact_f_speedup": {
+        "min": 0.7149,
+        "max": 1.9456,
+        "median": 1.2327,
+        "range": 1.2307000000000001,
+        "rel_dispersion": 0.998377545225927
+      },
+      "exact_f_ns": {
+        "min": 0.1719,
+        "max": 0.3173,
+        "median": 0.18595,
+        "range": 0.14540000000000003,
+        "rel_dispersion": 0.7819306265125034
+      }
+    },
+    "round": {
+      "exact_speedup": {
+        "min": 0.894,
+        "max": 2.1656,
+        "median": 0.9739,
+        "range": 1.2715999999999998,
+        "rel_dispersion": 1.3056782010473353
+      },
+      "exact_ns": {
+        "min": 0.1709,
+        "max": 0.2206,
+        "median": 0.1782,
+        "range": 0.049699999999999994,
+        "rel_dispersion": 0.2789001122334455
+      },
+      "exact_f_speedup": {
+        "min": 0.4684,
+        "max": 2.316,
+        "median": 0.9558500000000001,
+        "range": 1.8476,
+        "rel_dispersion": 1.9329392687137101
+      },
+      "exact_f_ns": {
+        "min": 0.168,
+        "max": 0.4443,
+        "median": 0.18209999999999998,
+        "range": 0.2763,
+        "rel_dispersion": 1.5172981878088962
+      }
+    },
+    "trunc": {
+      "exact_speedup": {
+        "min": 0.9893,
+        "max": 1.2058,
+        "median": 1.0268,
+        "range": 0.21650000000000003,
+        "rel_dispersion": 0.21084924035839506
+      },
+      "exact_ns": {
+        "min": 0.1589,
+        "max": 0.1781,
+        "median": 0.1643,
+        "range": 0.019199999999999995,
+        "rel_dispersion": 0.11685940353012778
+      },
+      "exact_f_speedup": {
+        "min": 0.8805,
+        "max": 1.095,
+        "median": 1.01355,
+        "range": 0.21450000000000002,
+        "rel_dispersion": 0.2116323812342756
+      },
+      "exact_f_ns": {
+        "min": 0.1589,
+        "max": 0.2138,
+        "median": 0.16704999999999998,
+        "range": 0.05489999999999998,
+        "rel_dispersion": 0.3286441185273869
+      }
+    },
+    "sqrt": {
+      "exact_speedup": {
+        "min": 0.9919,
+        "max": 1.0541,
+        "median": 1.0145,
+        "range": 0.06220000000000003,
+        "rel_dispersion": 0.06131099063578121
+      },
+      "exact_ns": {
+        "min": 0.4099,
+        "max": 0.4281,
+        "median": 0.41845,
+        "range": 0.018199999999999994,
+        "rel_dispersion": 0.04349384633767474
+      },
+      "exact_f_speedup": {
+        "min": 0.9845,
+        "max": 1.0419,
+        "median": 1.0244,
+        "range": 0.05740000000000001,
+        "rel_dispersion": 0.05603279968762203
+      },
+      "exact_f_ns": {
+        "min": 0.4107,
+        "max": 0.4401,
+        "median": 0.4154,
+        "range": 0.02939999999999998,
+        "rel_dispersion": 0.07077515647568604
+      }
+    }
+  }
+}

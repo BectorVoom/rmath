@@ -1078,6 +1078,29 @@ widening whenever the f64 kernel does more than the f32 result needs.
     "MyHypot3" lane-parallel with unfused arithmetic and `V::select` branch
     blending. Both verified bit-exact across all SIMD widths (1, 2, 4, 8)
     in `tests/bit_exact.rs`.
+  - **Cycle 2 S1: `acosh` and `asinh` exact band vectorisation (`de0e0a4`).**
+    Replaced per-lane scalar evaluation loop with vectorised evaluation of polynomial
+    bands (`1/(x*x)` series) and shared log tail arithmetic (`t::B`/`R1`/`R2`/`L1`/`L2`),
+    evaluating bands unconditionally and blending via `V::select`. Per-lane lookup is retained
+    only for table index indexing. `lb == ub` accurate path rejection routes rejected lanes
+    through `patch_lanes` to reference. Measured: `acosh` exact moved from 0.83x to **1.90x**
+    in-domain (2.01x `+Finite`), `asinh` moved from 1.24x to **2.38x** (2.44x `+Finite`).
+  - **Cycle 2 S2: `asin`/`acos` parity investigation and Documented Accept (`80126f5`).**
+    Experiments with hardware gathers (`vpgatherqq`) and table layout splits confirmed
+    that on this microarchitecture (Zen 5 AVX-512), 13-slot gathers on incoherent input
+    cannot beat scalar glibc's branchy cache-hitting path. Closed with permanent Documented
+    Accept at 0.75-0.77x exact (0.76-0.77x `+Finite`), with `Fast` delivering 8.5-10.2x.
+  - **Cycle 2 S3: `log1p` vector direct path and reduction (`9cdbd03`).**
+    Vectorised the branchy reduction (`k`, `c`, `f`, `hu` extraction) with arithmetic
+    exponent splitting and `c` compensation per vector with two-way `V::select` for
+    `hu < 0x6a09e` normalisation, leaving per-lane work only where integer shift is required,
+    feeding vector Horner FMA tail evaluation. Moved `log1p` exact from 1.05x to **1.97x**
+    in-domain (2.18x `+Finite`, 2.57-2.69x on default corpus).
+  - **Cycle 2 S5 hoist: `pow_exp` big scale branches (`1b2d243`).**
+    The big-scale branches (`k >= 1023*128` and `k >= 1024*128`) added for `tgamma` in
+    `pow_exp` were paying cost on every `pow` call. Hoisted behind a whole-vector
+    `kd.gt_mask(...)` guard, eliminating the per-lane comparison overhead for ordinary inputs.
+    Moved `pow` exact from 1.47x to **1.84x**.
 
 ## 7. Suggested sequencing
 

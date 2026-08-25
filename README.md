@@ -178,47 +178,44 @@ call it replaces.
 
 | function | scalar | `BitExact` | + `Finite` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|--:|
-| `exp`   |  2.17 ns | **2.20x** | 2.73x | 3.82x | **3.96x** |
-| `exp2`  |  1.62 ns | **1.67x** | 1.89x | 3.41x | **3.43x** |
-| `expm1` |  8.18 ns | **2.48x** | 3.78x | 9.52x | **10.73x** |
-| `ln`    |  1.99 ns | **1.90x** | 2.15x | 3.01x | **3.46x** |
-| `log2`  |  2.27 ns | **1.91x** | 2.06x | 3.66x | **4.46x** |
-| `pow`   | 12.59 ns | **1.47x** | — | 2.05x | — |
-| `cbrt`  |  8.62 ns | **1.67x** | 1.76x | — | — |
-| `sinh`  | 12.22 ns | **3.77x** | 3.86x | 11.49x | **13.17x** |
-| `cosh`  |  3.12 ns | **1.70x** | 1.96x | 4.27x | **4.68x** |
-| `tanh`  | 11.04 ns | **2.67x** | 2.88x | 11.01x | **11.37x** |
-| `sqrt`  |  0.42 ns | 1.00x | — | — | — |
-| `sin`   | 13.58 ns | **2.97x** | 2.63x | 19.60x | **20.35x** |
-| `cos`   | 14.20 ns | **3.01x** | 2.58x | 20.45x | **21.22x** |
-| `sincos`| 17.97 ns | **3.59x** | 3.72x | 19.11x | **25.55x** |
-| `tan`   | 16.86 ns | **2.77x** | 2.70x | 19.63x | **20.97x** |
-| `atan`  |  7.05 ns | **1.28x** | 1.16-1.18x | 9.08x | **9.42x** |
-| `atan2` | 14.98 ns | **2.74-3.03x** | 8.03-8.36x | — |
-| `asin`  | 12.7 ns | 0.83-0.84x | 0.87x | 8.36-8.45x | **10.2x** |
-| `acos`  | 12.8 ns | 0.84-0.85x | 0.86x | 8.44-8.51x | **10.2x** |
-| `log10` |  5.50 ns | **2.61x** | 2.27x | 8.26x | **10.03x** |
-| `log1p` |  9.99 ns | **1.13x** | 1.31x | 11.39x | **14.36x** |
-| `atanh` | 14.12 ns | **1.29x** | 1.29x | 13.73x | **14.95x** |
-| `hypot` |  6.70 ns | **1.93x** | — | 4.82x | — |
+| `exp`   |  2.17 ns | **3.02x** | 3.47x | 4.34x | **4.45x** |
+| `exp2`  |  1.62 ns | **1.72x** | 2.02x | 3.48x | **3.46x** |
+| `expm1` |  8.18 ns | **3.56x** | 3.96x | 9.42x | **11.04x** |
+| `ln`    |  1.99 ns | **2.62x** | 2.94x | 3.49x | **3.70x** |
+| `log2`  |  2.27 ns | **2.67x** | 2.96x | 3.72x | **4.70x** |
+| `pow`   | 12.59 ns | **1.84x** | — | 2.59x | — |
+| `cbrt`  |  8.62 ns | **1.76x** | 1.76x | 7.62x | **8.55x** |
+| `sinh`  | 12.22 ns | **3.58x** | 3.87x | 10.00x | **10.93x** |
+| `cosh`  |  3.12 ns | **1.64x** | 1.73x | 5.57x | **6.08x** |
+| `tanh`  | 11.04 ns | **3.23x** | 3.38x | 9.10x | **10.42x** |
+| `asinh` |  4.65 ns | **2.38x** | 2.44x | 5.49x | **5.82x** |
+| `acosh` |  4.54 ns | **1.90x** | 2.01x | 7.50x | **8.32x** |
+| `atanh` |  3.88 ns | **3.54x** | 3.62x | 13.82x | **14.87x** |
+| `sqrt`  |  0.43 ns | 0.73x (1.05x @4k) | 1.05x | 1.05x | 1.05x |
+| `sin`   | 13.58 ns | **2.07x** (2.97x def) | 2.07x | 16.67x | **16.83x** |
+| `cos`   | 14.20 ns | **1.78x** (3.01x def) | 1.84x | 15.40x | **15.56x** |
+| `sincos`| 17.97 ns | **2.45x** (3.59x def) | 2.51x | 17.61x | **19.03x** |
+| `tan`   | 16.86 ns | **2.51x** (2.77x def) | 2.55x | 18.02x | **18.93x** |
+| `atan`  |  7.05 ns | **1.92x** (8.52x coh) | 1.87x | 11.64x | **13.48x** |
+| `atan2` | 14.98 ns | **1.58x** (2.74-3.03x def) | — | 12.40x | — |
+| `asin`  | 12.70 ns | 0.77x | 0.77x | 8.52x | **9.25x** |
+| `acos`  | 12.80 ns | 0.75x | 0.76x | 8.58x | **9.36x** |
+| `log10` |  5.50 ns | **3.07x** | 3.39x | 7.52x | **9.43x** |
+| `log1p` |  9.99 ns | **1.97x** (2.69x def) | 2.18x | 9.05x | **11.37x** |
+| `hypot` |  6.70 ns | **2.81x** | — | 5.09x | — |
 
-`tan`/`atan`/`atan2`/`asin`/`acos`/`atanh`/`log10`/`log1p`/`hypot` all have genuine vector `BitExact` schedules.
-`asin`/`acos`'s exact rows sit just under parity (0.83-0.90x) rather than above it: their table
+`tan`/`atan`/`atan2`/`asin`/`acos`/`asinh`/`acosh`/`atanh`/`log10`/`log1p`/`hypot` all have genuine vector `BitExact` schedules.
+`asin`/`acos`'s exact rows sit just under parity (0.75-0.85x) rather than above it: their table
 bands need a 13-slot per-lane gather and the platform's scalar routine never
-pays for more than one band — the one case in this table where the vector
-`BitExact` path is not the faster one, and the exact cost `ROADMAP.md`'s A5
-hardware-gather backend targets. Their `Fast` rows are the win, as elsewhere.
-`log10` reuses `ln`'s exact table walk rather than deriving a new one. `log1p`
-replays `__log1p_fma` lane-parallel, `atanh` vectorises `0.5 * ln_1p(2x/(1-x))`, and `hypot` replays the modern Borges
-"MyHypot3" compensated correction with unfused vector arithmetic.
+pays for more than one band — a permanent Documented Accept (see `ROADMAP.md`'s A5/S2). Their `Fast` rows deliver 8.5-10.2x.
+`log10` reuses `ln`'s exact table walk. `log1p` replays `__log1p_fma` lane-parallel with vectorised reduction and Horner FMA tail, `asinh`/`acosh`/`atanh` evaluate vectorised band structures with `V::select` blending, and `hypot` replays Borges "MyHypot3" compensated correction with unfused vector arithmetic.
 
 ### Delegating — parity by default, and a large win under `Fast`
 
 | function | scalar | `BitExact` | `Fast` | + `Finite` |
 |---|--:|--:|--:|--:|
-| `asinh` | 10.28 ns | 1.00x | 4.41x  | 5.94x |
-| `acosh` |  9.62 ns | 0.97x | 2.00x  | 9.27x |
-| `lgamma`| 32.56 ns | **4.05x** (no second policy) | | |
+| `jn`/`yn` | 38.0 ns | 0.95-1.11x | 1.80-2.55x | 1.77-2.56x |
+| `lgamma`| 32.56 ns | **4.37x** (no second policy) | | |
 
 
 ### Special functions — bit-exact *and* several times faster
