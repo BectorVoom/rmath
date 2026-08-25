@@ -36,10 +36,10 @@ faster than the call it replaces, so it is stated up front rather than buried.
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
 | **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `log1p` `hypot` `pow` `cbrt` `sinh` `cosh` `tanh` `atanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `log1p` `hypot` `pow` `cbrt` `sinh` `cosh` `tanh` `asinh` `acosh` `atanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
-| **Delegating** | `asinh` `acosh` `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
-| **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, <= 1 ulp measured bound |
+| **Delegating** | `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, <= 2 ulp measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
 correct implementation is bit-identical, on any platform, forever; both policy
@@ -73,14 +73,12 @@ platform routine itself exploits. `tan`'s kernel keeps the family's six-band
 shape but adds the cotangent's compensated-division path, and hands `|x| >
 1e8` to the same `patch_lanes` repair as the other three; it measures **2.77x
 `BitExact`**, a step under `sin`/`cos`'s 3.0x for exactly that extra work.
-The newest members are `asin`/`acos`, whose five-degree table schedule is
-replayed from a single per-lane gather; their `BitExact` gain is smaller
-than the group's headline — measured 0.83-0.85x, just under parity — because
-that 13-slot
-gather is a per-lane loop (the hardware-gather backend `ROADMAP.md`'s A5 entry
-prototyped for `exp` is not rolled out yet), where `atan`/`atan2`'s lighter
-seven-slot rows land at 1.28x / 2.74-3.03x. Their `Fast` path still measures
-**8.4-8.5x**.
+`asinh` (2.45x), `acosh` (1.01x-2.05x), `log1p` (2.57x-2.69x), and `atanh` (3.53x-3.69x)
+are fully vectorised.
+For `asin`/`acos`, the five-degree table schedule is replayed from a single per-lane gather;
+their `BitExact` throughput measures 0.77-0.85x against glibc (a permanent Documented Accept:
+scalar glibc's branchy cache-hitting schedule holds an advantage over unconditional
+15-coefficient vector gathers on incoherent inputs), while `Fast` delivers **9.2-10.2x**.
 
 **Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
 by their shape. Below `|x| = 2` they are rational functions of `x^2` and
@@ -92,15 +90,7 @@ vector with any lane at or above 2 is handed to the scalar routine: a
 replaces, and shipping it would have been a loss dressed up as an
 optimisation. `Fast` vectorises both branches.
 
-**Delegating** is the honest part. glibc implements those families with the IBM
-Accurate Portable Math Library routines, whose schedule turns on tables of
-several hundred entries and on per-expression fused-multiply-add placement that
-the compiler chooses and the C source does not show. That has not been
-reproduced here, so under `BitExact` those kernels call the platform routine
-per lane — still bit-exact, so substituting `rmath` cannot change your result,
-but no faster than what it replaces. `Fast` is where their vector path lives,
-and it is worth a lot: the hyperbolic inverses measure **8-13x**. `jn` and
-`yn` are here for a different reason: they choose between three algorithms on
+**Delegating** is the honest part. `jn` and `yn` choose between three algorithms on
 `n` against `x`, and one of them runs a continued fraction whose length is
 decided at run time, so there is no vector shape to give them.
 

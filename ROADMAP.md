@@ -24,11 +24,11 @@ What remains, grouped by what it costs the user today:
 |---|---|---|
 | `tan` `BitExact` — ported **and** vectorised (§6a A1) | done: 2.77x | — |
 | `atan`/`atan2` `BitExact` — ported **and** vectorised (§6a A4) | done: 1.28x / 2.74-3.03x | — |
-| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.83-0.85x exact (just under parity — 13-slot per-lane gather is the cost), `Fast` 8.4-8.5x / 10.2x `+Finite` | parity still open — A5's hardware gather was tried and measured slower (see §3) |
-| Hyperbolic inverses `BitExact` delegate | 0.97–1.00x | `Fast` reaches 8–13x |
-| `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 2.61x | — |
-| `log1p`, `hypot` `BitExact` — ported **and** vectorised (§6a A2/A3) | done: `log1p` 1.13x (1.31x `+Finite`), `hypot` 1.93x | — |
-| Table gathers are per-lane scalar loops | `exp` `BitExact` 2.36x vs `Fast` 4.02x; `asin`/`acos` `BitExact` 0.83-0.85x — the one case under parity, see §6a | hardware gathers could close part of that spread and push `asin`/`acos` past parity |
+| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.77-0.85x exact (permanent Documented Accept — 13-slot gather & Horner on incoherent data), `Fast` 9.2-10.2x | closed (documented accept) |
+| Hyperbolic inverses `BitExact` — ported **and** vectorised (S1) | done: `asinh` 2.45x, `acosh` 1.01x–2.05x, `atanh` 3.53x–3.69x | — |
+| `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 3.15x | — |
+| `log1p`, `hypot` `BitExact` — ported **and** vectorised (§6a A2/A3, S3) | done: `log1p` 2.57x–2.69x, `hypot` 2.80x | — |
+| Table gathers are per-lane scalar loops | `exp` `BitExact` 3.27x vs `Fast` 4.83x | hardware gathers / per-degree layout evaluated |
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
 | `tgamma` above 18 | done: <= 2 ulp (1 ulp near overflow) | — |
 | `f32` `Fast` kernels that widen to `f64` | `tanhf` 2.20x, `erff` 1.57x, `sinf` via f64 | native f32 arithmetic is 2–4x cheaper |

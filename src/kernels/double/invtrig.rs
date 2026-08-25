@@ -529,19 +529,16 @@ mod bit_exact {
             } else {
                 (768 + (((k & 0x000f_e000) >> 13) * 15), 9)
             };
-            let n = n.min(2555) as usize;
-            x0.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n]);
-            t1.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 1]);
-            for (j, slot) in c.iter_mut().enumerate() {
-                let slot_idx = j + 2;
-                slot.as_mut_slice()[i] = if slot_idx < 2 + d {
-                    f64::from_bits(ac::ASNCS[n + slot_idx])
-                } else {
-                    0.0
-                };
+            let n = (n.min(2555)) as usize;
+            let d = d as usize;
+            let p = &ac::ASNCS[n..n + 4 + d];
+            x0.as_mut_slice()[i] = f64::from_bits(p[0]);
+            t1.as_mut_slice()[i] = f64::from_bits(p[1]);
+            for j in 0..d {
+                c[j].as_mut_slice()[i] = f64::from_bits(p[2 + j]);
             }
-            outer.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 2 + d]);
-            fin.as_mut_slice()[i] = f64::from_bits(ac::ASNCS[n + 3 + d]);
+            outer.as_mut_slice()[i] = f64::from_bits(p[2 + d]);
+            fin.as_mut_slice()[i] = f64::from_bits(p[3 + d]);
         }
         (
             V::from_array(x0),
