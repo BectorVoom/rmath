@@ -122,19 +122,12 @@ pub mod round {
     #[inline(always)]
     pub fn eval<V: Simd, A: Accuracy, D: Domain>(x: V) -> V {
         let _ = (A::BIT_EXACT, D::CHECKED);
-        let t = x.trunc();
-        // `x - t` is exact (Sterbenz), and is zero for every input that is
-        // already integral — which includes infinities, every |x| >= 2^52, and
-        // both zeros. For NaN it is NaN, which compares false, so the step
-        // below leaves NaN untouched with its payload intact.
-        let frac = x - t;
-        let half = V::splat(V::Elem::HALF);
-        let bump = V::select(
-            frac.abs().ge_mask(half),
-            V::splat(V::Elem::ONE).copysign(x),
-            V::splat(V::Elem::ZERO),
-        );
-        t + bump
+        // Ties away from zero via `trunc(x + copysign(0.5 - 1 ulp, x))`.
+        // Single-rounding addition with `0.5 - 1 ulp` cleanly shifts half-integers
+        // to the next integer away from zero without double-rounding, preserves
+        // signed zeroes and subnormals, and passes NaN payloads untouched through trunc.
+        let adj = V::splat(V::Elem::HALF_MINUS_ULP).copysign(x);
+        (x + adj).trunc()
     }
 }
 

@@ -1443,3 +1443,45 @@ fn eval_slice_matches_scalar_including_ragged_tails() {
         );
     }
 }
+
+fn corpus_round() -> Vec<f64> {
+    let mut v = universal();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+
+    // Halfway ties and integer boundaries: +-k + 0.5 +- 2 ulp
+    for k in -1000..=1000 {
+        let base = k as f64 + 0.5;
+        v.extend(around(base));
+        v.extend(around(-base));
+        v.extend(around(k as f64));
+    }
+
+    // Vicinity of 2^52 (where float integers lose fractional bits)
+    for exp in 0..=54 {
+        let base = ((1u64 << exp) as f64) + 0.5;
+        v.extend(around(base));
+        v.extend(around(-base));
+        v.extend(around((1u64 << exp) as f64));
+        v.extend(around(-((1u64 << exp) as f64)));
+    }
+
+    // Subnormals and small magnitudes
+    for u in 1..=500 {
+        v.extend(around(f64::from_bits(u)));
+        v.extend(around(f64::from_bits(u | (1u64 << 63))));
+    }
+
+    // Random samples across range
+    for _ in 0..50_000 {
+        v.push(rng.log_uniform(1e-300, 1e300, true));
+        v.push(f64::from_bits(rng.next()));
+    }
+    v
+}
+
+#[test]
+fn round_bit_exact() {
+    let v = corpus_round();
+    check_all_widths!("round", &v, f64::round, Round::new());
+}
+

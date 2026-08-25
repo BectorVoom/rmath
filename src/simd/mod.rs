@@ -199,6 +199,8 @@ pub trait Real: Simd<Elem = Self> + Default + PartialEq + PartialOrd + private::
     const ONE: Self;
     /// `0.5`.
     const HALF: Self;
+    /// `0.5 - 1 ulp` (the largest representable number strictly less than `0.5`).
+    const HALF_MINUS_ULP: Self;
     /// The smallest positive *normal* value.
     const MIN_POSITIVE: Self;
     /// Positive infinity.

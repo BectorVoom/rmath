@@ -45,6 +45,7 @@ mod libm {
         pub safe fn tanhf(x: f32) -> f32;
         pub safe fn asinhf(x: f32) -> f32;
         pub safe fn acoshf(x: f32) -> f32;
+        pub safe fn roundf(x: f32) -> f32;
     }
 }
 
@@ -268,4 +269,11 @@ suite!(
     "atanhf",
     |x| Atanh::new().eval(x),
     f32::atanh
+);
+suite!(
+    round_matches_libm_sampled,
+    round_matches_libm_exhaustive,
+    "roundf",
+    |x| Round::new().eval(x),
+    libm::roundf
 );
