@@ -50,7 +50,13 @@ These are the crate's contracts; the plan treats them as hard.
    algorithm (f64 `cbrt`), changing that is a design decision to surface, not
    an optimisation to sneak in.
 5. **Rare-lane repairs stay in `reference/`.** Vector main paths never own the
-   hard cases; `patch_lanes` + the scalar reference does.
+   hard cases; `patch_lanes` + the scalar reference does. *Amended, narrowly,
+   by Cycle 5 S1 (§6a):* where a function's hard cases are a handful of
+   constants rather than a schedule — `expm1`, `sinh`, `cosh`, `tanh` — selecting
+   them in vector form is allowed, because the repair loop there cost more than
+   the entire main path it protected. The bar is that nothing gets re-derived:
+   `reference/` stays the only place overflow, subnormal and NaN behaviour is
+   worked out from the platform.
 
 ## 3. Workstream A — `BitExact` throughput
 
@@ -1165,6 +1171,59 @@ widening whenever the f64 kernel does more than the f32 result needs.
     `log2f` 2 ulp (2.13B checked), `expf` 4 ulp (1.11B checked), `exp2f` 3 ulp (1.12B checked), `exp10f` 3 ulp (1.10B checked),
     `cbrtf` 1 ulp (2.13B checked), `tanhf` 2 ulp (1.10B checked), `erff` 2 ulp (2.13B checked), `erfcf` 0 ulp (1.08B checked),
     `j0f` 9 ulp (1.17B checked), `j1f` 9 ulp (1.17B checked). Fixed `k >= 128` multiplication order in `exp2f` and `expf`.
+  - **Cycle 5 S1: `expm1`/`sinh`/`cosh`/`tanh` — repair removed, not reduced.**
+    These four were the crate's worst boundary-corpus rows (`cosh` **0.30x**, `sinh` 0.53x,
+    `expm1` 0.53x at 1M) for one structural reason, and it was not the one Cycle 3 S3 recorded
+    for `exp2`. Their own repair mask was the smaller half of it: `cosh` and `sinh` are
+    *compositions*, and they were handing the unclamped `|x|` to the **inner** bit-exact `exp`
+    and `expm1`, whose `FullRange` masks then fired on every lane past 512 / `56 ln 2` — lanes
+    the composition was about to discard. A boundary vector paid up to three scalar fallbacks
+    for one hard lane. Three changes, in dependency order:
+    1. `exp::bit_exact_half` — `0.5 e^x` with the halving folded into the table's scale bits.
+       Not a convenience: the vector `exp`'s scale is `e^x` rounded up to the next 128th of an
+       octave, so it overflows the exponent field from `1024 ln2 - ln2/256` (= 709.7800053,
+       located by bisection) upward while `e^x` is still finite — and `0.5 e^x`, which is the
+       only form `sinh` and `cosh` ever want, never does. This is what removed their repair
+       *entirely* rather than narrowing it to a sliver.
+    2. `expm1`'s five-way blend extended over the whole line. glibc's `k < 0` reconstruction
+       arm is the same one it uses for `k > 56`, so widening that guard carries the vector path
+       from `56 ln 2` to the overflow threshold for one comparison; `2^(k-1)` replaces `2^k`
+       (`k` reaches 1024, where the exponent field has none left, and the platform likewise
+       spells its answer `y * 2.0 * 2^1023`). Outside that, three selects: `-1`, an overflowing
+       multiply, `x + x`.
+    3. Two arithmetic levers found while measuring: `2^-k` by reciprocal instead of a second
+       `pow2` (exact for the `0..=56` the arms that use it can hold), and a `pow2` that builds
+       the exponent from `k`'s own mantissa bits after a `1.5 * 2^52` add instead of a
+       float-to-int conversion — x86 has no saturating fix-up to emit for that. Together these
+       were worth more than either structural change on the boundary corpus (0.89x → 1.30x).
+
+    Measured, interleaved A/B of two binaries on a quiet machine, 1M elements
+    (before → after, `BitExact`):
+
+    | corpus | `expm1` | `sinh` | `cosh` | `tanh` |
+    |---|--:|--:|--:|--:|
+    | default | 2.85x → **5.75x** | 3.89x → **6.35x** | 1.87x → **3.06x** | 3.23x → **5.48x** |
+    | in-domain | 3.33x → **5.63x** | 3.51x → **5.20x** | 1.41x → **2.49x** | — |
+    | boundary | 0.60x → **1.30x** | 0.58x → **1.28x** | **0.34x → 1.13x** | — |
+    | random-bit | 0.80x → **3.0x** | 0.82x → **1.62x** | 0.51x → **2.04x** | — |
+    | coherent | 1.71x → **2.88x** | 2.45x → **4.08x** | 2.34x → **2.76x** | — |
+    | mixed-special | 2.09x → **3.90x** | 1.96x → **3.45x** | 0.68x → **1.52x** | — |
+
+    Every corpus the harness ships now clears parity for all four; none did before.
+    `tanh` was not a target — it shares the inner-kernel defect and got the fix for one line.
+
+    **This amends constraint §2.5 ("rare-lane repairs stay in `reference/`"), deliberately
+    and narrowly.** What moved into vector form is not a re-derivation of the hard cases: for
+    `expm1` it is an arm of the platform's own schedule that was already present, with its
+    guard widened; everything else is three or four constants (`-1`, `+inf`, `x * DBL_MAX`,
+    `x*x + inf`) selected by one comparison. `reference/` remains the single source of truth for
+    every case with real structure, and for the fifteen functions that still delegate. The
+    constraint's intent — no per-function re-derivation of overflow, subnormal and NaN handling
+    — is intact; its letter is not, and that is the trade this row bought.
+    Verified: the full `bit_exact` suite, plus a dedicated sweep of exactly the regions that
+    moved (3.4M `expm1` values over `[38, 710]` and `[-760, -38]`, 3.8M `cosh`/`sinh`/`tanh`
+    values concentrated on `[709, 711]` and every band edge, 8000-ulp neighbourhoods around each
+    threshold, and 300k adversarial bit patterns each) at all four widths: **0 mismatches**.
 
 ## 7. Suggested sequencing
 

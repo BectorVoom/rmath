@@ -180,14 +180,14 @@ call it replaces.
 |---|--:|--:|--:|--:|--:|
 | `exp`   |  2.17 ns | **3.02x** | 3.47x | 4.34x | **4.45x** |
 | `exp2`  |  1.62 ns | **1.72x** | 2.02x | 3.48x | **3.46x** |
-| `expm1` |  8.18 ns | **3.56x** | 3.96x | 9.42x | **11.04x** |
+| `expm1` |  8.28 ns | **5.75x** | 6.31x | 9.42x | **11.04x** |
 | `ln`    |  1.99 ns | **2.62x** | 2.94x | 3.49x | **3.70x** |
 | `log2`  |  2.27 ns | **2.67x** | 2.96x | 3.72x | **4.70x** |
 | `pow`   | 12.59 ns | **1.84x** | — | 2.59x | — |
 | `cbrt`  |  8.62 ns | **1.76x** | 1.76x | 7.62x | **8.55x** |
-| `sinh`  | 12.22 ns | **3.58x** | 3.87x | 10.00x | **10.93x** |
-| `cosh`  |  3.12 ns | **1.64x** | 1.73x | 5.57x | **6.08x** |
-| `tanh`  | 11.04 ns | **3.23x** | 3.38x | 9.10x | **10.42x** |
+| `sinh`  | 12.49 ns | **6.35x** | 6.38x | 10.00x | **10.93x** |
+| `cosh`  |  3.48 ns | **3.06x** | 3.56x | 5.57x | **6.08x** |
+| `tanh`  | 11.09 ns | **5.48x** | 5.94x | 9.10x | **10.42x** |
 | `asinh` |  4.65 ns | **2.38x** | 2.44x | 5.49x | **5.82x** |
 | `acosh` |  4.54 ns | **1.90x** | 2.01x | 7.50x | **8.32x** |
 | `atanh` |  3.88 ns | **3.54x** | 3.62x | 13.82x | **14.87x** |
@@ -203,6 +203,14 @@ call it replaces.
 | `log10` |  5.50 ns | **3.07x** | 3.39x | 7.52x | **9.43x** |
 | `log1p` |  9.99 ns | **1.97x** (2.69x def) | 2.18x | 9.05x | **11.37x** |
 | `hypot` |  6.70 ns | **2.81x** | — | 5.09x | — |
+
+`expm1`/`sinh`/`cosh`/`tanh` are the four rows with no scalar repair left in them at all: their
+`BitExact` paths answer every input — the overflow band, the infinities, the NaNs — in vector form.
+That is worth more than the table above shows, because the table is one corpus. On the adversarial
+`--corpus=boundary` mix, where roughly one lane in seven is at or past the overflow threshold and a
+single such lane used to drag all eight through the scalar reference, they moved from
+`expm1` 0.60x, `sinh` 0.58x, `cosh` 0.34x to **1.30x / 1.28x / 1.13x** — from well under the `libm`
+call they replace to above it. Every corpus the harness ships now clears parity for all four.
 
 `tan`/`atan`/`atan2`/`asin`/`acos`/`asinh`/`acosh`/`atanh`/`log10`/`log1p`/`hypot` all have genuine vector `BitExact` schedules.
 `asin`/`acos`'s exact rows sit just under parity (0.75-0.85x) rather than above it: their table

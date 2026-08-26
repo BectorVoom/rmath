@@ -26,13 +26,21 @@ const OVERFLOW: f64 = 710.0;
 /// `ln(DBL_MAX)` as the platform tests it, on the high word alone.
 ///
 /// Above this `sinh` and `cosh` split the exponential in two so neither half
-/// overflows — a rare enough band that the vector path hands it over rather
-/// than carrying a fourth arm.
+/// overflows. The vector path carries that arm rather than handing it over:
+/// it is the same exponential with a halved argument, so it costs two selects
+/// and a multiply, not a second call.
 const LN_DBL_MAX: f64 = f64::from_bits(0x40862e4200000000);
+/// The top of that splitting band, again as a high-word test: the platform
+/// takes it while `ix <= 0x408633ce`, so the band ends one high-word unit up.
+/// Past here `cosh` is `+inf` and `sinh` is `±inf`.
+const SPLIT_LIMIT: f64 = f64::from_bits(0x408633cf00000000);
 /// `0.5 * ln(2)`, where `cosh` switches from `expm1` to `exp`.
 const HALF_LN2: f64 = f64::from_bits(0x3fd62e4300000000);
-/// `2^-55`, below which `tanh` is the identity.
+/// `2^-55`, below which `tanh` is the identity — and below which `cosh` is
+/// exactly `1 + expm1(|x|)`, with no correction term left to add.
 const TANH_TINY: f64 = f64::from_bits(0x3c80000000000000);
+/// The same cutoff, under the name `cosh` uses it.
+const COSH_TINY: f64 = TANH_TINY;
 /// `2^-28`, below which `sinh` is the identity.
 const SINH_TINY: f64 = f64::from_bits(0x3e30000000000000);
 /// Where squaring the argument would overflow, for `asinh` / `acosh`.
@@ -55,17 +63,29 @@ mod inner {
         super::expm1::eval::<V, Fast, Finite>(x)
     }
 
-    /// The bit-exact `exp`, checked — the composed functions reach arguments
-    /// past its main path, so `Finite` would be wrong here.
+    /// `0.5 e^x`, bit-exact and unchecked.
+    ///
+    /// `sinh` and `cosh` want `±0.5 e^x` and never `e^x`, and asking for the
+    /// halved value directly is what lets this be unchecked: see
+    /// [`super::exp::bit_exact_half`] for why `e^x` itself has no vector form
+    /// at the top of the range and `0.5 e^x` does. With that, every argument
+    /// either arm can produce is inside the main path, and the repair loop
+    /// those two functions used to end with disappears.
     #[inline(always)]
-    pub fn exp_exact<V: Simd<Elem = f64>>(x: V) -> V {
-        super::exp::eval::<V, BitExact, FullRange>(x)
+    pub fn exp_half<V: Simd<Elem = f64>>(x: V) -> V {
+        super::exp::bit_exact_half(x)
     }
-    /// The bit-exact `expm1`, checked, for the same reason.
+
+    /// The bit-exact `expm1`, unchecked.
+    ///
+    /// Callers clamp the argument into the main path themselves — cheaper
+    /// than the checked form, whose repair fires on any lane past `56 ln 2`
+    /// even when the caller is about to discard that lane's result.
     #[inline(always)]
-    pub fn expm1_exact<V: Simd<Elem = f64>>(x: V) -> V {
-        super::expm1::eval::<V, BitExact, FullRange>(x)
+    pub fn expm1_main<V: Simd<Elem = f64>>(x: V) -> V {
+        super::expm1::eval::<V, BitExact, Finite>(x)
     }
+
     #[inline(always)]
     pub fn ln<V: Simd<Elem = f64>>(x: V) -> V {
         crate::kernels::double::ln::eval::<V, Fast, Finite>(x)
@@ -76,6 +96,25 @@ mod inner {
     }
 }
 
+/// The exponential's argument for `sinh` and `cosh`, and the lanes that took
+/// the splitting band.
+///
+/// Above `ln(DBL_MAX)` the platform evaluates `exp(|x|/2)` and multiplies the
+/// result back up in two steps, so that neither half overflows. Choosing the
+/// argument here rather than the result afterwards means one exponential
+/// serves the whole domain. Lanes further out still come back as nonsense —
+/// they are overwritten wholesale at the end of each caller, so they only
+/// have to be harmless, and unchecked floating-point arithmetic on a garbage
+/// argument is exactly that.
+#[inline(always)]
+fn split_arg<V: Simd<Elem = f64>, D: Domain>(a: V) -> (V, V::Mask) {
+    if !D::CHECKED {
+        return (a, no_lanes(a));
+    }
+    let split = a.ge_mask(V::splat(LN_DBL_MAX));
+    (V::select(split, a * V::splat(0.5), a), split)
+}
+
 /// Hyperbolic sine.
 pub mod sinh {
     use super::*;
@@ -84,24 +123,28 @@ pub mod sinh {
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         if A::BIT_EXACT {
-            let y = bit_exact(x);
-            if D::CHECKED {
-                return crate::simd::patch_lanes(x, y, outside(x, LN_DBL_MAX), reference::sinh);
-            }
-            return y;
+            return bit_exact::<V, D>(x);
         }
         dispatch::<V, A, D>(x, reference::sinh, fast, |x| outside(x, OVERFLOW))
     }
 
-    /// The ported path, valid for `|x| < ln(DBL_MAX)`.
+    /// The ported path. Under `FullRange` it is total: nothing is repaired.
     ///
     /// The two arms need *different* exponentials — `expm1` below 22 and `exp`
     /// above — so evaluating both unconditionally would double the cost of
     /// every vector to serve whichever arm happened to be needed. Each is
-    /// computed only when some lane is in its range, which is the same bet
-    /// `patch_lanes` makes everywhere else here.
+    /// computed only when some lane is in its range.
+    ///
+    /// Both are handed an argument the caller has already put inside their
+    /// main path: `expm1` sees a zero where the lane is going to take the
+    /// `exp` arm anyway, and `exp` sees the halved argument in the splitting
+    /// band and is asked for `0.5 e^x` rather than `e^x` throughout. That is
+    /// the whole reason this needs no scalar repair — an unclamped argument
+    /// would set the *inner* kernels' repair masks, and a single lane past
+    /// `56 ln 2` drags all eight through the scalar reference for a result
+    /// that is then thrown away.
     #[inline(always)]
-    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+    fn bit_exact<V: Simd<Elem = f64>, D: Domain>(x: V) -> V {
         let a = x.abs();
         let h = V::splat(0.5).copysign(x);
         let one = V::splat(1.0);
@@ -110,16 +153,37 @@ pub mod sinh {
         let mut y = if big.all() {
             a
         } else {
-            let t = inner::expm1_exact(a);
+            let t = inner::expm1_main(V::select(big, V::splat(0.0), a));
             // |x| < 1 uses the form that does not cancel as x -> 0.
             let below_one = h * (V::splat(2.0) * t - t * t / (t + one));
             let below_22 = h * (t + t / (t + one));
             V::select(a.lt_mask(one), below_one, below_22)
         };
         if big.any() {
-            y = V::select(big, h * inner::exp_exact(a), y);
+            let (arg, split) = split_arg::<V, D>(a);
+            let eh = inner::exp_half(arg); // 0.5 e^arg
+            // `h * exp(a)` is `±(0.5 exp(a))`, and the sign is a bit.
+            let t = eh.copysign(x);
+            let arm = if D::CHECKED {
+                // In the band the platform returns `t * w` with `w = exp(a/2)`
+                // and `t = h * w`; `t` is already that `t`, and `w` is `2 eh`.
+                V::select(split, t * (eh + eh), t)
+            } else {
+                t
+            };
+            y = V::select(big, arm, y);
         }
-        V::select(a.lt_mask(V::splat(SINH_TINY)), x, y)
+        y = V::select(a.lt_mask(V::splat(SINH_TINY)), x, y);
+
+        if !D::CHECKED {
+            return y;
+        }
+        // `x * DBL_MAX` overflows to the right infinity and carries the sign
+        // for free, which is how the platform spells it too. Infinities and
+        // NaNs land here as well, where the platform's `x + x` and this
+        // multiply agree bit for bit — an infinity is unchanged by either and
+        // a NaN is quietened by both — so they need no arm of their own.
+        V::select(a.lt_mask(V::splat(SPLIT_LIMIT)), y, x * V::splat(f64::MAX))
     }
 
     /// Measured error: below 3 ulp over `|x| < 710`.
@@ -144,45 +208,67 @@ pub mod cosh {
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         if A::BIT_EXACT {
-            let y = bit_exact(x);
-            if D::CHECKED {
-                return crate::simd::patch_lanes(x, y, outside(x, LN_DBL_MAX), reference::cosh);
-            }
-            return y;
+            return bit_exact::<V, D>(x);
         }
         dispatch::<V, A, D>(x, reference::cosh, fast, |x| outside(x, OVERFLOW))
     }
 
-    /// The ported path, valid for `|x| < ln(DBL_MAX)`.
+    /// The ported path. Under `FullRange` it is total: nothing is repaired.
     ///
-    /// `expm1` is evaluated only when a lane is actually below `ln(2)/2`.
-    /// `cosh` is the cheapest function in this family — the platform does it in
-    /// about three nanoseconds — so an unconditional second exponential costs
-    /// more than the whole call it replaces.
+    /// One exponential, asked for as `0.5 e^x` — which is the only form
+    /// either surviving arm wants, and the only one that stays inside the
+    /// vector `exp`'s exponent range all the way to the overflow threshold.
+    /// `e^x` itself is recovered by doubling, exactly, and is used only below
+    /// 22 where it cannot overflow.
+    ///
+    /// `expm1` is evaluated only when a lane is actually below `ln(2)/2`, and
+    /// then in its `k == 0` form: that interval is exactly where the platform's
+    /// `expm1` skips its own reduction, so the reduction, the exponent
+    /// construction and the five-way blend are all provably no-ops here. `cosh` is the
+    /// cheapest function in this family — the platform does it in about three
+    /// nanoseconds — so an unconditional full second exponential costs more
+    /// than the whole call it replaces.
     #[inline(always)]
-    fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+    fn bit_exact<V: Simd<Elem = f64>, D: Domain>(x: V) -> V {
         let a = x.abs();
         let one = V::splat(1.0);
         let half = V::splat(0.5);
 
-        let e = inner::exp_exact(a);
-        let mid = half * e + half / e;
-        let y = V::select(a.lt_mask(V::splat(22.0)), mid, half * e);
+        let (arg, split) = split_arg::<V, D>(a);
+        let eh = inner::exp_half(arg); // 0.5 e^arg
+        let e = eh + eh; // e^arg, exactly
+
+        let mid = eh + half / e; // |x| < 22: 0.5 t + 0.5 / t
+        let mut y = V::select(a.lt_mask(V::splat(22.0)), mid, eh);
+        if D::CHECKED {
+            // In the band, `w = exp(a/2)`, `t = 0.5 w`, and the answer is
+            // `t * w` — which is `eh * e` with `arg` already halved.
+            y = V::select(split, eh * e, y);
+        }
 
         let small = a.lt_mask(V::splat(HALF_LN2));
-        if small.none() {
+        if small.any() {
+            // Near zero, `1 + t^2/(2(1+t))` keeps the result's leading bits,
+            // which `0.5(e + 1/e)` would round away.
+            let t = expm1::unreduced(a);
+            let w = one + t;
+            let tiny = V::select(a.lt_mask(V::splat(COSH_TINY)), w, one + (t * t) / (w + w));
+            y = V::select(small, tiny, y);
+        }
+
+        if !D::CHECKED {
             return y;
         }
-        // Near zero, `1 + t^2/(2(1+t))` keeps the result's leading bits, which
-        // `0.5(e + 1/e)` would round away.
-        let t = inner::expm1_exact(a);
-        let w = one + t;
-        let tiny = V::select(
-            a.lt_mask(V::splat(f64::from_bits(0x3c80000000000000))),
-            w,
-            one + (t * t) / (w + w),
-        );
-        V::select(small, tiny, y)
+        // One arm for all three of the platform's outermost cases. `x * x` is
+        // its own answer for an infinity and for a NaN, and adding infinity
+        // disturbs neither while turning the merely-large finite arguments —
+        // where `x * x` is a perfectly ordinary number — into the overflow
+        // the platform reaches by squaring `DBL_MAX`.
+        V::select(
+            a.lt_mask(V::splat(SPLIT_LIMIT)),
+            y,
+            x.mul_add(x, V::splat(f64::INFINITY)),
+        )
     }
 
     /// Measured error: below 3 ulp over `|x| < 710`.
@@ -230,7 +316,10 @@ pub mod tanh {
 
         let ge_one = a.ge_mask(one);
         let arg = V::select(ge_one, a + a, -(a + a));
-        let t = inner::expm1_exact(arg);
+        // Unchecked: `|arg|` reaches 44 on the `|x| < 22` arm, past `expm1`'s
+        // old repair threshold but well inside the range its vector path now
+        // covers, and every lane beyond that is discarded three lines down.
+        let t = inner::expm1_main(arg);
 
         let z = V::select(ge_one, one - two / (t + two), -t / (t + two));
         let z = V::select(

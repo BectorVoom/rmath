@@ -905,7 +905,7 @@ pub fn pow(x: f64, y: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Overflow threshold for `expm1`, `ln(DBL_MAX)`.
-const EXPM1_OTHRESHOLD: f64 = f64::from_bits(0x40862e42fefa39ef);
+pub(crate) const EXPM1_OTHRESHOLD: f64 = f64::from_bits(0x40862e42fefa39ef);
 /// `ln(2)`, high part, exact in 33 bits.
 pub(crate) const EXPM1_LN2HI: f64 = f64::from_bits(0x3fe62e42fee00000);
 /// `ln(2)`, low part.

@@ -56,8 +56,13 @@ fn gather_tab<V: Simd<Elem = f64>>(idx: V::Bits) -> V::Bits {
 }
 
 /// The table path, lane-for-lane identical to [`reference::exp`]'s main body.
+///
+/// `scale_bias` is folded into the table's scale factor before the final
+/// fused combine: `0` for `e^x`, `-(1 << 52)` for `0.5 e^x`. Adding it to the
+/// bit pattern rather than multiplying afterwards is what makes
+/// [`bit_exact_half`] work at the top of the range — see there.
 #[inline(always)]
-fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+fn table<V: Simd<Elem = f64>>(x: V, scale_bias: u64) -> V {
     let shift = V::splat(t::SHIFT);
     let kd_s = x.mul_add(V::splat(t::INVLN2N), shift);
     let ki = kd_s.to_bits();
@@ -90,7 +95,9 @@ fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let scale_raw = gather_tab::<V>(idx1);
     let mut scale_bits = V::Bits::filled_default();
     for i in 0..V::LANES {
-        scale_bits.as_mut_slice()[i] = scale_raw.as_slice()[i].wrapping_add(kshift.as_slice()[i]);
+        scale_bits.as_mut_slice()[i] = scale_raw.as_slice()[i]
+            .wrapping_add(kshift.as_slice()[i])
+            .wrapping_add(scale_bias);
     }
     let tail = V::from_bits(tail_bits);
     let scale = V::from_bits(scale_bits);
@@ -103,6 +110,34 @@ fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
     let r4 = r2 * r2;
     let tmp = r4.mul_add(p45, s1);
     scale.mul_add(tmp, scale)
+}
+
+/// `e^x`, the table path.
+#[inline(always)]
+fn bit_exact<V: Simd<Elem = f64>>(x: V) -> V {
+    table(x, 0)
+}
+
+/// `0.5 e^x`, the table path, for `0 <= x <= ln(DBL_MAX)`.
+///
+/// Not `0.5 * bit_exact(x)`: near the top of the range that intermediate does
+/// not exist. The table's scale factor is `e^x` rounded to the *nearest*
+/// 128th of an octave, so it can sit above `e^x` by as much as `e^(ln2/256)`,
+/// a factor of 1.0027. From `1024 ln2 - ln2/256` (709.7800053, located by
+/// bisection) upward that pushes the scale past the exponent field while
+/// `e^x` itself is still finite, and the vector path hands back a NaN where
+/// the platform hands back a number. Biasing the scale down by one
+/// exponent instead keeps every intermediate in range, and the result is
+/// bit-identical to halving afterwards: `fma(s/2, t, s/2)` and
+/// `0.5 * fma(s, t, s)` round the same exact value, because scaling by a
+/// power of two commutes with rounding away from the subnormals.
+///
+/// This is what lets `cosh` and `sinh` — which want `0.5 e^x` and `±0.5 e^x`,
+/// never `e^x` — run their whole `|x| >= 22` arm in vector form, with no
+/// scalar repair band below the overflow threshold at all.
+#[inline(always)]
+pub(crate) fn bit_exact_half<V: Simd<Elem = f64>>(x: V) -> V {
+    table(x, (1u64 << 52).wrapping_neg())
 }
 
 /// `1/ln(2)`, for the table-free reduction.
