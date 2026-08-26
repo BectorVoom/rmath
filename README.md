@@ -75,10 +75,15 @@ shape but adds the cotangent's compensated-division path, and hands `|x| >
 `BitExact`**, a step under `sin`/`cos`'s 3.0x for exactly that extra work.
 `asinh` (2.45x), `acosh` (1.01x-2.05x), `log1p` (2.57x-2.69x), and `atanh` (3.53x-3.69x)
 are fully vectorised.
-For `asin`/`acos`, the five-degree table schedule is replayed from a single per-lane gather;
-their `BitExact` throughput measures 0.77-0.85x against glibc (a permanent Documented Accept:
-scalar glibc's branchy cache-hitting schedule holds an advantage over unconditional
-15-coefficient vector gathers on incoherent inputs), while `Fast` delivers **9.2-10.2x**.
+`asin`/`acos` are the pair this round rebuilt. Their table is really indexed by the
+argument's top eight bits — `e_asin.c`'s six band-index formulas are six spellings of
+`floor(256*|x|) - 32`, and its band centre is always `(row + 32.5)/256` — so the whole
+per-lane index computation becomes three vector instructions and the band centre is
+computed rather than read. Repacked at one stride with the unused coefficient slots
+zeroed, a row is twelve adjacent doubles, which a single block-load-and-transpose
+gather (`Simd::gather_run`) reads as two 512-bit loads instead of twelve scalar ones.
+`BitExact` went from **0.75x to 4.8-5.5x**, with no scalar repair left on any input;
+`Fast` delivers **9.2-10.1x**.
 
 **Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
 by their shape. Below `|x| = 2` they are rational functions of `x^2` and
@@ -172,7 +177,17 @@ otherwise call. Reproduce with
 `RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench`.
 
 Numbers are speedups over that baseline; above 1.00x is faster than the `libm`
-call it replaces.
+call it replaces. The `sqrt`, `asin` and `acos` rows were re-measured in a later
+session on the same machine (the interleaved A/B in `ROADMAP.md`'s Cycle 6 entry);
+the `scalar` column drifts a little between sessions, the speedups are within-run
+ratios and do not.
+
+One caveat that applies to every branchy scalar baseline here and bites `asin`/`acos`
+hardest: measure them on a *small* buffer replayed many times and glibc's branch
+predictor memorises the whole sequence of band branches, which is worth a factor of
+several to it and to nothing in this crate. These are 1 M-element rows for that reason.
+`asin` reads 1.6x at 4096 elements and 5.5x at 1 M, on the same code and the same data
+distribution.
 
 ### Ported — bit-exact *and* faster
 
@@ -191,15 +206,15 @@ call it replaces.
 | `asinh` |  4.65 ns | **2.38x** | 2.44x | 5.49x | **5.82x** |
 | `acosh` |  4.54 ns | **1.90x** | 2.01x | 7.50x | **8.32x** |
 | `atanh` |  3.88 ns | **3.54x** | 3.62x | 13.82x | **14.87x** |
-| `sqrt`  |  0.43 ns | 0.73x (1.05x @4k) | 1.05x | 1.05x | 1.05x |
+| `sqrt`  |  0.52 ns | 1.03x | 1.05x | 1.05x | 1.05x |
 | `sin`   | 13.58 ns | **2.07x** (2.97x def) | 2.07x | 16.67x | **16.83x** |
 | `cos`   | 14.20 ns | **1.78x** (3.01x def) | 1.84x | 15.40x | **15.56x** |
 | `sincos`| 17.97 ns | **2.45x** (3.59x def) | 2.51x | 17.61x | **19.03x** |
 | `tan`   | 16.86 ns | **2.51x** (2.77x def) | 2.55x | 18.02x | **18.93x** |
 | `atan`  |  7.05 ns | **1.92x** (8.52x coh) | 1.87x | 11.64x | **13.48x** |
 | `atan2` | 14.98 ns | **1.58x** (2.74-3.03x def) | — | 12.40x | — |
-| `asin`  | 12.70 ns | 0.77x | 0.77x | 8.52x | **9.25x** |
-| `acos`  | 12.80 ns | 0.75x | 0.76x | 8.58x | **9.36x** |
+| `asin`  | 13.39 ns | **5.49x** | 5.47x | 9.23x | **9.84x** |
+| `acos`  | 13.56 ns | **4.82x** | 4.99x | 9.26x | **10.06x** |
 | `log10` |  5.50 ns | **3.07x** | 3.39x | 7.52x | **9.43x** |
 | `log1p` |  9.99 ns | **1.97x** (2.69x def) | 2.18x | 9.05x | **11.37x** |
 | `hypot` |  6.70 ns | **2.81x** | — | 5.09x | — |
@@ -213,9 +228,12 @@ single such lane used to drag all eight through the scalar reference, they moved
 call they replace to above it. Every corpus the harness ships now clears parity for all four.
 
 `tan`/`atan`/`atan2`/`asin`/`acos`/`asinh`/`acosh`/`atanh`/`log10`/`log1p`/`hypot` all have genuine vector `BitExact` schedules.
-`asin`/`acos`'s exact rows sit just under parity (0.75-0.85x) rather than above it: their table
-bands need a 13-slot per-lane gather and the platform's scalar routine never
-pays for more than one band — a permanent Documented Accept (see `ROADMAP.md`'s A5/S2). Their `Fast` rows deliver 8.5-10.2x.
+`asin`/`acos`'s exact rows used to sit under parity at 0.75-0.85x, on the reasoning that their
+table bands need a per-lane gather while the platform's scalar routine never pays for more than
+one band. Half of that was right: the gather was the cost, but it was the cost of the table's
+*shape*. Indexed by one affine expression, repacked at one stride with one polynomial degree, and
+read a row at a time, the same schedule is **4.8-5.5x** (see `ROADMAP.md`'s Cycle 6). Their `Fast`
+rows deliver 9.2-10.1x.
 `log10` reuses `ln`'s exact table walk. `log1p` replays `__log1p_fma` lane-parallel with vectorised reduction and Horner FMA tail, `asinh`/`acosh`/`atanh` evaluate vectorised band structures with `V::select` blending, and `hypot` replays Borges "MyHypot3" compensated correction with unfused vector arithmetic.
 
 ### Delegating — parity by default, and a large win under `Fast`
@@ -280,15 +298,23 @@ Several of those deserve comment rather than burial:
   the small shortfall on some rows is the cost of packing and unpacking the
   lane array around it. If you want those functions vectorised, that is what
   `Fast` is for — and it is a 4x to 22x difference, not a rounding one.
-- **`sqrt` gains nothing**, and cannot. It is one instruction, LLVM already
-  vectorises loops containing it, and `rmath` has nothing to add. It is
-  included so a pipeline of these functions does not have to break its pattern
-  for one member — not because it is faster. The same is true of `floor`,
-  `ceil`, `round` and `trunc`. At small and cache-resident sizes (e.g. 4096 elements),
-  they run at parity (~1.00–1.08x). At 1M elements (16 MB source+destination buffer traffic
-  exceeding L2 cache), out-of-place memory bandwidth dominates execution (~0.43 ns/elem across
-  `identity`, `floor`, and `sqrt` in the traversal diagnostic ladder), measuring ~0.73x–1.05x
-  exact depending on memory-subsystem state.
+- **`sqrt` gains nothing**, and cannot. IEEE-754 *requires* square root to be
+  correctly rounded, every target here has one instruction that does it, and
+  glibc lowers `sqrt` to that same instruction — so there is no schedule to
+  replay and no accuracy to trade. LLVM also vectorises loops containing
+  `sqrt` on its own, which is precisely what it will not do for `exp`, so the
+  baseline this row is measured against is already `vsqrtpd`: it compares two
+  identical instruction streams. `sqrt` is here so a pipeline of these
+  functions does not have to break its pattern for one member, not because it
+  is faster. The same is true of `floor`, `ceil`, `round` and `trunc`. At
+  cache-resident sizes they run at parity (~1.00–1.08x); at 1 M elements
+  (16 MB of source and destination traffic, past L2) memory bandwidth
+  dominates and the row reads ~1.0x either way. What did have slack was the
+  buffer walk around the instruction, not the instruction: `eval_slice` used
+  to leave a bounds check and a branch-to-panic inside its own loop, which is
+  nothing next to `exp`'s hundred-instruction body and was two of the seven
+  instructions in `sqrt`'s. It is written with `chunks_exact` now, and LLVM
+  unrolls it.
 - **`acosh` gains far more from `Finite` than anything else** (1.97x to 8.95x).
   Its domain test is two comparisons *and* a NaN-producing branch for `x < 1`,
   which is expensive relative to the small amount of arithmetic that follows.

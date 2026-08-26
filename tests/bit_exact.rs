@@ -1485,3 +1485,260 @@ fn round_bit_exact() {
     check_all_widths!("round", &v, f64::round, Round::new());
 }
 
+// ---------------------------------------------------------------------------
+// `asin`/`acos`'s packed band table
+//
+// The vector `asin`/`acos` do not evaluate `e_asin.c`'s six band-index
+// formulas, and do not read the band centre `x0` out of the table. Both are
+// replaced by arithmetic on `floor(256*|x|)`. That is a claim about the data,
+// not about the algorithm, so it is proved here — exhaustively over the band
+// — rather than asserted in a comment.
+// ---------------------------------------------------------------------------
+
+/// `e_asin.c`'s `asncs_band_index`, transcribed here independently of the
+/// crate's own copy so that this test compares two spellings rather than one
+/// spelling with itself.
+fn upstream_band_index(k: u32) -> (usize, usize) {
+    if k < 0x3fe0_0000 {
+        let n = if k < 0x3fd0_0000 {
+            11 * ((k & 0x000f_ffff) >> 15)
+        } else {
+            11 * ((k & 0x000f_ffff) >> 14) + 352
+        };
+        (n as usize, 5)
+    } else if k < 0x3fe8_0000 {
+        (1056 + (((k & 0x000f_e000) >> 11) * 3) as usize, 6)
+    } else if k < 0x3fed_8000 {
+        (992 + (((k & 0x000f_e000) >> 13) * 13) as usize, 7)
+    } else if k < 0x3fee_8000 {
+        (884 + (((k & 0x000f_e000) >> 13) * 14) as usize, 8)
+    } else {
+        (768 + (((k & 0x000f_e000) >> 13) * 15) as usize, 9)
+    }
+}
+
+#[test]
+fn asncs_row_index_is_one_affine_expression() {
+    use rmath::tables::double::asincos_packed as pk;
+
+    // Every `k` the table band can produce, at both ends of its low word: the
+    // row must not depend on the bits `k` throws away.
+    for k in 0x3fc0_0000u32..0x3fef_0000 {
+        for low in [0u64, 1, 0x7fff_ffff, 0xffff_ffff] {
+            let x = f64::from_bits(((k as u64) << 32) | low);
+            let row = (256.0 * x).floor() as usize - 32;
+            assert!(row < pk::REAL_ROWS, "k={k:#010x} low={low:#x} row={row}");
+            assert_eq!(
+                pk::source_row(row),
+                upstream_band_index(k),
+                "k={k:#010x} low={low:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn asncs_band_centre_is_arithmetic() {
+    use rmath::tables::double::asincos_data::ASNCS;
+    use rmath::tables::double::asincos_packed as pk;
+
+    for row in 0..pk::REAL_ROWS {
+        let (n, _) = pk::source_row(row);
+        let upstream = f64::from_bits(ASNCS[n]);
+        let computed = (row as f64 + 32.5) / 256.0;
+        assert_eq!(
+            upstream.to_bits(),
+            computed.to_bits(),
+            "row {row}: table x0 {upstream:e} vs computed {computed:e}"
+        );
+    }
+}
+
+#[test]
+fn asncs_packed_rows_match_upstream() {
+    use rmath::tables::double::asincos_data::ASNCS;
+    use rmath::tables::double::asincos_packed as pk;
+
+    for row in 0..pk::REAL_ROWS {
+        let (n, degree) = pk::source_row(row);
+        let packed = &pk::PACKED[row * pk::STRIDE..row * pk::STRIDE + pk::USED];
+        // Slot 0 is `t1`; slot 0 of the upstream row (`x0`) is not stored.
+        assert_eq!(packed[0], ASNCS[n + 1], "row {row} t1");
+        for j in 0..9 {
+            let want = if j < degree { ASNCS[n + 2 + j] } else { 0 };
+            assert_eq!(packed[1 + j], want, "row {row} c{j}");
+        }
+        assert_eq!(packed[10], ASNCS[n + 2 + degree], "row {row} outer");
+        assert_eq!(packed[11], ASNCS[n + 3 + degree], "row {row} final");
+    }
+    // Every index the kernel's `bits & 0xfff` can produce, plus the block a
+    // hardware `gather_run` reads past it, has to be in bounds.
+    const { assert!(pk::SLOTS >= 0xfff + 16) };
+}
+
+#[test]
+fn gather_run_matches_plain_indexing_at_every_width() {
+    use rmath::Simd;
+    use rmath::simd::Lanes;
+
+    // A table whose every slot is distinguishable, so a transpose that
+    // crosses lanes or columns cannot pass by coincidence.
+    let table: Vec<u64> = (0..4096u64)
+        .map(|i| (i + 1).wrapping_mul(0x9E37_79B9))
+        .collect();
+
+    fn run<V: Simd<Elem = f64>, const N: usize>(table: &[u64], starts: &[u64]) {
+        let mut idx = V::Bits::filled_default();
+        for i in 0..V::LANES {
+            idx.as_mut_slice()[i] = starts[i % starts.len()];
+        }
+        // SAFETY: every start is below 4096 - 16 and `N` here is at most 16.
+        let got: [V; N] = unsafe { V::gather_run(table, idx) };
+        for (j, col) in got.iter().enumerate() {
+            let lanes = col.to_array();
+            for i in 0..V::LANES {
+                let want = f64::from_bits(table[idx.as_slice()[i] as usize + j]);
+                assert_eq!(
+                    lanes.as_slice()[i].to_bits(),
+                    want.to_bits(),
+                    "{} N={N}: column {j} lane {i}",
+                    core::any::type_name::<V>()
+                );
+            }
+        }
+    }
+
+    /// Every run length the AVX-512 override branches on: below the block
+    /// size, exactly one block, and a second partial block — `12` is what the
+    /// kernel asks for, the rest are there so a mis-set `want` threshold
+    /// cannot hide behind it.
+    fn check<V: Simd<Elem = f64>>(table: &[u64], starts: &[u64]) {
+        run::<V, 1>(table, starts);
+        run::<V, 2>(table, starts);
+        run::<V, 3>(table, starts);
+        run::<V, 4>(table, starts);
+        run::<V, 5>(table, starts);
+        run::<V, 6>(table, starts);
+        run::<V, 7>(table, starts);
+        run::<V, 8>(table, starts);
+        run::<V, 9>(table, starts);
+        run::<V, 12>(table, starts);
+        run::<V, 16>(table, starts);
+    }
+
+    let mut rng = Rng(0x5EED_1234_ABCD_0001);
+    for _ in 0..3_000 {
+        let starts: Vec<u64> = (0..8).map(|_| rng.next() % (4096 - 16)).collect();
+        check::<f64>(&table, &starts);
+        #[cfg(feature = "wide")]
+        {
+            check::<wide::f64x2>(&table, &starts);
+            check::<wide::f64x4>(&table, &starts);
+            check::<wide::f64x8>(&table, &starts);
+        }
+    }
+    // All lanes on one row, and all lanes on distinct adjacent rows: the two
+    // patterns a transpose is most likely to get right by accident.
+    check::<f64>(&table, &[64]);
+    #[cfg(feature = "wide")]
+    {
+        check::<wide::f64x8>(&table, &[64]);
+        check::<wide::f64x8>(&table, &[0, 16, 32, 48, 64, 80, 96, 112]);
+    }
+}
+
+/// The band-by-band sweep the packed-table rewrite was verified with, kept as
+/// a permanent, reproducible harness rather than a one-off script.
+///
+/// Ignored by default because it is minutes, not seconds. `RMATH_SWEEP_N`
+/// overrides the random sample count (default 30,000,000); the structured part
+/// — every `k` the table band can produce, and every band boundary with its
+/// neighbouring low words — runs whatever that is set to.
+///
+/// ```text
+/// cargo test --release --test bit_exact -- --ignored --nocapture asin_acos_band_sweep
+/// RMATH_SWEEP_N=300000000 cargo test --release --test bit_exact -- --ignored --nocapture asin_acos_band_sweep
+/// ```
+#[test]
+#[ignore = "sweeps the whole asin/acos band structure; minutes, not seconds"]
+fn asin_acos_band_sweep() {
+    let n: usize = std::env::var("RMATH_SWEEP_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000_000);
+
+    let mut checked = 0usize;
+
+    // 1. Structured: every table row, at four positions inside it, both signs.
+    let mut v = Vec::new();
+    for hi in (0x3fc0_0000u32..0x3ff0_0000).step_by(64) {
+        for low in [0u64, 1, 0x7fff_ffff, 0xffff_ffff] {
+            let x = f64::from_bits(((hi as u64) << 32) | low);
+            v.push(x);
+            v.push(-x);
+        }
+    }
+    // 2. Every band boundary, with 2048 low words either side of it.
+    for hi in [
+        0x3fc0_0000u32,
+        0x3fcf_ffff,
+        0x3fd0_0000,
+        0x3fdf_ffff,
+        0x3fe0_0000,
+        0x3fe7_ffff,
+        0x3fe8_0000,
+        0x3fed_7fff,
+        0x3fed_8000,
+        0x3fee_7fff,
+        0x3fee_8000,
+        0x3fee_ffff,
+        0x3fef_0000,
+        0x3fef_ffff,
+        0x3ff0_0000,
+    ] {
+        for lo in 0..2048u64 {
+            for b in [
+                ((hi as u64) << 32) | lo,
+                ((hi as u64) << 32) | (0xffff_ffff - lo),
+            ] {
+                v.push(f64::from_bits(b));
+                v.push(-f64::from_bits(b));
+            }
+        }
+    }
+    checked += v.len();
+    check_all_widths!("asin", &v, f64::asin, Asin::new());
+    check_all_widths!("acos", &v, f64::acos, Acos::new());
+
+    // 3. Random, weighted towards the places a band mistake would hide.
+    let mut rng = Rng(0xDEAD_BEEF_1234_5678);
+    let mut done = 0usize;
+    while done < n {
+        let chunk = (n - done).min(1 << 20);
+        let mut v = Vec::with_capacity(chunk);
+        for _ in 0..chunk {
+            v.push(match rng.next() % 8 {
+                0 => f64::from_bits(rng.next()),
+                // The last 2^30 ulps below 1, where the near-one band lives.
+                1 => f64::from_bits(
+                    (0x3ff0_0000_0000_0000u64 - 1 - rng.next() % (1u64 << 30))
+                        | ((rng.next() & 1) << 63),
+                ),
+                2 => {
+                    let s = if rng.next() & 1 == 0 { 1.0 } else { -1.0 };
+                    s * (0.96875 + 0.03125 * rng.unit())
+                }
+                3 => {
+                    let s = if rng.next() & 1 == 0 { 1.0 } else { -1.0 };
+                    s * rng.unit() * (2.0f64).powi(-((rng.next() % 80) as i32))
+                }
+                _ => 2.0 * rng.unit() - 1.0,
+            });
+        }
+        checked += v.len();
+        check_all_widths!("asin", &v, f64::asin, Asin::new());
+        check_all_widths!("acos", &v, f64::acos, Acos::new());
+        done += chunk;
+    }
+    println!("asin/acos band sweep: {checked} inputs per function, per width");
+}

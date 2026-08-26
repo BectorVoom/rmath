@@ -24,7 +24,7 @@ What remains, grouped by what it costs the user today:
 |---|---|---|
 | `tan` `BitExact` — ported **and** vectorised (§6a A1) | done: 2.77x | — |
 | `atan`/`atan2` `BitExact` — ported **and** vectorised (§6a A4) | done: 1.28x / 2.74-3.03x | — |
-| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: 0.77-0.85x exact (permanent Documented Accept — 13-slot gather & Horner on incoherent data), `Fast` 9.2-10.2x | closed (documented accept) |
+| `asin`/`acos` `BitExact` — ported **and** vectorised (§6a A4); `acos`'s near-1 gap fixed, see §6a | done: **4.8-5.5x** exact (the 0.75-0.85x "permanent Documented Accept" was reopened and closed — unified row index, fixed-stride table, block-load gather; see Cycle 6 in §6a), `Fast` 9.2-10.1x | — |
 | Hyperbolic inverses `BitExact` — ported **and** vectorised (S1) | done: `asinh` 2.45x, `acosh` 1.01x–2.05x, `atanh` 3.53x–3.69x | — |
 | `log10` `BitExact` — ported **and** vectorised (§6a A2), reusing `ln`'s own table | done: 3.15x | — |
 | `log1p`, `hypot` `BitExact` — ported **and** vectorised (§6a A2/A3, S3) | done: `log1p` 2.57x–2.69x, `hypot` 2.80x | — |
@@ -1224,6 +1224,154 @@ widening whenever the f64 kernel does more than the f32 result needs.
     moved (3.4M `expm1` values over `[38, 710]` and `[-760, -38]`, 3.8M `cosh`/`sinh`/`tanh`
     values concentrated on `[709, 711]` and every band edge, 8000-ulp neighbourhoods around each
     threshold, and 300k adversarial bit patterns each) at all four widths: **0 mismatches**.
+
+- **Cycle 6 done: `asin`/`acos` `BitExact` — the A4/A5 "permanent Documented
+  Accept" reopened and closed.** The row that read *0.75-0.85x, permanent
+  Documented Accept — 13-slot gather & Horner on incoherent data* now reads
+  **5.49x / 4.82x** on the default corpus at 1M elements. The accept was right
+  about where the time went and wrong about the floor: the gather was
+  expensive because of the shape of the table, not because gathering is
+  expensive.
+
+  Four changes to the data, each independently verifiable:
+
+  1. **One row index instead of six band formulas.** `e_asin.c` picks a row
+     from `k = high32(|x|)` with six different mask/shift/multiply/add
+     expressions across four range tests. All six are `floor(256*|x|) - 32`:
+     the table is indexed by the argument's top eight bits, and the six
+     spellings are six ways of saying that once the leading `1.` is stripped.
+     The whole per-lane index computation collapses to a multiply, a `floor`
+     and an FMA on the whole vector. `tests/bit_exact.rs::
+     asncs_row_index_is_one_affine_expression` proves the equality over every
+     `k` in the band against an independent transcription of upstream's six
+     formulas, rather than asserting it in a comment.
+
+  2. **No `x0` gather.** Upstream's slot 0 is the band centre, and it is
+     always exactly `(row + 32.5) / 256` — the same consequence of
+     top-eight-bits indexing. The kernel computes it from the `floor` it
+     already has, as `(f - m)/256 - 1/512` with `f = 256*|x|`, which is exact
+     at every step (`f - m` is Sterbenz-exact and a multiple of `2^-47`), so
+     the reduced argument is the reference's own `|x| - row[0]` bit for bit
+     rather than merely close. (`asncs_band_centre_is_arithmetic`, all 216
+     rows.)
+
+  3. **One row stride and one polynomial degree.** Upstream rows are
+     `4 + degree` wide with `degree` running `5..=9`, so a slot's offset
+     depends on which band the row came from.
+     `src/tables/double/asincos_packed.rs` rebuilds them at compile time —
+     `const fn` over the transcribed table, so there is still exactly one
+     source of truth for the numbers and no generator step to keep in sync —
+     at a fixed 16-slot stride, with the coefficient slots a row's own degree
+     does not use written `+0.0`. A zero leading coefficient is a no-op in
+     Horner's rule (`fma(xx, 0, c) == c` exactly), so one unrolled degree-9
+     fold evaluates all five degrees with no per-lane branch. The two fewer
+     FMAs are the small part. The large parts are that every slot is now
+     written *unconditionally*, which is what lets LLVM drop the
+     zero-initialisation of the gather's staging arrays, and that rows are 128
+     bytes on a 64-byte-aligned table, so no block load is ever split across
+     cache lines (worth 3% on its own).
+
+  4. **`Simd::gather_run` — block loads and a register transpose.** A5
+     established that hardware *element* gather loses on this machine, and it
+     still does: an SoA layout with one `gather_bits` per slot measured 4.95
+     ns/element against 2.54 for the per-lane copy. What wins is the opposite
+     move. Twelve adjacent slots per lane, read element by element, are 96
+     scalar loads plus 84 merge/insert operations; read row by row they are 16
+     512-bit loads and 44 shuffles. `Simd::gather_run` is that shape — a
+     contiguous *run* of `N` slots per lane, with the same checked per-lane
+     loop as the default that every target without an override runs, and an
+     `f64x8` override behind `cfg(target_feature = "avx512f")` doing two 8x8
+     transposes (`src/simd/wide_backend.rs`). Worth 9% on `asin` on its own,
+     and it is the only new `unsafe` in the crate this cycle: three `unsafe`
+     blocks, each with its bounds argument next to the arithmetic that makes
+     it true, and a test that checks the override against the default for
+     every run length it branches on.
+
+  And two changes to the dispatch:
+
+  5. **`any()`, not five `all()` probes.** The old entry tested each band for
+     *every* lane being in it, and fell through to computing all three bands
+     plus the blend when none matched — which, on data spread over `[-1, 1]`,
+     is 75% of vectors. Now the table band runs unconditionally (its index
+     arithmetic is safe on every input, NaN and infinity included, so blending
+     it away costs nothing), the Taylor band is guarded by one `any()`, and the
+     near-one band — the only genuinely expensive one, with a second table, a
+     divide and a Newton refinement, and the only one that is actually rare in
+     bulk data — is guarded by another.
+
+  6. **No scalar repair left at all.** `|x| > 1` and NaN separate with a
+     single test, `!(|x| <= 1)`, since every comparison against a NaN is
+     false; the NaN lanes are then refined to the reference's own
+     payload-preserving `x + x`, which is exactly what a hardware add does to
+     a NaN lane. `asin`/`acos` join `expm1`/`sinh`/`cosh`/`tanh` as rows with
+     no `patch_lanes` in them, and `FullRange` now costs exactly what `Finite`
+     costs.
+
+  **A measurement note worth keeping.** This pair measures ~1.6x at 4096
+  elements and ~5x at 1M, and the difference is not cache — it is glibc's
+  branch predictor. The scalar routine takes half a dozen data-dependent band
+  branches per call; a 4096-element buffer replayed thirty times lets the
+  predictor memorise the entire sequence, and glibc's `asin` measures ~11
+  cycles per element. It cannot memorise a 1M-element one, and the same
+  routine measures ~90. Small repeated buffers flatter branchy scalar `libm`
+  routines by a factor of several; the 1M row is the honest one, and it is the
+  one the harness reports by default.
+
+  Measured, interleaved A/B of two binaries, `examples/bench.rs`, default
+  corpus, 1M elements:
+
+  | function | policy | before | after |
+  |---|---|--:|--:|
+  | `asin` | `BitExact` | 0.75x (16.12 ns) | **5.49x** (2.44 ns) |
+  | `asin` | `BitExact` + `Finite` | 0.77x | **5.47x** |
+  | `acos` | `BitExact` | 0.76x (16.07 ns) | **4.82x** (2.81 ns) |
+  | `acos` | `BitExact` + `Finite` | 0.77x | **4.99x** |
+  | `asin`/`acos` | `Fast` | 9.11x / 9.36x | 9.23x / 9.26x (unchanged) |
+
+  Four alternating rounds of each binary, medians. No other row in the suite
+  shows a change that separates from noise, and the qualifier matters here:
+  the session these were taken in had a background load the reference runs did
+  not, and per-round spreads on the untouched rows reached ±40% in *both*
+  directions (`exp` `BitExact` ranged 1.50x-2.74x across four runs of the same
+  binary). Nothing but `asin`/`acos` moves far enough to be readable through
+  that, which is the claim being made — not that nothing else moved at all.
+  The one row that could plausibly have moved on purpose is every unary
+  function, through the `chunks_exact` rewrite of the slice driver below; it
+  did not separate from noise either way.
+
+  Verified: the full `bit_exact` suite at all four widths, plus a dedicated
+  sweep kept as `tests/bit_exact.rs::asin_acos_band_sweep` (`#[ignore]`d,
+  `RMATH_SWEEP_N` for the random count) — every `k` in the table band at four
+  low-word positions, every band boundary with its 2048 neighbouring low words
+  on each side and both signs, and 300M random values weighted towards the
+  near-one band, the last 2^30 ulps below 1, subnormal-to-tiny magnitudes and
+  raw bit patterns — at all four widths, for both functions:
+  **0 mismatches**. Three more tests pin the claims the rewrite rests on
+  rather than leaving them as comments: the row index against an independent
+  transcription of upstream's six formulas over every `k` in the band, the
+  band centre against the table for all 216 rows, and every packed row against
+  the row it was built from.
+
+- **`sqrt`: the slice driver stopped bounds-checking inside its own loop.**
+  `eval_slice`'s `while i < end { .. &src[i..i + lanes] .. }` left a length
+  check, and a branch to a panic, in the loop body: the range is provably in
+  bounds, but nothing in the slice operation says so. Rewritten as `split_at`
+  plus `chunks_exact`, which carries the guarantee in its type — the check and
+  the branch go, and LLVM unrolls the loop eightfold. It is invisible where the
+  body is a hundred instructions; on `sqrt`, whose body is one `vsqrtpd` and
+  one store, it was two of the loop's seven instructions.
+
+  `sqrt` itself is at its floor and always was, which is worth stating
+  plainly rather than leaving as an unexplained ~1.0x row: IEEE-754 *requires*
+  square root to be correctly rounded, every target here has a single
+  instruction that does it, and glibc lowers `sqrt` to that same instruction.
+  There is no schedule to replay and no accuracy to trade. The benchmark's own
+  scalar baseline auto-vectorises to `vsqrtpd` as well — LLVM will vectorise a
+  `sqrt` loop, which is exactly what it will not do for `exp` — so that row
+  compares two identical instruction streams and cannot read much above
+  parity. It is a real ~1.0x, not a missed optimisation, and the value rmath
+  adds for `sqrt` is composition: a `sqrt` inside a loop that also calls `exp`
+  vectorises with it instead of blocking the loop.
 
 ## 7. Suggested sequencing
 

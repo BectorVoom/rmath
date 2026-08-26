@@ -1,6 +1,7 @@
 //! Double-precision tables.
 
 pub mod asincos_data;
+pub mod asincos_packed;
 pub mod asincosh;
 pub mod atan2_data;
 pub mod atan_data;

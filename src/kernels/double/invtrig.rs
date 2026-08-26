@@ -37,27 +37,36 @@ fn asin_core<V: Simd<Elem = f64>>(t: V, s: V) -> V {
 /// mirroring [`crate::reference::double::invtrig`] exactly — same bands, same
 /// fusions (see that module's doc for the disassembly this was cross-checked
 /// against). `asin`/`acos` landed as the follow-on `ROADMAP.md`'s A4 entry
-/// planned: their eight bands share a 2568-entry table, gathered per lane
-/// below like `atan`'s own `cij` rows.
+/// planned: their eight bands share the `asncs.x` table, repacked at one
+/// stride by [`crate::tables::double::asincos_packed`] and read one whole row
+/// per lane by [`Simd::gather_run`].
 ///
 /// Every band below is evaluated for every lane, then blended with
 /// `V::select`, the same whole-vector discipline `trig.rs` uses: `Simd` has
-/// no scalar control flow to branch on. Table gathers (`cij_row`) go
-/// through a per-lane loop exactly like `trig.rs`'s `TAB` lookup and
-/// `ln.rs`'s exponent-field extraction, for the same reason — there is no
-/// packed integer shift or index anywhere in this crate's `Simd` surface.
-/// Lanes the reference reaches via an *early return* rather than the
-/// regular arithmetic path (NaN; zero, subnormal or infinite arguments;
-/// `atan2`'s extreme-exponent-difference short circuit; its extreme-
-/// magnitude rescale bands) are not replayed here at all — they are
-/// detected and handed to the scalar reference by `patch_lanes`/
-/// `patch_lanes2`, per this crate's own rule that rare-lane repairs stay in
-/// `reference/`, not in a vector main path.
+/// no scalar control flow to branch on — except where a band is expensive
+/// *and* rare, in which case it is skipped by an `any()` test on the mask
+/// that would have selected it (`asin`/`acos`'s near-one band). `atan`'s
+/// table gather (`cij_row`) still goes through a per-lane loop exactly like
+/// `trig.rs`'s `TAB` lookup, because it reads a single value per lane rather
+/// than a run; there is no packed integer shift or index anywhere in this
+/// crate's `Simd` surface.
+///
+/// Lanes the reference reaches via an *early return* rather than the regular
+/// arithmetic path are handled two different ways here. `atan`/`atan2` hand
+/// theirs (NaN; zero, subnormal or infinite arguments; `atan2`'s
+/// extreme-exponent-difference short circuit and its extreme-magnitude
+/// rescale bands) to the scalar reference through `patch_lanes`/
+/// `patch_lanes2`, per this crate's rule that rare-lane repairs stay in
+/// `reference/` rather than in a vector main path. `asin`/`acos` have none
+/// left to hand over: their only such case is a NaN argument, whose
+/// payload-preserving `x + x` is what a hardware add already does to a NaN
+/// lane, so it is two instructions in the main path instead of a repair.
 mod bit_exact {
     use super::*;
     use crate::kernels::double::dd::{a_mul, two_sum};
     use crate::simd::Lanes;
     use crate::tables::double::asincos_data as ac;
+    use crate::tables::double::asincos_packed as pk;
     use crate::tables::double::atan_data as at;
     use crate::tables::double::atan2_data as at2;
 
@@ -432,148 +441,113 @@ mod bit_exact {
     // disassembly this was cross-checked against, and `ROADMAP.md`'s A4 entry
     // for the `t24`-vs-`t27` bug the fix records).
 
-    /// The band thresholds, as the scalar reference's `k = high32(|x|)` values
-    /// promoted to floats. `u32` sits far inside `f64`'s exact range, so the
-    /// comparisons below are exact.
-    const K_TINY: f64 = 0x3e50_0000_u32 as f64; // 2^-26, asin's A band
-    const K_ACOS_TINY: f64 = 0x3c88_0000_u32 as f64; // 2^-55, acos's A band
-    const K_TAYLOR: f64 = 0x3fc0_0000_u32 as f64; // 0.125
-    const K_TABLE: f64 = 0x3fef_0000_u32 as f64; // 0.96875
+    /// The band thresholds, as the exact `f64` values the scalar reference's
+    /// `k = high32(|x|)` comparisons are testing for.
+    ///
+    /// `k` is the top 32 bits of a non-negative double, which is a monotone
+    /// function of the value, so `k < K` and `|x| < f64::from_bits(K << 32)`
+    /// select the same lanes — and the float form costs one compare against
+    /// a constant instead of a per-lane shift out of the bit pattern. The
+    /// bounds are all exactly representable (they *are* doubles with a zero
+    /// low word), so nothing is lost at the boundary.
+    const TINY: f64 = f64::from_bits(0x3e50_0000_0000_0000); // 2^-26, asin's A band
+    const ACOS_TINY: f64 = f64::from_bits(0x3c88_0000_0000_0000); // 1.5*2^-55, acos's A band
+    const TAYLOR_HI: f64 = 0.125; // 0x3fc00000
+    const TABLE_HI: f64 = 0.96875; // 0x3fef0000
 
-    /// `high32(|x|)` — the scalar reference's `k` — as float lanes. Exactly
-    /// representable: the value is a `u32` at most, far inside `f64`'s range.
+    /// `2^52 - 32 * STRIDE`, the constant that turns `floor(256*|x|)` into a
+    /// packed *slot offset* inside a double's mantissa — see [`asncs_key`].
+    const KEY_BIAS: f64 = 4503599627370496.0 - 32.0 * pk::STRIDE as f64;
+
+    /// The packed table's row index and band centre, from one `floor`.
+    ///
+    /// `e_asin.c` picks a row with six different band formulas over
+    /// `k = high32(|x|)`; every one of them is `floor(256*|x|) - 32` in
+    /// disguise (see [`crate::tables::double::asincos_packed`], and
+    /// `tests/bit_exact.rs` for the proof over every `k` in the band). So the
+    /// whole per-lane index computation — the shift out of the bit pattern,
+    /// the four range tests, the six mask/shift/multiply/add pairs —
+    /// collapses to a multiply, a `floor` and two FMAs, on the whole vector at
+    /// once.
+    ///
+    /// Returns `(xx, key)`:
+    ///
+    /// * `xx = |x| - x0` is the reduced argument, where the band centre
+    ///   `x0 = (floor(256*|x|) + 0.5) / 256` is upstream's slot 0 exactly
+    ///   (checked for all 216 rows in `tests/bit_exact.rs`). It is spelled
+    ///   `(f - m)/256 - 1/512` with `f = 256*|x|` so that the whole reduction
+    ///   is one subtraction and one FMA, and every step of it is *exact*:
+    ///   `f` is a power-of-two scaling, `f - m` is Sterbenz-exact and a
+    ///   multiple of `2^-47`, and dividing by 256 and shifting by `1/512`
+    ///   keep it inside 53 bits. Exact at every step is what makes this
+    ///   reproduce the reference's own `|x| - row[0]` bit for bit rather than
+    ///   merely closely.
+    ///
+    /// * `key` is `2^52 + row * STRIDE`, so that `key`'s low bits *are* the
+    ///   offset of the row's first slot: the gather reads it with one mask and
+    ///   never converts a float to an integer, never scales an index and never
+    ///   clamps one. The scaling rides along in the `floor`'s own FMA, which
+    ///   is exact — every value involved is a small integer. A lane outside
+    ///   the table band lands on some arbitrary offset in `[0, 0xfff]`,
+    ///   including a NaN or infinite lane whose bit pattern masks to something
+    ///   harmless, and the table is sized past `0xfff` precisely so that
+    ///   offset is in bounds; the blend discards its result.
     #[inline(always)]
-    fn high32<V: Simd<Elem = f64>>(x: V) -> V {
-        let bits = x.to_bits();
-        let mut out = V::Floats::filled_default();
-        for i in 0..V::LANES {
-            out.as_mut_slice()[i] = (bits.as_slice()[i] >> 32) as u32 as f64;
-        }
-        V::from_array(out)
-    }
-
-    /// One `asncs.x` row's 13 slots, gathered per lane from the lane's own
-    /// `k = high32(|x|)`. The six band-index formulas and five degrees of the
-    /// scalar reference's `asncs_band_index` are resolved here, per lane, into
-    /// a single `(n, d)` pair: `n` clamped to `[0, 2555]` so an out-of-band
-    /// lane (one whose result the blend discards) still reads an in-bounds
-    /// row — the same defensive role `cij_row`'s `clamp(0, 240)` plays — and
-    /// `d` chosen from the band. The 13 slots are gathered unmasked into
-    /// `x0`, `t1`, the 11 coefficient slots `c[0..11]` (= row slots 2..12)
-    /// and the trailing `outer`/`final`; the coefficient slots that lie
-    /// beyond this lane's own degree are zeroed here, so the caller's single
-    /// unrolled polynomial can fold them as no-ops no matter which band the
-    /// lane actually landed in. `outer` and `final` are read from their
-    /// per-degree positions directly, before the zeroing.
-    #[inline(always)]
-    fn asncs_row<V: Simd<Elem = f64>>(k: V) -> (V, V, [V; 11], V, V) {
-        let ka = k.to_array();
-        let k0 = ka.as_slice()[0] as u32;
-        let mut all_same = true;
-        for i in 1..V::LANES {
-            if ka.as_slice()[i] as u32 != k0 {
-                all_same = false;
-                break;
-            }
-        }
-        if all_same {
-            let (n, d) = if k0 < 0x3fe0_0000 {
-                if k0 < 0x3fd0_0000 {
-                    (11 * ((k0 & 0x000f_ffff) >> 15), 5)
-                } else {
-                    (11 * ((k0 & 0x000f_ffff) >> 14) + 352, 5)
-                }
-            } else if k0 < 0x3fe8_0000 {
-                (1056 + (((k0 & 0x000f_e000) >> 11) * 3), 6)
-            } else if k0 < 0x3fed_8000 {
-                (992 + (((k0 & 0x000f_e000) >> 13) * 13), 7)
-            } else if k0 < 0x3fee_8000 {
-                (884 + (((k0 & 0x000f_e000) >> 13) * 14), 8)
-            } else {
-                (768 + (((k0 & 0x000f_e000) >> 13) * 15), 9)
-            };
-            let n = (n.min(2555)) as usize;
-            let x0 = V::splat(f64::from_bits(ac::ASNCS[n]));
-            let t1 = V::splat(f64::from_bits(ac::ASNCS[n + 1]));
-            let mut c = [V::splat(0.0); 11];
-            for (j, slot) in c.iter_mut().enumerate() {
-                let slot_idx = j + 2;
-                if slot_idx < 2 + d {
-                    *slot = V::splat(f64::from_bits(ac::ASNCS[n + slot_idx]));
-                }
-            }
-            let outer = V::splat(f64::from_bits(ac::ASNCS[n + 2 + d]));
-            let fin = V::splat(f64::from_bits(ac::ASNCS[n + 3 + d]));
-            return (x0, t1, c, outer, fin);
-        }
-
-        let mut x0 = V::Floats::filled_default();
-        let mut t1 = V::Floats::filled_default();
-        let mut c = [V::Floats::filled_default(); 11];
-        let mut outer = V::Floats::filled_default();
-        let mut fin = V::Floats::filled_default();
-        for i in 0..V::LANES {
-            let k = ka.as_slice()[i] as u32;
-            let (n, d) = if k < 0x3fe0_0000 {
-                if k < 0x3fd0_0000 {
-                    (11 * ((k & 0x000f_ffff) >> 15), 5)
-                } else {
-                    (11 * ((k & 0x000f_ffff) >> 14) + 352, 5)
-                }
-            } else if k < 0x3fe8_0000 {
-                (1056 + (((k & 0x000f_e000) >> 11) * 3), 6)
-            } else if k < 0x3fed_8000 {
-                (992 + (((k & 0x000f_e000) >> 13) * 13), 7)
-            } else if k < 0x3fee_8000 {
-                (884 + (((k & 0x000f_e000) >> 13) * 14), 8)
-            } else {
-                (768 + (((k & 0x000f_e000) >> 13) * 15), 9)
-            };
-            let n = (n.min(2555)) as usize;
-            let d = d as usize;
-            let p = &ac::ASNCS[n..n + 4 + d];
-            x0.as_mut_slice()[i] = f64::from_bits(p[0]);
-            t1.as_mut_slice()[i] = f64::from_bits(p[1]);
-            for j in 0..d {
-                c[j].as_mut_slice()[i] = f64::from_bits(p[2 + j]);
-            }
-            outer.as_mut_slice()[i] = f64::from_bits(p[2 + d]);
-            fin.as_mut_slice()[i] = f64::from_bits(p[3 + d]);
-        }
+    fn asncs_key<V: Simd<Elem = f64>>(u: V) -> (V, V) {
+        let f = V::splat(256.0) * u;
+        let m = f.floor();
         (
-            V::from_array(x0),
-            V::from_array(t1),
-            [
-                V::from_array(c[0]),
-                V::from_array(c[1]),
-                V::from_array(c[2]),
-                V::from_array(c[3]),
-                V::from_array(c[4]),
-                V::from_array(c[5]),
-                V::from_array(c[6]),
-                V::from_array(c[7]),
-                V::from_array(c[8]),
-                V::from_array(c[9]),
-                V::from_array(c[10]),
-            ],
-            V::from_array(outer),
-            V::from_array(fin),
+            (f - m).mul_add(V::splat(1.0 / 256.0), V::splat(-1.0 / 512.0)),
+            m.mul_add(V::splat(pk::STRIDE as f64), V::splat(KEY_BIAS)),
         )
     }
 
-    /// One unrolled `asncs.x` band polynomial: `p = xx^2*horner(xx, c) +
-    /// outer` and `t = xx*t1 + p`, each one fused FMA exactly as the
-    /// reference's `asncs_band` compiles, then the unfused trailing combine.
-    /// The fold runs all eleven coefficient slots on every lane; the slots
-    /// beyond a lane's own degree are zero by construction (see `asncs_row`),
-    /// so `val` is identically zero until it reaches the lane's real leading
-    /// coefficient. `final` is returned separately because `asin`'s bands
-    /// finish with the unfused `final + t` while `acos`'s apply their own
-    /// `HP0`/`HP1` combination on top. Returns `(t_plus_p, final)`.
+    /// One packed row's twelve slots, as twelve vectors.
+    ///
+    /// The row is `[t1, c0..c8, outer, final]` at a fixed stride, which is
+    /// what lets this be one [`Simd::gather_run`] — a contiguous run per lane,
+    /// so the backend can read whole rows and transpose them in register
+    /// rather than issue `LANES * 12` scalar loads (see that method's doc, and
+    /// the AVX-512 override in `src/simd/wide_backend.rs`). The coefficient
+    /// slots past a lane's own degree are `+0.0` in the table itself, which is
+    /// what lets one degree-9 fold serve all five degrees: `fma(xx, 0, c) == c`
+    /// exactly.
+    #[allow(unsafe_code)]
     #[inline(always)]
-    fn asncs_poly<V: Simd<Elem = f64>>(xx: V, t1: V, c: [V; 11], outer: V, fin: V) -> (V, V) {
-        let mut val = c[10];
-        for &ci in c[..10].iter().rev() {
+    fn asncs_row<V: Simd<Elem = f64>>(key: V) -> (V, [V; 9], V, V) {
+        let kb = key.to_bits();
+        let mut idx = V::Bits::filled_default();
+        for i in 0..V::LANES {
+            idx.as_mut_slice()[i] = kb.as_slice()[i] & 0xfff;
+        }
+        // SAFETY: every index is masked to `0xfff`, and `pk::PACKED` is sized
+        // to `0x1000 + 16` precisely so that a run of `pk::USED` slots from
+        // any such index — rounded up to the eight-slot block a hardware
+        // override reads whether or not every slot in it is wanted — is in
+        // bounds. See `pk::SLOTS`.
+        let r: [V; pk::USED] = unsafe { V::gather_run(&pk::PACKED.0, idx) };
+        (
+            r[0],
+            [r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]],
+            r[10],
+            r[11],
+        )
+    }
+
+    /// One `asncs.x` band polynomial: `p = xx^2*horner(xx, c) + outer` and
+    /// `t = xx*t1 + p`, each one fused FMA exactly as the reference's
+    /// `asncs_band` compiles, then the unfused trailing combine the caller
+    /// applies. The fold runs all nine coefficient slots on every lane; the
+    /// slots beyond a lane's own degree are `+0.0` in the table, so `val` is
+    /// identically zero until the fold reaches that lane's real leading
+    /// coefficient and the chain is bit-for-bit the reference's shorter one.
+    /// `final` is returned separately because `asin`'s bands finish with the
+    /// unfused `final + t` while `acos`'s apply their own `HP0`/`HP1`
+    /// combination on top. Returns `(t_plus_p, final)`.
+    #[inline(always)]
+    fn asncs_poly<V: Simd<Elem = f64>>(xx: V, t1: V, c: [V; 9], outer: V, fin: V) -> (V, V) {
+        let mut val = c[8];
+        for &ci in c[..8].iter().rev() {
             val = xx.mul_add(val, ci);
         }
         let p = (xx * xx).mul_add(val, outer);
@@ -690,20 +664,27 @@ mod bit_exact {
     /// `acos`'s table bands' trailing combine: `y = HP0 ∓ final`,
     /// `t = HP1 ∓ t_plus_p`, `y + t` — `e_asin.c`'s `acos` bands never add
     /// `row[3+degree]` themselves (`asin`'s do).
+    ///
+    /// The `∓` is `x`'s sign bit XORed into both operands rather than a pair
+    /// of blends: `HP0 - (fin ^ sign(x))` is `HP0 - fin` when `x > 0` and
+    /// `HP0 + fin` when `x < 0`, exactly — negation is a bit flip, and the
+    /// subtraction that follows rounds once either way. `x` is never zero in
+    /// a table band, so there is no signed-zero case to get wrong.
     #[inline(always)]
-    fn acos_table_combine<V: Simd<Elem = f64>>(neg: V::Mask, fin: V, t: V) -> V {
-        let y = V::select(neg, V::splat(ac::HP0) + fin, V::splat(ac::HP0) - fin);
-        y + V::select(neg, V::splat(ac::HP1) + t, V::splat(ac::HP1) - t)
+    fn acos_table_combine<V: Simd<Elem = f64>>(x: V, fin: V, t: V) -> V {
+        let sign = x.and_bits(V::splat(-0.0));
+        let y = V::splat(ac::HP0) - fin.xor_bits(sign);
+        y + (V::splat(ac::HP1) - t.xor_bits(sign))
     }
 
-    /// `asin`'s table bands (`0.125 <= |x| < 0.96875`): every band's row and
-    /// polynomial evaluated for every lane from one per-lane gather, the
-    /// degree resolved per lane by `asncs_row` — the whole-vector-blend
-    /// discipline this module uses throughout.
+    /// `asin`'s table bands (`0.125 <= |x| < 0.96875`): one gather and one
+    /// degree-9 fold for every lane, whatever band each lane is really in —
+    /// the whole-vector-blend discipline this module uses throughout.
     #[inline(always)]
-    fn asin_table<V: Simd<Elem = f64>>(u: V, k: V) -> V {
-        let (x0, t1, c, outer, fin) = asncs_row(k);
-        let (t_plus_p, fin) = asncs_poly(u - x0, t1, c, outer, fin);
+    fn asin_table<V: Simd<Elem = f64>>(u: V) -> V {
+        let (xx, key) = asncs_key(u);
+        let (t1, c, outer, fin) = asncs_row(key);
+        let (t_plus_p, fin) = asncs_poly(xx, t1, c, outer, fin);
         fin + t_plus_p
     }
 
@@ -711,127 +692,90 @@ mod bit_exact {
     /// combined by `acos_table_combine` instead of the plain unfused
     /// `final + t`.
     #[inline(always)]
-    fn acos_table<V: Simd<Elem = f64>>(x: V, u: V, k: V) -> V {
-        let (x0, t1, c, outer, fin) = asncs_row(k);
-        let (t_plus_p, fin) = asncs_poly(u - x0, t1, c, outer, fin);
-        acos_table_combine(x.lt_mask(V::splat(0.0)), fin, t_plus_p)
+    fn acos_table<V: Simd<Elem = f64>>(x: V, u: V) -> V {
+        let (xx, key) = asncs_key(u);
+        let (t1, c, outer, fin) = asncs_row(key);
+        let (t_plus_p, fin) = asncs_poly(xx, t1, c, outer, fin);
+        acos_table_combine(x, fin, t_plus_p)
     }
 
     /// `asin(x)`, vectorised — a genuine replay of `__ieee754_asin_fma`'s
-    /// schedule, not a per-lane call. Lanes the reference reaches via an
-    /// early return that no band arithmetic reproduces — NaN, whose
-    /// payload-preserving `x + x` the arithmetic cannot — are left for
-    /// [`asin_needs_repair`]. `|x| == 1` is a real band (`+-pi/2`, computed
-    /// by select) and `|x| > 1` the canonical NaN the reference's wrapper
-    /// returns, so neither needs the reference. The final `.copysign(x)` is
-    /// applied *before* the out-of-domain overwrite so that only the real
-    /// bands take the input's sign (`asin(-inf)` must stay the positive
-    /// canonical NaN, not a negative one).
+    /// schedule, not a per-lane call, and one that answers *every* input in
+    /// vector form. `|x| == 1` is a real band (`+-pi/2`, computed by select),
+    /// `|x| > 1` is the canonical NaN the reference's wrapper returns, and a
+    /// NaN input gets the reference's own payload-preserving `x + x` from a
+    /// hardware add — so there is no scalar repair here and `FullRange` costs
+    /// nothing over `Finite`. The sign is applied *before* the out-of-domain
+    /// overwrite, so only the real bands take the input's sign
+    /// (`asin(-inf)` must stay the positive canonical NaN, not a negative
+    /// one).
+    ///
+    /// # Which bands actually run
+    ///
+    /// The table band is the one every real workload spends its time in, and
+    /// it is also the only band whose cost is a gather, so it runs
+    /// unconditionally: its index arithmetic is safe on every input
+    /// ([`asncs_key`]) and blending it away costs nothing. The Taylor band is
+    /// six FMAs and likewise not worth a branch. The near-one band is the
+    /// expensive one — a second table, a divide and a Newton refinement — and
+    /// it is the one band that is genuinely rare in bulk data, so it alone is
+    /// guarded by an `any()` test. That is the whole dispatch: one predictable
+    /// branch instead of the five `all()` tests this used to open with, which
+    /// only paid off when an entire vector landed in one band.
     #[inline(always)]
     pub(super) fn asin<V: Simd<Elem = f64>>(x: V) -> V {
         let u = x.abs();
-        let k = high32(u);
+        let below = u.lt_mask(V::splat(TAYLOR_HI));
+        let above = u.ge_mask(V::splat(TABLE_HI));
 
-        let is_taylor = k.lt_mask(V::splat(K_TAYLOR));
-        if is_taylor.all() {
-            let taylor = asin_taylor(x);
-            let r = V::select(k.lt_mask(V::splat(K_TINY)), x, taylor);
-            return r.copysign(x);
+        let mut r = asin_table(u);
+        if below.any() {
+            r = V::select(below, asin_taylor(u), r);
         }
-        let is_table = k
-            .ge_mask(V::splat(K_TAYLOR))
-            .and(k.lt_mask(V::splat(K_TABLE)));
-        if is_table.all() {
-            let table = asin_table(u, k);
-            return table.copysign(x);
+        if above.any() {
+            let near1 = V::select(u.eq_mask(V::splat(1.0)), V::splat(ac::HP0), asin_near1(u));
+            r = V::select(above, near1, r);
         }
-        let is_near1 = k.ge_mask(V::splat(K_TABLE)).and(u.le_mask(V::splat(1.0)));
-        if is_near1.all() {
-            let near1 = asin_near1(u);
-            let at_one = V::splat(ac::HP0).copysign(x);
-            let r = V::select(u.eq_mask(V::splat(1.0)), at_one, near1);
-            return r.copysign(x);
-        }
-
-        let taylor = asin_taylor(x);
-        let table = asin_table(u, k);
-        let near1 = asin_near1(u);
-        let at_one = V::splat(ac::HP0).copysign(x);
-        let nan = V::splat(f64::NAN);
-
-        let r = V::select(k.lt_mask(V::splat(K_TINY)), x, taylor);
-        let r = V::select(k.lt_mask(V::splat(K_TAYLOR)), r, table);
-        let r = V::select(k.lt_mask(V::splat(K_TABLE)), r, near1);
-        let r = V::select(u.eq_mask(V::splat(1.0)), at_one, r);
-        let r = r.copysign(x);
-        let out = u.gt_mask(V::splat(1.0)).or(x.is_nan());
-        V::select(out, nan, r)
-    }
-
-    /// Lanes `asin`'s vector path leaves to the reference: NaN only. `|x| > 1`
-    /// is the canonical `f64::NAN` the reference's wrapper returns, reproduced
-    /// exactly in-vector; `|x| == 1` is a select; every other input is real
-    /// vector arithmetic replaying the reference's own schedule.
-    #[inline(always)]
-    pub(super) fn asin_needs_repair<V: Simd<Elem = f64>>(x: V) -> V::Mask {
-        x.is_nan()
+        // Every band above returns a magnitude, so the sign goes on with an
+        // XOR rather than `copysign`'s abs-and-or: `r` is known non-negative.
+        r = V::select(u.lt_mask(V::splat(TINY)), u, r).xor_bits(x.and_bits(V::splat(-0.0)));
+        // Out of domain *or* NaN in one test: `!(|x| <= 1)` is true for both,
+        // since every comparison against a NaN is false. The canonical NaN
+        // goes in first and the NaN lanes are then refined to the reference's
+        // own payload-preserving `x + x`, which is exactly what a hardware
+        // add does to a NaN lane — so this function needs no scalar repair on
+        // any input at all, and `FullRange` costs nothing over `Finite`.
+        let r = V::select(u.le_mask(V::splat(1.0)).not(), V::splat(f64::NAN), r);
+        V::select(x.is_nan(), x + x, r)
     }
 
     /// `acos(x)`, vectorised — shares `asin`'s bands and differs only in the
     /// linear combination applied to each (see [`acos_table`] and
-    /// [`acos_near1`]).
+    /// [`acos_near1`]), and in dispatching on the signed `x` rather than on
+    /// the magnitude. Same band-selection reasoning as [`asin`]'s.
     #[inline(always)]
     pub(super) fn acos<V: Simd<Elem = f64>>(x: V) -> V {
         let u = x.abs();
-        let k = high32(u);
+        let below = u.lt_mask(V::splat(TAYLOR_HI));
+        let above = u.ge_mask(V::splat(TABLE_HI));
 
-        let is_taylor = k.lt_mask(V::splat(K_TAYLOR));
-        if is_taylor.all() {
-            let tiny = V::splat(ac::HP0);
-            let taylor = acos_taylor(x);
-            return V::select(k.lt_mask(V::splat(K_ACOS_TINY)), tiny, taylor);
+        let mut r = acos_table(x, u);
+        if below.any() {
+            r = V::select(below, acos_taylor(x), r);
         }
-        let is_table = k
-            .ge_mask(V::splat(K_TAYLOR))
-            .and(k.lt_mask(V::splat(K_TABLE)));
-        if is_table.all() {
-            return acos_table(x, u, k);
-        }
-        let is_near1 = k.ge_mask(V::splat(K_TABLE)).and(u.le_mask(V::splat(1.0)));
-        if is_near1.all() {
-            let near1 = acos_near1(x);
+        if above.any() {
             let at_one = V::select(
                 x.lt_mask(V::splat(0.0)),
                 V::splat(2.0 * ac::HP0),
                 V::splat(0.0),
             );
-            return V::select(u.eq_mask(V::splat(1.0)), at_one, near1);
+            let near1 = V::select(u.eq_mask(V::splat(1.0)), at_one, acos_near1(x));
+            r = V::select(above, near1, r);
         }
-
-        let tiny = V::splat(ac::HP0);
-        let taylor = acos_taylor(x);
-        let table = acos_table(x, u, k);
-        let near1 = acos_near1(x);
-        let at_one = V::select(
-            x.lt_mask(V::splat(0.0)),
-            V::splat(2.0 * ac::HP0),
-            V::splat(0.0),
-        );
-        let nan = V::splat(f64::NAN);
-
-        let r = V::select(k.lt_mask(V::splat(K_ACOS_TINY)), tiny, taylor);
-        let r = V::select(k.lt_mask(V::splat(K_TAYLOR)), r, table);
-        let r = V::select(k.lt_mask(V::splat(K_TABLE)), r, near1);
-        let r = V::select(u.eq_mask(V::splat(1.0)), at_one, r);
-        let out = u.gt_mask(V::splat(1.0)).or(x.is_nan());
-        V::select(out, nan, r)
-    }
-
-    /// Lanes `acos`'s vector path leaves to the reference: NaN only, as for
-    /// [`asin_needs_repair`].
-    #[inline(always)]
-    pub(super) fn acos_needs_repair<V: Simd<Elem = f64>>(x: V) -> V::Mask {
-        x.is_nan()
+        r = V::select(u.lt_mask(V::splat(ACOS_TINY)), V::splat(ac::HP0), r);
+        // See `asin`'s identical tail: no scalar repair on any input.
+        let r = V::select(u.le_mask(V::splat(1.0)).not(), V::splat(f64::NAN), r);
+        V::select(x.is_nan(), x + x, r)
     }
 }
 
@@ -842,9 +786,10 @@ pub mod asin {
     /// `asin(x)` for a vector of lanes.
     ///
     /// Under `BitExact` the vector path is a genuine schedule replay
-    /// (`bit_exact::asin`), with a NaN repair for the payload-preserving
-    /// `x + x` the reference returns for a NaN input; `|x| >= 1` is handled
-    /// in-vector (`+-pi/2` at exactly 1, the canonical NaN beyond). Under
+    /// (`bit_exact::asin`) with no scalar repair on any input: `|x| >= 1` is
+    /// handled in-vector (`+-pi/2` at exactly 1, the canonical NaN beyond),
+    /// and so is a NaN argument, whose payload-preserving `x + x` is what a
+    /// hardware add already does to a NaN lane. Under
     /// `Fast`, `outside(x, 1.0)` also catches `|x| == 1` and sends it to the
     /// reference — one extra scalar lane on an input that is rare in bulk
     /// data, buying not having to reason about `sqrt(0)` in the folded
@@ -852,12 +797,8 @@ pub mod asin {
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         if A::BIT_EXACT {
-            let y = bit_exact::asin(x);
-            return if D::CHECKED {
-                patch_lanes(x, y, bit_exact::asin_needs_repair(x), reference::asin)
-            } else {
-                y
-            };
+            let _ = D::CHECKED;
+            return bit_exact::asin(x);
         }
         dispatch::<V, A, D>(x, reference::asin, fast, |x| outside(x, 1.0))
     }
@@ -888,19 +829,15 @@ pub mod acos {
     /// `acos(x)` for a vector of lanes.
     ///
     /// Under `BitExact` the vector path is a genuine schedule replay
-    /// (`bit_exact::acos`), with a NaN repair as for [`asin::eval`]; `|x| >= 1`
-    /// is handled in-vector (`0` or `2*pi` at exactly 1, the canonical NaN
-    /// beyond). Under `Fast`, `outside(x, 1.0)` also catches `|x| == 1` and
+    /// (`bit_exact::acos`) with no scalar repair on any input, as for
+    /// [`asin::eval`]; `|x| >= 1` is handled in-vector (`0` or `2*pi` at
+    /// exactly 1, the canonical NaN beyond). Under `Fast`, `outside(x, 1.0)` also catches `|x| == 1` and
     /// sends it to the reference, as in [`asin::eval`].
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         if A::BIT_EXACT {
-            let y = bit_exact::acos(x);
-            return if D::CHECKED {
-                patch_lanes(x, y, bit_exact::acos_needs_repair(x), reference::acos)
-            } else {
-                y
-            };
+            let _ = D::CHECKED;
+            return bit_exact::acos(x);
         }
         dispatch::<V, A, D>(x, reference::acos, fast, |x| outside(x, 1.0))
     }

@@ -44,20 +44,30 @@ pub type Widest = <f64 as Real>::Widest;
 /// The widest `f32` vector the enabled backend provides.
 pub type WidestF32 = <f32 as Real>::Widest;
 
+/// The buffer walk every unary function's `eval_slice` runs.
+///
+/// Spelled as `split_at` plus `chunks_exact` rather than as an index loop over
+/// `&src[i..i + lanes]`, because the two say the same thing to a reader and
+/// different things to the optimiser. An index loop leaves a length check —
+/// and a branch to a panic — *inside* the loop body: nothing in the slice
+/// operation itself states that the range is in bounds, so the check survives
+/// even though `i < end <= len - len % lanes` makes it dead.
+/// `chunks_exact` carries that guarantee in its type instead, which both
+/// removes the branch and lets LLVM unroll. It is invisible on `exp`, where
+/// the loop body is a hundred instructions; on `sqrt`, where the body is one
+/// `vsqrtpd` and one store, it was two of the loop's seven instructions.
 #[inline(always)]
 fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
     assert_eq!(src.len(), dst.len(), "eval_slice: length mismatch");
     let lanes = <E::Widest as Simd>::LANES;
-    let rem = src.len() % lanes;
-    let end = src.len() - rem;
+    let end = src.len() - src.len() % lanes;
+    let (src_v, src_t) = src.split_at(end);
+    let (dst_v, dst_t) = dst.split_at_mut(end);
 
-    let mut i = 0;
-    while i < end {
-        let v = f.eval(<E::Widest as Simd>::load_slice(&src[i..i + lanes]));
-        v.store_slice(&mut dst[i..i + lanes]);
-        i += lanes;
+    for (s, d) in src_v.chunks_exact(lanes).zip(dst_v.chunks_exact_mut(lanes)) {
+        f.eval(<E::Widest as Simd>::load_slice(s)).store_slice(d);
     }
-    for (s, d) in src[end..].iter().zip(dst[end..].iter_mut()) {
+    for (s, d) in src_t.iter().zip(dst_t.iter_mut()) {
         *d = f.eval::<E>(*s);
     }
 }
@@ -65,17 +75,14 @@ fn eval_unary_slice<E: Real, F: Function<E>>(f: &F, src: &[E], dst: &mut [E]) {
 #[inline(always)]
 fn eval_unary_in_place<E: Real, F: Function<E>>(f: &F, buf: &mut [E]) {
     let lanes = <E::Widest as Simd>::LANES;
-    let rem = buf.len() % lanes;
-    let end = buf.len() - rem;
+    let end = buf.len() - buf.len() % lanes;
+    let (v, tail) = buf.split_at_mut(end);
 
-    let mut i = 0;
-    while i < end {
-        let chunk = &mut buf[i..i + lanes];
-        let v = f.eval(<E::Widest as Simd>::load_slice(chunk));
-        v.store_slice(chunk);
-        i += lanes;
+    for chunk in v.chunks_exact_mut(lanes) {
+        let r = f.eval(<E::Widest as Simd>::load_slice(chunk));
+        r.store_slice(chunk);
     }
-    for x in buf[end..].iter_mut() {
+    for x in tail.iter_mut() {
         *x = f.eval::<E>(*x);
     }
 }

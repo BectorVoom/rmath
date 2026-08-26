@@ -386,6 +386,47 @@ pub trait Simd:
         out
     }
 
+    /// One contiguous *run* of `N` table slots per lane: `out[j][i] =
+    /// table[idx[i] + j]`.
+    ///
+    /// [`Simd::gather_bits`]'s shape is one slot per lane, which is what a
+    /// one-value-per-interval table (`exp`, `ln`, `pow`) needs. A
+    /// *polynomial* table — `asin`/`acos`'s band table, where each interval
+    /// owns a whole row of coefficients — needs a dozen adjacent slots from
+    /// the same row instead, and asking for them one at a time throws away
+    /// what makes them cheap: they are adjacent, so a single wide load brings
+    /// the whole row in at once and the work becomes a transpose rather than
+    /// `LANES * N` scalar loads.
+    ///
+    /// The default below *is* the `LANES * N` scalar loop, and it is what
+    /// every target without a specialised override runs. `f64x8` overrides it
+    /// with AVX-512 block loads and a register transpose — see
+    /// `src/simd/wide_backend.rs`.
+    ///
+    /// # Safety
+    /// Every `idx[i] + N` must be no greater than `table.len()`. The default
+    /// implementation upholds this with ordinary checked indexing (so it
+    /// panics rather than misbehaves on a caller bug); an override is not
+    /// required to, and the AVX-512 one does not — it loads a whole aligned
+    /// block whether or not every slot in it is wanted, so the table must be
+    /// long enough for `idx[i] + N` *rounded up to the override's block size*,
+    /// which is `LANES`.
+    #[allow(unsafe_code)]
+    #[inline(always)]
+    unsafe fn gather_run<const N: usize>(
+        table: &[<Self::Elem as Real>::Uint],
+        idx: Self::Bits,
+    ) -> [Self; N] {
+        let mut out = [Self::Bits::filled_default(); N];
+        for i in 0..Self::LANES {
+            let base = idx.as_slice()[i].as_u32() as usize;
+            for (j, o) in out.iter_mut().enumerate() {
+                o.as_mut_slice()[i] = table[base + j];
+            }
+        }
+        out.map(Self::from_bits)
+    }
+
     /// Load a vector from a slice of length `LANES`.
     #[inline(always)]
     fn load_slice(slice: &[Self::Elem]) -> Self {

@@ -234,13 +234,13 @@ macro_rules! backend {
             impl_wide!($vec, f64, u64, $lanes, $vec);
         }
     };
-    // A double-precision width, with a hardware `gather_bits` override.
-    ($modname:ident, $vec:ident, $lanes:literal, gather: $gather:item) => {
+    // A double-precision width, with hardware gather overrides.
+    ($modname:ident, $vec:ident, $lanes:literal, gather: $($extra:item)+) => {
         mod $modname {
             use super::*;
             use wide::$vec;
             all_ones!($vec, f64, u64, $lanes);
-            impl_wide!($vec, f64, u64, $lanes, $vec, $gather);
+            impl_wide!($vec, f64, u64, $lanes, $vec $(, $extra)+);
         }
     };
 }
@@ -321,7 +321,161 @@ backend!(
                 out
             }
         }
+
+        /// `AVX-512F` block-load-and-transpose — see `Simd::gather_run`'s doc
+        /// for what it is for and its safety contract.
+        ///
+        /// Eight lanes each want the same `N` adjacent slots of their own row.
+        /// Read element by element that is `8 * N` scalar loads, each of which
+        /// also costs a merge into its half-register; read *row* by row it is
+        /// one 512-bit load per lane and then a transpose, which is
+        /// three stages of eight in-register shuffles and no loads at all
+        /// beyond the eight. For `asin`'s twelve-slot rows that trades 96
+        /// loads and 84 merge/insert operations for 16 loads and 44 shuffles.
+        ///
+        /// `N > 8` needs a second block; only the columns actually asked for
+        /// are built from it, so `N = 12` costs 24 shuffles for the first
+        /// block and 20 for the second rather than 48.
+        #[allow(unsafe_code)]
+        #[inline(always)]
+        unsafe fn gather_run<const N: usize>(table: &[u64], idx: [u64; 8]) -> [f64x8; N] {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            {
+                if N > 2 && N <= 16 {
+                    // SAFETY: forwarded from the caller's own contract, in the
+                    // block-rounded form `Simd::gather_run` states: each block
+                    // load reads eight slots from `idx[i]` or `idx[i] + 8`,
+                    // and `N > 8` is what gates the second one.
+                    let cols = unsafe { transpose_blocks::<N>(table, idx) };
+                    return core::array::from_fn(|j| {
+                        <f64x8 as Simd>::from_bits(cols[j])
+                    });
+                }
+            }
+            let mut out = [[0u64; 8]; N];
+            for i in 0..8 {
+                let base = idx[i] as usize;
+                for j in 0..N {
+                    out[j][i] = table[base + j];
+                }
+            }
+            out.map(<f64x8 as Simd>::from_bits)
+        }
 );
+
+/// The 8x8 double transpose behind `f64x8`'s `Simd::gather_run` override.
+///
+/// Returns sixteen columns' worth of storage but only fills the `N` the
+/// caller asked for: the first block always costs a full 8x8 transpose
+/// (24 shuffles), and a second block, when `N > 8`, costs only the stages
+/// leading to its first `N - 8` columns.
+///
+/// # Safety
+/// `table.len()` must be at least `idx[i] + 8` for every lane, and at least
+/// `idx[i] + 16` when `N > 8`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn transpose_blocks<const N: usize>(table: &[u64], idx: [u64; 8]) -> [[u64; 8]; N] {
+    use core::arch::x86_64::{
+        __m512d, _mm512_loadu_pd, _mm512_shuffle_f64x2, _mm512_unpackhi_pd, _mm512_unpacklo_pd,
+    };
+
+    /// One block: eight rows in, up to eight columns out.
+    ///
+    /// Stage 1 interleaves adjacent rows within each 128-bit lane, stages 2
+    /// and 3 shuffle those 128-bit lanes into place; `0x88` takes the even
+    /// lanes of both sources and `0xdd` the odd ones, which is exactly the
+    /// even/odd column split each stage needs.
+    #[inline(always)]
+    fn columns(r: [__m512d; 8], want: usize) -> [__m512d; 8] {
+        // SAFETY: pure register shuffles, no memory operand; `avx512f` is a
+        // static target feature here.
+        unsafe {
+            let t0 = _mm512_unpacklo_pd(r[0], r[1]);
+            let t1 = _mm512_unpackhi_pd(r[0], r[1]);
+            let t2 = _mm512_unpacklo_pd(r[2], r[3]);
+            let t3 = _mm512_unpackhi_pd(r[2], r[3]);
+            let t4 = _mm512_unpacklo_pd(r[4], r[5]);
+            let t5 = _mm512_unpackhi_pd(r[4], r[5]);
+            let t6 = _mm512_unpacklo_pd(r[6], r[7]);
+            let t7 = _mm512_unpackhi_pd(r[6], r[7]);
+
+            let s0 = _mm512_shuffle_f64x2(t0, t2, 0x88);
+            let s4 = _mm512_shuffle_f64x2(t4, t6, 0x88);
+            let c0 = _mm512_shuffle_f64x2(s0, s4, 0x88);
+            let mut out = [c0; 8];
+            if want > 1 {
+                let s1 = _mm512_shuffle_f64x2(t1, t3, 0x88);
+                let s5 = _mm512_shuffle_f64x2(t5, t7, 0x88);
+                out[1] = _mm512_shuffle_f64x2(s1, s5, 0x88);
+                if want > 5 {
+                    out[5] = _mm512_shuffle_f64x2(s1, s5, 0xdd);
+                }
+            }
+            if want > 2 {
+                let s2 = _mm512_shuffle_f64x2(t0, t2, 0xdd);
+                let s6 = _mm512_shuffle_f64x2(t4, t6, 0xdd);
+                out[2] = _mm512_shuffle_f64x2(s2, s6, 0x88);
+                if want > 6 {
+                    out[6] = _mm512_shuffle_f64x2(s2, s6, 0xdd);
+                }
+            }
+            if want > 3 {
+                let s3 = _mm512_shuffle_f64x2(t1, t3, 0xdd);
+                let s7 = _mm512_shuffle_f64x2(t5, t7, 0xdd);
+                out[3] = _mm512_shuffle_f64x2(s3, s7, 0x88);
+                if want > 7 {
+                    out[7] = _mm512_shuffle_f64x2(s3, s7, 0xdd);
+                }
+            }
+            if want > 4 {
+                out[4] = _mm512_shuffle_f64x2(s0, s4, 0xdd);
+            }
+            out
+        }
+    }
+
+    // SAFETY: the caller guarantees every block load is in bounds.
+    unsafe {
+        let p = table.as_ptr().cast::<f64>();
+        let lo = columns(
+            [
+                _mm512_loadu_pd(p.add(idx[0] as usize)),
+                _mm512_loadu_pd(p.add(idx[1] as usize)),
+                _mm512_loadu_pd(p.add(idx[2] as usize)),
+                _mm512_loadu_pd(p.add(idx[3] as usize)),
+                _mm512_loadu_pd(p.add(idx[4] as usize)),
+                _mm512_loadu_pd(p.add(idx[5] as usize)),
+                _mm512_loadu_pd(p.add(idx[6] as usize)),
+                _mm512_loadu_pd(p.add(idx[7] as usize)),
+            ],
+            if N < 8 { N } else { 8 },
+        );
+        let hi = if N > 8 {
+            columns(
+                [
+                    _mm512_loadu_pd(p.add(idx[0] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[1] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[2] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[3] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[4] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[5] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[6] as usize + 8)),
+                    _mm512_loadu_pd(p.add(idx[7] as usize + 8)),
+                ],
+                N - 8,
+            )
+        } else {
+            lo
+        };
+        core::array::from_fn(|j| {
+            let v = if j < 8 { lo[j] } else { hi[j - 8] };
+            core::mem::transmute::<__m512d, [u64; 8]>(v)
+        })
+    }
+}
+
 backend!(s4, f32x4, f32, u32, 4, f64x4);
 backend!(s8, f32x8, f32, u32, 8, f64x8);
 
