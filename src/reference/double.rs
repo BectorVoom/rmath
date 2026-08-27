@@ -18,10 +18,18 @@
 //! * `exp` and `log` are ported from their `_fma` ifunc variants, which is
 //!   what any FMA-capable x86-64 machine selects at load time. `exp2` has no
 //!   `_fma` variant, so it is ported from the baseline SSE2 build and uses
-//!   *no* fused operations at all.
+//!   *no* fused operations at all, and neither does `__branred` (see
+//!   [`trig`]), which glibc compiles as its own translation unit without
+//!   `-mfma` even though the trigonometric functions that call it are built
+//!   with it.
 //! * Bit-exactness is therefore a claim about a platform, not a universal
 //!   truth. It is not assumed: `tests/bit_exact.rs` checks it against the
 //!   host's libm, and fails loudly on a platform whose libm differs.
+//!
+//! [`hyper`]'s `asinh` and `acosh` are the exception: glibc takes CORE-MATH's
+//! *correctly rounded* routines for those two, and a correctly-rounded result
+//! is the same everywhere, so their bits are not a platform claim. `erf` and
+//! `erfc` are the same case — see [`crate::reference`] for the distinction.
 //!
 //! These are also the crate's fallback path. A vector kernel handles rare
 //! lanes — overflow, subnormals, NaN — by calling the function here for those
@@ -31,6 +39,7 @@
 pub mod bessel;
 pub mod erf_parts;
 pub mod erfc_parts;
+pub mod hyper;
 pub mod hypot;
 pub mod invtrig;
 pub mod log1p;
@@ -39,12 +48,13 @@ pub mod trig;
 pub use bessel::{j0, j1, jn, y0, y1, yn};
 pub use erf_parts::erf;
 pub use erfc_parts::erfc;
+pub use hyper::{acosh, asinh};
 pub use hypot::hypot;
 pub use invtrig::{acos, asin, atan, atan2};
 pub use log1p::log1p;
 pub use trig::{cos, sin, sincos, tan};
 
-use crate::tables::double::{exp as et, exp10 as x10t, log as lt, pow as pt};
+use crate::tables::double::{exp as et, exp10 as x10t, log as lt, log2 as l2t, pow as pt};
 
 /// The sign and exponent bits, as glibc's `top12`.
 #[inline(always)]
@@ -566,58 +576,183 @@ fn copysign(mag: f64, sign: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Delegating references
-//
-// These do not reproduce a schedule; they *are* the platform routine, reached
-// through Rust's own wrapper. That is a deliberate choice and worth stating
-// plainly, because it is the one place this crate calls the library it exists
-// to replace.
-//
-// glibc implements the trigonometric and inverse-trigonometric families with
-// the IBM Accurate Portable Math Library routines. Their operation schedule
-// depends on tables of several hundred entries and on per-expression
-// fused-multiply-add placement that the compiler chooses and the C source does
-// not show; reproducing it is a larger job than everything else in this crate
-// put together, and getting it subtly wrong would be worse than not doing it,
-// because `BitExact` would then be a false claim rather than a slow one.
-//
-// So `BitExact` stays true for these functions by delegation: substituting
-// rmath for the call you were already making cannot change a result, which is
-// the whole promise. What it does not do is make them faster --
-// `crate::policy::Fast` is where the vector path lives. The crate-level
-// documentation says which functions this covers.
-//
-// Using `f64`'s own methods rather than `extern "C"` keeps this portable: on
-// every target Rust's `sin` *is* the platform's `sin`, so the delegation is
-// exact wherever the crate builds, not only where a C `libm` is linkable.
+// log2 and log10
 // ---------------------------------------------------------------------------
 
-/// Generate a reference that forwards to the platform routine.
-macro_rules! delegate {
-    ($(#[$doc:meta])* $name:ident => $method:ident) => {
-        $(#[$doc])*
-        #[inline(always)]
-        pub fn $name(x: f64) -> f64 {
-            f64::$method(x)
+/// The near-1.0 window's lower bound, `1.0 - 0x1.5b51p-5`, as bits.
+const LOG2_NEAR_LO: u64 = 0x3feea4af00000000;
+/// The near-1.0 window's upper bound, `1.0 + 0x1.6ab2p-5`, as bits.
+const LOG2_NEAR_HI: u64 = 0x3ff0b55900000000;
+/// `log2`'s table-centring offset, `bits(0x1.6p-1)`. Not [`POW_OFF`], and not
+/// [`ln`]'s: each of the three tables is centred for its own polynomial.
+const LOG2_OFF: u64 = 0x3fe6000000000000;
+
+/// `log2(x)`, bit-identical to the platform's.
+///
+/// A port of glibc's `__log2_fma` (`sysdeps/ieee754/dbl-64/e_log2.c`, ARM
+/// optimized-routines): a 64-subinterval `1/c` / `log2(c)` table with a
+/// degree-6 correction, plus a separate degree-11 polynomial for arguments
+/// near 1.0 where the table path's `hi + lo` cancels away its own accuracy.
+/// The FMA placement is the `__FP_FAST_FMA` arm of the C source, which is
+/// what the `_fma` ifunc variant compiles; it matches
+/// [`crate::kernels::double::logx::log2`]'s vector schedule term for term,
+/// since the two are ports of the same code.
+pub fn log2(x: f64) -> f64 {
+    let mut ix = x.to_bits();
+
+    // The near-1.0 window, tested the way the C tests it: one unsigned
+    // comparison on `ix - LO`, which wraps for anything below the window.
+    if ix.wrapping_sub(LOG2_NEAR_LO) < LOG2_NEAR_HI - LOG2_NEAR_LO {
+        // `log2(1)` is `+0.0`, spelled out so it cannot come back `-0.0`.
+        if ix == 1.0f64.to_bits() {
+            return 0.0;
         }
-    };
-    ($(#[$doc:meta])* $name:ident => $method:ident, 2) => {
-        $(#[$doc])*
-        #[inline(always)]
-        pub fn $name(x: f64, y: f64) -> f64 {
-            f64::$method(x, y)
+        let r = x - 1.0;
+        let hi = r * l2t::INVLN2HI;
+        let lo = r.mul_add(l2t::INVLN2LO, r.mul_add(l2t::INVLN2HI, -hi));
+        let r2 = r * r;
+        let r4 = r2 * r2;
+
+        let b01 = r.mul_add(l2t::B1, l2t::B0);
+        let y = r2.mul_add(b01, hi);
+        let lo = lo + r2.mul_add(b01, hi - y);
+
+        let b23 = r.mul_add(l2t::B3, l2t::B2);
+        let b45 = r.mul_add(l2t::B5, l2t::B4);
+        let b67 = r.mul_add(l2t::B7, l2t::B6);
+        let b89 = r.mul_add(l2t::B9, l2t::B8);
+        let tail = r4.mul_add(r2.mul_add(b89, b67), r2.mul_add(b45, b23));
+        return y + r4.mul_add(tail, lo);
+    }
+
+    // `top - 0x0010 >= 0x7ff0 - 0x0010`: subnormal, zero, infinite, NaN or
+    // negative, all caught by one unsigned comparison on the top 16 bits.
+    let top = (ix >> 48) as u32;
+    if top.wrapping_sub(0x0010) >= 0x7ff0 - 0x0010 {
+        if ix.wrapping_mul(2) == 0 {
+            // `__math_divzero (1)`: `-1 / 0`.
+            return -1.0 / 0.0;
         }
-    };
+        if ix == f64::INFINITY.to_bits() {
+            return x;
+        }
+        if top & 0x8000 != 0 || top & 0x7ff0 == 0x7ff0 {
+            // `__math_invalid (x)`: `(x - x) / (x - x)`, which quietens a
+            // signalling NaN's payload rather than inventing a new NaN.
+            #[allow(clippy::eq_op)]
+            return (x - x) / (x - x);
+        }
+        // Subnormal: scale into the normals and pay for it in the exponent.
+        // The subtraction borrows into the exponent field for the smallest
+        // arguments, which is exactly what the C's two's-complement
+        // arithmetic does — `k` and `iz` below both come out right.
+        ix = (x * f64::from_bits(0x4330000000000000)).to_bits();
+        ix = ix.wrapping_sub(52u64 << 52);
+    }
+
+    let tmp = ix.wrapping_sub(LOG2_OFF);
+    let i = ((tmp >> 46) & 63) as usize;
+    let kd = ((tmp as i64) >> 52) as f64;
+    let z = f64::from_bits(ix.wrapping_sub(tmp & (0xfffu64 << 52)));
+    let invc = l2t::TAB[2 * i];
+    let logc = l2t::TAB[2 * i + 1];
+
+    // `r = z/c - 1`, then `r / ln2` carried as the unevaluated `t1 + t2`.
+    let r = z.mul_add(invc, -1.0);
+    let t1 = r * l2t::INVLN2HI;
+    let t2 = r.mul_add(l2t::INVLN2LO, r.mul_add(l2t::INVLN2HI, -t1));
+
+    let t3 = kd + logc;
+    let hi = t3 + t1;
+    let lo = t3 - hi + t1 + t2;
+
+    let r2 = r * r;
+    let r4 = r2 * r2;
+    let a01 = r.mul_add(l2t::A1, l2t::A0);
+    let a23 = r.mul_add(l2t::A3, l2t::A2);
+    let a45 = r.mul_add(l2t::A5, l2t::A4);
+    let p = r4.mul_add(a45, r2.mul_add(a23, a01));
+    hi + r2.mul_add(p, lo)
 }
 
-delegate! { /// `asinh(x)`, the platform's.
-asinh => asinh }
-delegate! { /// `acosh(x)`, the platform's.
-acosh => acosh }
-delegate! { /// `log10(x)`, the platform's.
-log10 => log10 }
-delegate! { /// `log2(x)`, the platform's.
-log2 => log2 }
+/// `2^54`, `__ieee754_log10`'s `two54` subnormal pre-scale.
+const TWO54: f64 = f64::from_bits(0x4350000000000000);
+/// `1 / ln(10)`, `__ieee754_log10`'s `ivln10`.
+const IVLN10: f64 = f64::from_bits(0x3fdbcb7b1526e50e);
+/// High part of `log10(2)`.
+const LOG10_2HI: f64 = f64::from_bits(0x3fd34413509f6000);
+/// Low part of `log10(2)`.
+const LOG10_2LO: f64 = f64::from_bits(0x3d59fef311f12b36);
+
+/// `log10(x)`, bit-identical to the platform's.
+///
+/// A port of glibc's `__ieee754_log10` (`sysdeps/ieee754/dbl-64/e_log10.c`),
+/// which is not a table algorithm of its own: it reduces the exponent, calls
+/// straight into `__ieee754_log` — [`ln`] here, the same port
+/// [`crate::kernels::double::logx::log10`]'s vector path reuses — and
+/// combines with three *unfused* operations. The lack of fusion in that
+/// combine is read from `__log10_finite`'s disassembly, not assumed: it
+/// contains no `vfmadd` at all.
+pub fn log10(x: f64) -> f64 {
+    // The public `log10` is not `__ieee754_log10` itself: it is the SVID
+    // compatibility wrapper (`math/w_log10_template.c` plus
+    // `math/k_standard.c`), and unlike `log2` — whose wrapper was left behind
+    // at `log2@GLIBC_2.2.5` when `versioned_symbol` promoted the bare
+    // `__log2` to the default at `GLIBC_2.29` — `log10` still has only the
+    // wrapped `log10@@GLIBC_2.2.5` to link against. For a negative argument
+    // the wrapper never reaches the kernel: it raises `FE_INVALID` and
+    // returns `__kernel_standard`'s case 19, which is `__builtin_nan ("")` —
+    // a *positive* quiet NaN with an empty payload, not the sign-set
+    // "real indefinite" that the kernel's own `(x - x) / (x - x)` would
+    // produce on x86. Read off the disassembly of `log10@@GLIBC_2.2.5`
+    // (`ucomisd`, `jae`, `jne`, then `__kernel_standard (x, x, 19)`), and the
+    // `x < 0.0` spelling reproduces its comparison exactly: false for NaN,
+    // and false for `-0.0`, both of which do go on to the kernel.
+    if x < 0.0 {
+        return f64::from_bits(0x7ff8000000000000);
+    }
+
+    let mut x = x;
+    let mut hx = x.to_bits() as i64;
+    let mut k: i32 = 0;
+
+    if hx < 0x0010_0000_0000_0000 {
+        // Below the smallest normal — which, `hx` being signed, also catches
+        // every negative argument.
+        if hx & 0x7fff_ffff_ffff_ffff == 0 {
+            return -TWO54 / x.abs(); // log10(+-0) = -inf
+        }
+        // `__ieee754_log10`'s own negative guard. Unreachable through this
+        // function — the wrapper check above has already taken every
+        // negative argument, and `-0.0` leaves by the zero branch just
+        // above — but kept because it is what the ported routine contains,
+        // and because a future caller reaching the kernel directly would
+        // need it.
+        if hx < 0 {
+            #[allow(clippy::eq_op)]
+            return (x - x) / (x - x); // log10(-#) = NaN
+        }
+        k -= 54;
+        x *= TWO54;
+        hx = x.to_bits() as i64;
+    }
+    if hx >= 0x7ff0_0000_0000_0000 {
+        return x + x; // +inf, or a NaN to quieten
+    }
+
+    k += (hx >> 52) as i32 - 1023;
+    // `i` is 1 when `k` is negative and 0 otherwise, read off the sign bit of
+    // the sign-extended `k` exactly as the C does.
+    let i = ((k as u64) >> 63) as i64;
+    let reduced = f64::from_bits(
+        (hx as u64 & 0x000f_ffff_ffff_ffff) | ((0x3ffu64.wrapping_sub(i as u64)) << 52),
+    );
+    let y = (k as i64 + i) as f64;
+
+    // Three separate roundings, in the source's own order.
+    let z = y * LOG10_2LO + IVLN10 * ln(reduced);
+    z + y * LOG10_2HI
+}
 
 /// `atanh(x)`, matching Rust's `f64::atanh`.
 #[inline(always)]

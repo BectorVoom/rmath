@@ -16,77 +16,74 @@
 //!    correctness at the edges never depends on the vector code getting the
 //!    hard cases right.
 //!
-//! # Ported, delegated, or correctly rounded
+//! # Ported, or correctly rounded
 //!
-//! Three cases now, because `erf` and `erfc` are a third. glibc computes them
-//! with CORE-MATH's routines, which are *correctly rounded* — they return the
-//! representable value nearest the true result on every input. That makes them
-//! the one family here whose reference is not a claim about this platform: any
-//! correctly-rounded implementation returns the same bits, so
-//! [`double::erf_parts`] and [`double::erfc_parts`] are bit-exact to glibc and
-//! to every other correct `erf` anywhere. See those modules for how correct
-//! rounding is actually reached — a double-double fast path, a test asking
-//! whether its error bound settles the last bit, and an accurate path for the
-//! rare input where it does not.
+//! Two cases, and no third: **nothing in this module calls the platform any
+//! more.** Every function here is either a port of the routine glibc runs, or
+//! a port of a *correctly rounded* routine, and the difference is what the
+//! bit-exactness claim rests on.
 //!
-//! The Bessel family is a plain port, of Sun's fdlibm — which is still what
-//! glibc runs for it, verified by finding fdlibm's own constants in the
-//! installed `libm.so` where `erf`'s and `lgamma`'s are no longer there. Those
-//! routines call the platform's `sin`, `cos` and `log`, so they inherit the
-//! delegation described below for the trigonometric part.
+//! A **port** reproduces the platform's *operation schedule* — which table,
+//! which polynomial, which association, and critically where a fused
+//! multiply-add is used and where two separate roundings are. That is what
+//! makes a *vectorised* bit-exact kernel possible: the schedule can be
+//! replayed lane-parallel. It is also a claim about a platform, which is why
+//! `tests/bit_exact.rs` and `tests/single.rs` check every one of them against
+//! the host and fail loudly on a machine whose libm differs.
 //!
-//! # Ported, or delegated
+//! A **correctly rounded** routine returns the representable value nearest
+//! the true result on every input. Reproducing one is *not* a claim about
+//! this platform: any correctly-rounded implementation returns the same bits,
+//! anywhere. `erf`, `erfc`, `asinh`, `acosh` and — in single precision —
+//! `tanf`, `asinf`, `acosf`, `atanf`, `atan2f`, the whole hyperbolic family,
+//! `expm1f`, `log1pf`, `log10f` and `cbrtf` are all of this kind, because
+//! glibc took CORE-MATH's routines for them. They share a shape: a fast path
+//! with a proven error bound, a bracket test asking whether that bound leaves
+//! only one representable result in range, and a slower double-double or
+//! triple-double path — sometimes plus a short table of the arguments where
+//! even that lands on a halfway point — for when it does not.
 //!
-//! Most of these are faithful ports of the routine the platform's C library
-//! actually runs, reproducing its *operation schedule* — which table, which
-//! polynomial, which association, and critically where a fused multiply-add
-//! is used and where two separate roundings are. Those are marked as ports in
-//! their own documentation, and they are what makes a *vectorised* bit-exact
-//! kernel possible: the schedule can be replayed lane-parallel.
+//! # What the ports cover
 //!
-//! `asin`, `acos`, `atan` and `atan2` ([`double::invtrig`]) are ports too now,
-//! of `e_asin.c`/`s_atan.c`/`e_atan2.c` (the IBM Accurate Mathematical
-//! Library's `asin`/`acos`/`atan`/`atan2`, disassembled the same way `sin`,
-//! `cos`, `sincos` and the exponential/logarithm family were). `atan` and
-//! `atan2` also have a vector kernel replaying that schedule lane-parallel
-//! now (`src/kernels/double/invtrig.rs`'s `bit_exact` submodule); `asin` and
-//! `acos` do not yet, so [`crate::policy::BitExact`] still runs those two
-//! one lane at a time under [`crate::simd::map_lanes`], same cost as the
-//! delegating functions below, for now. `acos`'s near-1 band also has one
-//! known open bug — see `ROADMAP.md`'s A4 entry.
+//! * The exponential and logarithm families, `pow`, and (in single precision)
+//!   `powf`, are ARM optimized-routines, ported from the `_fma` ifunc variant
+//!   any FMA-capable x86-64 selects at load time.
+//! * `sin`, `cos`, `sincos`, `tan`, `asin`, `acos`, `atan` and `atan2` in
+//!   double precision are the IBM Accurate Mathematical Library, disassembled
+//!   rather than read off the C source — the FMA placement is the compiler's
+//!   choice and the source does not show it. `__branred`, the Payne-Hanek
+//!   reduction those four reach for past `|x| = 105414350`, is ported too
+//!   ([`double::trig`]), so there is no huge-argument gap left; it is
+//!   deliberately unfused, because glibc compiles `branred.c` as its own
+//!   translation unit without `-mfma`.
+//! * `sinf`, `cosf` and `sincosf` are ARM optimized-routines and are *not*
+//!   correctly rounded (0.5607 ULP), so those three are schedule claims and
+//!   were read out of the compiled `__sinf_fma` / `__cosf_fma` /
+//!   `__sincosf_fma`.
+//! * The Bessel family is Sun's fdlibm, which is still what glibc runs for it
+//!   — verified by finding fdlibm's own constants in the installed `libm.so`
+//!   where `erf`'s and `lgamma`'s are no longer there. Its trigonometry is
+//!   now this crate's own [`double::trig`] / [`single::trig`], and the
+//!   distinction between `__sincos` and a separate `__sin`/`__cos` pair is
+//!   preserved: they are not the same computation.
+//! * [`double::log1p()`] and [`double::hypot()`] are ports at the scalar
+//!   level only. `hypot`'s algorithm is glibc's modern (2021+) Borges
+//!   "MyHypot3" — deliberately FMA-free even on an FMA-capable host, since
+//!   its error-free-transformation identities depend on separately-rounded
+//!   arithmetic — not the older Dekker/`dla.h`-style routine this crate's own
+//!   `ROADMAP.md` once assumed.
 //!
-//! `log10` (`crate::kernels::double::logx::log10`) is a port too: disassembly
-//! shows `__log10_finite` is a thin wrapper around `__ieee754_log_fma` — the
-//! exact table walk [`double::ln`] already replays lane-parallel — plus an
-//! exponent reduction and a three-term combine in a specific, unfused order
-//! (getting the order right mattered: it is not the order `e_log10.c`'s own
-//! source grouping suggests). `log10` therefore has a full vector kernel
-//! now, reusing `ln`'s table rather than re-deriving it.
+//! # Which of these are vectorised
 //!
-//! [`double::log1p()`] and [`double::hypot()`] are ports at
-//! the scalar level — verified bit-exact against the live platform over tens
-//! of millions of samples, including the NaN-payload-quieting and
-//! signaling-NaN edge cases that a naive port gets wrong — but do not yet
-//! have a vector kernel: [`crate::policy::BitExact`] still runs them one
-//! lane at a time under [`crate::simd::map_lanes`]/[`crate::simd::map_lanes2`],
-//! same cost as before, just no longer calling the platform underneath.
-//! `hypot`'s algorithm is glibc's modern (2021+) Borges "MyHypot3" —
-//! deliberately FMA-free even on an FMA-capable host, since its
-//! error-free-transformation identities depend on separately-rounded
-//! arithmetic — not the older Dekker/`dla.h`-style routine this crate's own
-//! `ROADMAP.md` once assumed.
+//! A scalar port and a vector kernel are different pieces of work, and this
+//! module only guarantees the first. Where no vector kernel exists,
+//! [`crate::policy::BitExact`] runs the function here one lane at a time
+//! under [`crate::simd::map_lanes`] — correct, and no faster than calling the
+//! platform used to be, but no longer *calling* it. `src/kernels/` says which
+//! functions have a replayed schedule and which are still scalar loops, and
+//! the accuracy table in the crate documentation summarises it.
 //!
-//! `tan` and the inverse hyperbolics delegate to the platform routine. That
-//! is a deliberate, documented choice rather than a stub: glibc implements
-//! those with the IBM Accurate Portable Math Library routines, whose
-//! operation schedule depends on large tables and on per-expression
-//! fused-multiply-add placement chosen by the compiler, and reproducing it
-//! is a much larger job than the rest of this crate put together. Delegating
-//! keeps [`crate::policy::BitExact`] an honest guarantee for those
-//! functions — it is bit-exact by construction — at the cost of the kernel
-//! running one lane at a time. See the accuracy table in the crate
-//! documentation for exactly which functions that covers, and use
-//! [`crate::policy::Fast`] to get a vectorised path for them.
+//! `acos`'s near-1 band has one known open bug — see `ROADMAP.md`'s A4 entry.
 
 pub mod double;
 pub mod single;

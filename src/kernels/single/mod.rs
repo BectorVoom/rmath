@@ -33,13 +33,22 @@
 //! test would ever have caught, and which would have made the crate's headline
 //! claim quietly false.
 //!
-//! **It is also slower.** The platform's `float` routines are much cheaper
-//! than its `double` ones, so routing `f32` work through `f64` costs more than
-//! the call it replaces: measured at 0.24x for `tanhf` and 0.48x for `cbrtf`.
-//! Delegating is both exact and faster.
+//! **It is also slower.** A `float` routine is much cheaper than the `double`
+//! one, so routing `f32` work through `f64` costs more than the scalar
+//! `f32` call it replaces: measured at 0.24x for `tanhf` and 0.48x for
+//! `cbrtf`. A per-lane scalar call is both exact and faster.
 //!
 //! So the wide path is kept for `Fast`, where there is no exactness claim to
-//! break and the vector width is worth having, and `BitExact` delegates.
+//! break and the vector width is worth having, and `BitExact` runs
+//! [`crate::reference::single`] one lane at a time.
+//!
+//! # What "one lane at a time" no longer means
+//!
+//! It used to mean a call into `libm.so`. It does not any more: every
+//! function [`crate::reference::single`] exports is this crate's own port,
+//! checked exhaustively against the platform over all 2^32 `f32` inputs. The
+//! per-lane cost is unchanged; what changed is that the crate no longer links
+//! the library it exists to replace.
 
 use crate::simd::{Lanes, Simd};
 use crate::tables::single::exp as et;
@@ -72,9 +81,11 @@ macro_rules! via_double_raw {
 
 /// A kernel whose bit-exact path is the scalar reference, lane by lane.
 ///
-/// For the functions where the platform's `float` routine is neither correctly
-/// rounded nor reproduced here. `Fast` still gets the double-precision vector
-/// path, which is where the speed is.
+/// For the functions with no vector schedule replay of their own — the
+/// reference *is* reproduced, and exhaustively checked, but nobody has
+/// written the lane-parallel version yet, so `BitExact` walks the lanes.
+/// `Fast` still gets the double-precision vector path, which is where the
+/// speed is.
 macro_rules! delegating {
     ($(#[$doc:meta])* $name:ident, $reference:path, $($k:ident)::+) => {
         $(#[$doc])*

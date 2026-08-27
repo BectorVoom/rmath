@@ -22,15 +22,21 @@
 //! `sin x +- cos x = -cos(2x) / (sin x -+ cos x)`, which has no cancellation
 //! at all. That is why these routines call `cos(x + x)` as well as `sincos`.
 //!
-//! # What the trigonometry costs
+//! # Where the trigonometry comes from
 //!
-//! `sin`, `cos` and `log` here are the platform's, for the reason set out in
-//! [`crate::reference`]: glibc computes them with the IBM Accurate Portable
-//! Math routines, whose schedule is not reproduced in this crate. So the
-//! Bessel functions inherit that — bit-exact by delegation for the
-//! trigonometric part, ported for everything else.
+//! [`super::trig::sincos`] and [`super::trig::cos`], this crate's own ports of
+//! the IBM Accurate Portable Math routines — not the platform's. The
+//! distinction between `__sincos` and a separate `__sin`/`__cos` pair matters
+//! and is preserved: glibc's Bessel sources call `__sincos (x, &s, &c)`, which
+//! is *not* the same computation as `sin(x)` and `cos(x)` evaluated
+//! independently (see [`super::trig`]'s module doc on why the three entry
+//! points do not share a helper), and `2 <= x < 2.426265` is exactly the band
+//! where they can differ.
+//!
+//! `log` is [`super::ln`], likewise this crate's own. Nothing in this module
+//! calls out to the platform any more.
 
-use super::ln;
+use super::{ln, trig};
 use crate::tables::double::bessel as t;
 
 /// `1e300`, fdlibm's `huge`. Only ever used to raise the inexact flag, which
@@ -67,13 +73,12 @@ fn interval(ix: u32) -> usize {
 /// `(sin x - cos x)(sin x + cos x) = -cos(2x)` exactly.
 #[inline(always)]
 fn ss_cc(x: f64, ix: u32) -> (f64, f64) {
-    let s = x.sin();
-    let c = x.cos();
+    let (s, c) = trig::sincos(x);
     let mut ss = s - c;
     let mut cc = s + c;
     if ix < 0x7fe0_0000 {
         // Guarded so that `x + x` cannot overflow to infinity.
-        let z = -(x + x).cos();
+        let z = -trig::cos(x + x);
         if s * c < 0.0 {
             cc = z / ss;
         } else {
@@ -273,12 +278,11 @@ pub fn j1(x: f64) -> f64 {
         // The order-1 combination is the order-0 one with the roles and signs
         // of `ss` and `cc` exchanged, because `x0` is `x - 3pi/4` rather than
         // `x - pi/4`.
-        let s = y.sin();
-        let c = y.cos();
+        let (s, c) = trig::sincos(y);
         let mut ss = -s - c;
         let mut cc = s - c;
         if ix < 0x7fe0_0000 {
-            let z = (y + y).cos();
+            let z = trig::cos(y + y);
             if s * c > 0.0 {
                 cc = z / ss;
             } else {
@@ -329,12 +333,11 @@ pub fn y1(x: f64) -> f64 {
         return 0.0 / (0.0 * x);
     }
     if ix >= 0x4000_0000 {
-        let s = x.sin();
-        let c = x.cos();
+        let (s, c) = trig::sincos(x);
         let mut ss = -s - c;
         let mut cc = s - c;
         if ix < 0x7fe0_0000 {
-            let z = (x + x).cos();
+            let z = trig::cos(x + x);
             if s * c > 0.0 {
                 cc = z / ss;
             } else {
@@ -409,8 +412,7 @@ pub fn jn(n: i32, x: f64) -> f64 {
         if ix >= 0x52d0_0000 {
             // x > 2^302, where x dwarfs n^2 and the asymptotic form is exact
             // to the last bit: Jn(x) = cos(x - (2n+1)pi/4) sqrt(2/(pi x)).
-            let s = x.sin();
-            let c = x.cos();
+            let (s, c) = trig::sincos(x);
             let temp = match n & 3 {
                 0 => c + s,
                 1 => -c + s,
@@ -556,8 +558,7 @@ pub fn yn(n: i32, x: f64) -> f64 {
     }
     {
         let b = if ix >= 0x52d0_0000 {
-            let s = x.sin();
-            let c = x.cos();
+            let (s, c) = trig::sincos(x);
             let temp = match n & 3 {
                 0 => s - c,
                 1 => -s - c,

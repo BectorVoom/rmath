@@ -430,8 +430,8 @@ fn reduce<E: Real>(x: E, y: E) -> (E, bool) {
 
 /// A lane-wise scalar fallback, for kernels with no vectorised schedule.
 ///
-/// Re-exported here so the delegating kernels have one obvious place to reach
-/// for, rather than each importing from [`crate::simd`].
+/// Re-exported here so the scalar-loop kernels have one obvious place to
+/// reach for, rather than each importing from [`crate::simd`].
 pub use crate::simd::map_lanes as lanewise;
 
 // ---------------------------------------------------------------------------

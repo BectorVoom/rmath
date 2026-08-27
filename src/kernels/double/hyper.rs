@@ -7,8 +7,14 @@
 //! code calls this crate's own `exp` and `expm1` kernels, not the platform's,
 //! so nothing drops to a scalar loop.
 //!
-//! The inverse family — `asinh`, `acosh`, `atanh` — still delegates under
-//! `BitExact`; those are not compositions of anything already ported here.
+//! The inverse family — `asinh`, `acosh`, `atanh` — is not a composition of
+//! anything already ported here, so each has its own scalar reference:
+//! `atanh` is Rust's own `0.5 * log1p(2x/(1-x))` identity, and `asinh` and
+//! `acosh` are ports of CORE-MATH's correctly-rounded routines
+//! ([`crate::reference::double::hyper`]). `asinh` and `acosh` have vector
+//! `BitExact` paths below that replay the *fast* half of those routines
+//! lane-parallel and repair the rest through `patch_lanes`; the reference is
+//! what those repairs call, and it no longer calls the platform.
 //!
 //! Under `Fast` all six are built from this crate's vectorised `exp`, `expm1`,
 //! `ln` and `log1p`, with the identities chosen to be the ones that stay

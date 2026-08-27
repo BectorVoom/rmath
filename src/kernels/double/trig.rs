@@ -259,7 +259,7 @@ mod bit_exact {
     /// `0x1.9921fb0000000p26`: the exact value whose high 32 bits are
     /// `0x419921FB`, matching `__sin`/`__cos`'s bit-level (not floating-point)
     /// boundary test — see `crate::reference::double::trig`'s `k` comparisons.
-    const TABLE_LIMIT: f64 = f64::from_bits(0x419921fb00000000);
+    pub(super) const TABLE_LIMIT: f64 = f64::from_bits(0x419921fb00000000);
 
     /// Lanes past `__tan`'s second reduction's domain: `|x| >= 1e8`. glibc's
     /// own test is `w > g5`, so the `|x| == 1e8` lane is patched too — a
@@ -442,99 +442,90 @@ mod bit_exact {
     }
 
     /// `sin(x)` for `|x| < 105414350`; callers repair the rest.
+    ///
+    /// The three narrow bands are *guarded*, not blended: they nest
+    /// (`tiny` inside `poly` inside `mid`), so one `any()` decides whether
+    /// any of the three is reachable at all, and a vector of large arguments
+    /// — every asymptotic Bessel argument, most of any wide corpus — runs
+    /// the table path alone instead of evaluating three more kernels and
+    /// discarding them. Blending is still what happens *within* a mixed
+    /// vector; the guard only skips work no lane wants.
     #[inline(always)]
     pub(super) fn sin<V: Simd<Elem = f64>>(x: V) -> V {
-        let tiny = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3e500000_00000000)));
-        let poly = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+        let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
+        let is_odd = n_bit0.eq_mask(V::splat(1.0));
+        let flip = n_bit1.eq_mask(V::splat(1.0));
+        let r = V::select(is_odd, do_cos(a, da), do_sin(a, da));
+        let mut r = V::select(flip, -r, r);
+
         let mid = x
             .abs()
             .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
-
-        let poly_val = do_sin(x, V::splat(0.0));
-
-        let t = V::splat(t::HP0) - x.abs();
-        let mid_val = do_cos(t, V::splat(t::HP1)).copysign(x);
-
-        let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
-        let table_val = {
-            let is_odd = n_bit0.eq_mask(V::splat(1.0));
-            let flip = n_bit1.eq_mask(V::splat(1.0));
-            let r = V::select(is_odd, do_cos(a, da), do_sin(a, da));
-            V::select(flip, -r, r)
-        };
-
-        let r = V::select(mid, mid_val, table_val);
-        let r = V::select(poly, poly_val, r);
-        V::select(tiny, x, r)
+        if mid.any() {
+            let t = V::splat(t::HP0) - x.abs();
+            r = V::select(mid, do_cos(t, V::splat(t::HP1)).copysign(x), r);
+            let poly = x
+                .abs()
+                .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+            if poly.any() {
+                r = V::select(poly, do_sin(x, V::splat(0.0)), r);
+                let tiny = x
+                    .abs()
+                    .lt_mask(V::splat(f64::from_bits(0x3e500000_00000000)));
+                if tiny.any() {
+                    r = V::select(tiny, x, r);
+                }
+            }
+        }
+        r
     }
 
-    /// `cos(x)` for `|x| < 105414350`; callers repair the rest.
+    /// `cos(x)` for `|x| < 105414350`; callers repair the rest. Bands
+    /// guarded rather than blended, for the reason given on [`sin`].
     #[inline(always)]
     pub(super) fn cos<V: Simd<Elem = f64>>(x: V) -> V {
-        let tiny = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
-        let poly = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+        let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
+        // `n + 1`: bit0 flips, bit1 flips only when bit0 was already set
+        // (the carry out of `+1` on a 2-bit field) — i.e. `n_bit1 ^= n_bit0`.
+        let new_bit1 = V::select(
+            n_bit0.eq_mask(V::splat(1.0)),
+            V::splat(1.0) - n_bit1,
+            n_bit1,
+        );
+        let new_bit0 = V::splat(1.0) - n_bit0;
+        let is_odd = new_bit0.eq_mask(V::splat(1.0));
+        let flip = new_bit1.eq_mask(V::splat(1.0));
+        let r = V::select(is_odd, do_cos(a, da), do_sin(a, da));
+        let mut r = V::select(flip, -r, r);
+
         let mid = x
             .abs()
             .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
-
-        let poly_val = do_cos(x, V::splat(0.0));
-
-        let y = V::splat(t::HP0) - x.abs();
-        let a = y + V::splat(t::HP1);
-        let da = (y - a) + V::splat(t::HP1);
-        let mid_val = do_sin(a, da);
-
-        let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
-        let table_val = {
-            // `n + 1`: bit0 flips, bit1 flips only when bit0 was already set
-            // (the carry out of `+1` on a 2-bit field) — i.e. `n_bit1 ^= n_bit0`.
-            let new_bit1 = V::select(
-                n_bit0.eq_mask(V::splat(1.0)),
-                V::splat(1.0) - n_bit1,
-                n_bit1,
-            );
-            let new_bit0 = V::splat(1.0) - n_bit0;
-            let is_odd = new_bit0.eq_mask(V::splat(1.0));
-            let flip = new_bit1.eq_mask(V::splat(1.0));
-            let r = V::select(is_odd, do_cos(a, da), do_sin(a, da));
-            V::select(flip, -r, r)
-        };
-
-        let r = V::select(mid, mid_val, table_val);
-        let r = V::select(poly, poly_val, r);
-        V::select(tiny, V::splat(1.0), r)
+        if mid.any() {
+            let y = V::splat(t::HP0) - x.abs();
+            let am = y + V::splat(t::HP1);
+            let dam = (y - am) + V::splat(t::HP1);
+            r = V::select(mid, do_sin(am, dam), r);
+            let poly = x
+                .abs()
+                .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+            if poly.any() {
+                r = V::select(poly, do_cos(x, V::splat(0.0)), r);
+                let tiny = x
+                    .abs()
+                    .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
+                if tiny.any() {
+                    r = V::select(tiny, V::splat(1.0), r);
+                }
+            }
+        }
+        r
     }
 
     /// `(sin(x), cos(x))` for `|x| < 105414350`; callers repair the rest.
+    /// Bands guarded rather than blended, for the reason given on [`sin`].
     #[inline(always)]
     pub(super) fn sincos<V: Simd<Elem = f64>>(x: V) -> (V, V) {
-        let tiny = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
-        let poly = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
-        let mid = x
-            .abs()
-            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
-
-        let poly_sin = do_sin(x, V::splat(0.0));
-        let poly_cos = do_cos(x, V::splat(0.0));
-
-        let y = V::splat(t::HP0) - x.abs();
-        let a_mid = y + V::splat(t::HP1);
-        let da_mid = (y - a_mid) + V::splat(t::HP1);
-        let mid_sin = do_cos(a_mid, da_mid).copysign(x);
-        let mid_cos = do_sin(a_mid, da_mid);
-
         let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
         // `if (n & 3) == 1 || (n & 3) == 2 { a = -a; da = -da; }`
         let neg_ad = n_bit0
@@ -549,18 +540,134 @@ mod bit_exact {
         let xx = do_cos(a, da);
         let cosx = V::select(n_bit1.eq_mask(V::splat(1.0)), -xx, xx);
         let is_odd = n_bit0.eq_mask(V::splat(1.0));
-        let table_sin = V::select(is_odd, cosx, sinx);
-        let table_cos = V::select(is_odd, sinx, cosx);
+        let mut rs = V::select(is_odd, cosx, sinx);
+        let mut rc = V::select(is_odd, sinx, cosx);
 
-        let rs = V::select(mid, mid_sin, table_sin);
-        let rs = V::select(poly, poly_sin, rs);
-        let rs = V::select(tiny, x, rs);
+        let mid = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
+        if mid.any() {
+            let y = V::splat(t::HP0) - x.abs();
+            let a_mid = y + V::splat(t::HP1);
+            let da_mid = (y - a_mid) + V::splat(t::HP1);
+            rs = V::select(mid, do_cos(a_mid, da_mid).copysign(x), rs);
+            rc = V::select(mid, do_sin(a_mid, da_mid), rc);
 
-        let rc = V::select(mid, mid_cos, table_cos);
-        let rc = V::select(poly, poly_cos, rc);
-        let rc = V::select(tiny, V::splat(1.0), rc);
-
+            let poly = x
+                .abs()
+                .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+            if poly.any() {
+                rs = V::select(poly, do_sin(x, V::splat(0.0)), rs);
+                rc = V::select(poly, do_cos(x, V::splat(0.0)), rc);
+                let tiny = x
+                    .abs()
+                    .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
+                if tiny.any() {
+                    rs = V::select(tiny, x, rs);
+                    rc = V::select(tiny, V::splat(1.0), rc);
+                }
+            }
+        }
         (rs, rc)
+    }
+
+    /// `(sin(x), cos(x))` for `|x| < 105414350`, bit-identical to [`sin`] and
+    /// [`cos`] called *separately* — which is not what [`sincos`] computes.
+    ///
+    /// # Why this is not `sincos`
+    ///
+    /// glibc ships three entry points, and `__sincos` is genuinely a third
+    /// schedule: in the table band it negates `(a, da)` for two of the four
+    /// quadrants and recovers the signs afterwards, where `__sin` and `__cos`
+    /// each keep `(a, da)` and place the sign from the quadrant bits. The
+    /// results agree in value almost everywhere and *not* everywhere, so a
+    /// caller that must match `__sin(x)` and `__cos(x)` — which is what
+    /// [`crate::kernels::double::bessel`] must, because fdlibm's `j0`/`y0`
+    /// are bit-exact against those two — cannot borrow `__sincos`'s answer.
+    ///
+    /// # What it saves
+    ///
+    /// Everything except the sign bookkeeping. `sin` and `cos` reduce the
+    /// same `x` with the same `reduce_sincos`, and each of them then
+    /// evaluates *both* `do_sin(a, da)` and `do_cos(a, da)` — they differ
+    /// only in which one the quadrant selects and which sign it carries. Run
+    /// separately that is two reductions and four kernel evaluations; run
+    /// here it is one reduction and two, for the identical bits.
+    ///
+    /// The three narrow bands are guarded rather than blended, which the
+    /// separate entry points cannot do because each is one expression. A
+    /// vector whose lanes all sit outside `|x| < 2.4266` — every asymptotic
+    /// Bessel argument, and `cos(x + x)` for all of them — skips the mid,
+    /// polynomial and tiny paths entirely instead of evaluating four more
+    /// kernels and throwing them away. The masks are nested (`tiny` inside
+    /// `poly` inside `mid`), so one `any()` gates all three.
+    #[inline(always)]
+    pub(super) fn sin_cos_split<V: Simd<Elem = f64>>(x: V) -> (V, V) {
+        let (a, da, n_bit0, n_bit1) = reduce_sincos(x);
+        let ds = do_sin(a, da);
+        let dc = do_cos(a, da);
+        let is_odd = n_bit0.eq_mask(V::splat(1.0));
+        let flip = n_bit1.eq_mask(V::splat(1.0));
+
+        // `sin`: quadrant 1 and 3 take the cosine kernel, 2 and 3 negate.
+        let rs = V::select(is_odd, dc, ds);
+        let mut rs = V::select(flip, -rs, rs);
+        // `cos`: the same table entry read at `n + 1`, i.e. `bit0` flipped
+        // and `bit1` flipped only where `bit0` was set.
+        let rc = V::select(is_odd, ds, dc);
+        let new_bit1 = V::select(is_odd, V::splat(1.0) - n_bit1, n_bit1);
+        let mut rc = V::select(new_bit1.eq_mask(V::splat(1.0)), -rc, rc);
+
+        let mid = x
+            .abs()
+            .lt_mask(V::splat(f64::from_bits(0x400368fd_00000000)));
+        if mid.any() {
+            let t = V::splat(t::HP0) - x.abs();
+            rs = V::select(mid, do_cos(t, V::splat(t::HP1)).copysign(x), rs);
+            let a_mid = t + V::splat(t::HP1);
+            let da_mid = (t - a_mid) + V::splat(t::HP1);
+            rc = V::select(mid, do_sin(a_mid, da_mid), rc);
+
+            let poly = x
+                .abs()
+                .lt_mask(V::splat(f64::from_bits(0x3feb6000_00000000)));
+            if poly.any() {
+                rs = V::select(poly, do_sin(x, V::splat(0.0)), rs);
+                rc = V::select(poly, do_cos(x, V::splat(0.0)), rc);
+                // `sin` and `cos` cut over to the identity at different
+                // magnitudes: 2^-26 and 2^-27.
+                let tiny_s = x
+                    .abs()
+                    .lt_mask(V::splat(f64::from_bits(0x3e500000_00000000)));
+                if tiny_s.any() {
+                    rs = V::select(tiny_s, x, rs);
+                    let tiny_c = x
+                        .abs()
+                        .lt_mask(V::splat(f64::from_bits(0x3e400000_00000000)));
+                    rc = V::select(tiny_c, V::splat(1.0), rc);
+                }
+            }
+        }
+        (rs, rc)
+    }
+}
+
+/// The largest `|x|` this module answers for without per-lane repair, under
+/// policy `A`.
+///
+/// `BitExact` runs out at `__branred`'s handoff, 105414350; `Fast`'s
+/// Cody-Waite reduction stops being trustworthy at `TRIG_LIMIT`. Exposed
+/// because a caller that composes several of these calls — every asymptotic
+/// branch in [`super::bessel`] wants `sin x`, `cos x` *and* `cos 2x` — is
+/// better placed to decide the whole vector's fate once than to have three
+/// separate `patch_lanes` fire on the same lane, each repairing one third of
+/// an answer the caller is going to throw away anyway.
+#[inline(always)]
+pub fn safe_limit<A: Accuracy>() -> f64 {
+    if A::BIT_EXACT {
+        bit_exact::TABLE_LIMIT
+    } else {
+        p::TRIG_LIMIT
     }
 }
 
@@ -628,6 +735,44 @@ pub mod sincos {
         }
         let bad = too_large(x);
         crate::simd::patch_lanes_pair(x, (s, c), bad, reference::sincos)
+    }
+}
+
+/// Sine and cosine of the same argument, as the *separate* entry points
+/// compute them.
+///
+/// Not a duplicate of [`sincos`]: that one replays glibc's `__sincos`, this
+/// one replays `__sin` and `__cos`, and under [`crate::policy::BitExact`]
+/// those are three different schedules whose answers are not identical
+/// everywhere. A caller that has to match `sin(x)` and `cos(x)` — fdlibm's
+/// Bessel routines do, and `__sincos`'s answer would not always do — asks
+/// here and still pays for only one argument reduction. See
+/// `bit_exact::sin_cos_split` for the sharing and for the band guards.
+///
+/// Under [`crate::policy::Fast`] there is only one schedule and this is
+/// [`sincos`] exactly.
+pub mod sincos_split {
+    use super::*;
+
+    /// `(sin(x), cos(x))` for a vector of lanes.
+    #[inline(always)]
+    pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> (V, V) {
+        if A::BIT_EXACT {
+            let (s, c) = bit_exact::sin_cos_split(x);
+            if !D::CHECKED {
+                return (s, c);
+            }
+            let bad = bit_exact::needs_branred(x);
+            return crate::simd::patch_lanes_pair(x, (s, c), bad, |v| {
+                (reference::sin(v), reference::cos(v))
+            });
+        }
+        let (s, c) = both(x);
+        if !D::CHECKED {
+            return (s, c);
+        }
+        let bad = too_large(x);
+        crate::simd::patch_lanes_pair(x, (s, c), bad, |v| (reference::sin(v), reference::cos(v)))
     }
 }
 

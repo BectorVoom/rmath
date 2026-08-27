@@ -1,31 +1,63 @@
 //! Single-precision scalar references.
 //!
-//! Ports of what the platform's `libm` runs for `float`, which on this target
-//! is ARM's optimized-routines — the same source glibc compiles into `__expf`,
-//! `__logf` and friends. Every one of them evaluates in `double` over a small
-//! table and rounds once at the end, so the ports below take and return `f32`
-//! but do their arithmetic in `f64`.
+//! Ports of what the platform's `libm` runs for `float`, from two upstreams.
+//! Every one of them evaluates in `double` over a small table and rounds once
+//! at the end, so the functions below take and return `f32` but do their
+//! arithmetic in `f64`.
 //!
 //! That detail is what makes the single-precision kernels worth having: the
 //! schedule is plain double-precision arithmetic, so [`crate::kernels::single`]
 //! replays it eight lanes at a time by widening `f32x8` to `f64x8`, rather than
 //! falling back to a scalar loop.
 //!
-//! # Which functions are here
+//! # Two upstreams, two kinds of claim
 //!
-//! Only the ones whose platform implementation is *not* correctly rounded, and
-//! which therefore need their exact schedule reproduced: `expf`, `exp2f`,
-//! `logf`, `log2f`, `powf`, `sinf`, `cosf`. Everything else in single
-//! precision is correctly rounded on this platform, which is a far easier
-//! target: computing in `f64` and rounding once lands on the correctly-rounded
-//! `f32` result, and `tests/exhaustive.rs` checks that over *every* one of the
-//! 2^32 inputs rather than a sample.
+//! **ARM optimized-routines** — `expf`, `exp2f`, `logf`, `log2f`, `powf`,
+//! `sinf`, `cosf`, `sincosf` — are *not* correctly rounded, so reproducing
+//! them is a claim about a schedule and about this platform. `powf`, `sinf`,
+//! `cosf` and `sincosf` are the only `f32` routines glibc builds with
+//! `-mfma`, and their fusion was read out of the compiled `__powf_fma`,
+//! `__sinf_fma`, `__cosf_fma` and `__sincosf_fma` rather than inferred from
+//! the C.
+//!
+//! **CORE-MATH** — everything else: `tanf`, `asinf`, `acosf`, `atanf`,
+//! `atan2f`, `sinhf`, `coshf`, `tanhf`, `asinhf`, `acoshf`, `expm1f`,
+//! `log1pf`, `log10f`, `cbrtf`, `erff`, `erfcf` — *is* correctly rounded, so
+//! reproducing it is not a platform claim at all: any correct implementation
+//! anywhere returns the same bits. None of these has an FMA variant and none
+//! contains a `vfmadd`, so their arithmetic is deliberately unfused except
+//! where the C calls `fma`/`fmaf` outright.
+//!
+//! Two functions sit outside both. `hypotf` needs no polynomial — every `f32`
+//! square is exact in a `double`, so one `sqrt` of the exact sum is correctly
+//! rounded by construction. And [`hyper::atanh`] reproduces *Rust's*
+//! `f32::atanh`, which is a composition rather than a libm call; see its own
+//! documentation for why that is the right target here.
+//!
+//! # Verification
+//!
+//! Exhaustive, not sampled: every one-argument function here was checked
+//! against the platform over all 2^32 `f32` bit patterns. `powf` and `atan2f`
+//! have a 2^64 domain and cannot be swept, so they are checked over a large
+//! structured random corpus instead.
 
 pub mod bessel;
 pub mod erf_parts;
+pub mod expm1;
+pub mod hyper;
+pub mod invtrig;
+pub mod logx;
+pub mod pow;
+pub mod trig;
 
 pub use bessel::{j0, j1, jn, y0, y1, yn};
 pub use erf_parts::{erf, erfc};
+pub use expm1::{cbrt, expm1, hypot};
+pub use hyper::{acosh, asinh, atanh, cosh, sinh, tanh};
+pub use invtrig::{acos, asin, atan};
+pub use logx::{log1p, log10};
+pub use pow::{atan2, pow};
+pub use trig::{cos, sin, sincos, tan};
 
 use crate::tables::single::exp as et;
 use crate::tables::single::exp10 as x10t;
@@ -286,81 +318,4 @@ fn log2_core(ix: u32) -> f64 {
     let p = r.mul_add(l2t::A3, y0);
     let y = r2.mul_add(l2t::A0, y);
     y.mul_add(r2, p)
-}
-
-// ---------------------------------------------------------------------------
-// Delegating references
-//
-// Same reasoning as `reference::double`: where the platform's routine has not
-// been reproduced here, `BitExact` stays a true statement by forwarding to it.
-// The `f32` methods are used rather than `extern "C"` so this is portable to
-// any target the crate builds on.
-// ---------------------------------------------------------------------------
-
-/// Generate a reference that forwards to the platform routine.
-macro_rules! delegate {
-    ($(#[$doc:meta])* $name:ident => $method:ident) => {
-        $(#[$doc])*
-        #[inline(always)]
-        pub fn $name(x: f32) -> f32 {
-            f32::$method(x)
-        }
-    };
-}
-
-delegate! { /// `sin(x)`, the platform's. `x` in radians.
-sin => sin }
-delegate! { /// `cos(x)`, the platform's. `x` in radians.
-cos => cos }
-delegate! { /// `tan(x)`, the platform's. `x` in radians.
-tan => tan }
-delegate! { /// `asin(x)`, the platform's.
-asin => asin }
-delegate! { /// `acos(x)`, the platform's.
-acos => acos }
-delegate! { /// `atan(x)`, the platform's.
-atan => atan }
-delegate! { /// `sinh(x)`, the platform's.
-sinh => sinh }
-delegate! { /// `cosh(x)`, the platform's.
-cosh => cosh }
-delegate! { /// `tanh(x)`, the platform's.
-tanh => tanh }
-delegate! { /// `asinh(x)`, the platform's.
-asinh => asinh }
-delegate! { /// `acosh(x)`, the platform's.
-acosh => acosh }
-delegate! { /// `atanh(x)`, matching Rust's `f32::atanh`.
-atanh => atanh }
-delegate! { /// `log10(x)`, the platform's.
-log10 => log10 }
-delegate! { /// `log1p(x)`, the platform's.
-log1p => ln_1p }
-delegate! { /// `expm1(x)`, the platform's.
-expm1 => exp_m1 }
-delegate! { /// `cbrt(x)`, the platform's.
-cbrt => cbrt }
-
-/// `x^y`, the platform's `powf`.
-#[inline(always)]
-pub fn pow(x: f32, y: f32) -> f32 {
-    f32::powf(x, y)
-}
-
-/// `atan2(y, x)`, the platform's.
-#[inline(always)]
-pub fn atan2(y: f32, x: f32) -> f32 {
-    f32::atan2(y, x)
-}
-
-/// `hypot(x, y)`, the platform's.
-#[inline(always)]
-pub fn hypot(x: f32, y: f32) -> f32 {
-    f32::hypot(x, y)
-}
-
-/// `(sin(x), cos(x))`, the platform's.
-#[inline(always)]
-pub fn sincos(x: f32) -> (f32, f32) {
-    (f32::sin(x), f32::cos(x))
 }

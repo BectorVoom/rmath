@@ -5,14 +5,19 @@
 //!
 //! Ported rather than left as `f64::sin`/`f64::cos`/`f64::tan` because
 //! `src/kernels/double/trig.rs`'s vector `BitExact` path needs a schedule to
-//! replay lane-parallel, and the platform call is opaque to that. The huge-
-//! argument bands (`|x| >= 105414350` for the sine family, `|x| > 1e8` for
-//! `tan`, where the source reaches for `__branred`'s Payne-Hanek reduction)
-//! are deliberately **not** ported: they still call straight through to the
-//! platform function, which is bit-exact by construction and correct for
-//! every input — a `patch_lanes` repair the vector kernel reaches for, not a
-//! port with a gap in it. `__branred` itself may be ported later if
-//! profiling shows that band matters; nothing here depends on it not being.
+//! replay lane-parallel, and the platform call is opaque to that.
+//!
+//! The huge-argument bands — `|x| >= 105414350` for the sine family, `|x| >
+//! 1e8` for `tan` — are ported too, including `__branred`'s Payne-Hanek
+//! reduction (`branred` below). There is no gap left: nothing in this
+//! module calls the platform on any input.
+//!
+//! `__branred` is the one piece here that is entirely unfused, and that is
+//! not a simplification. `branred.c` is its own translation unit and is *not*
+//! built with `-mfma` — glibc's `sysdeps/x86_64/fpu/multiarch/Makefile` puts
+//! `-mfma -mavx2` on `s_sin-fma.c` and `s_tan-fma.c`, which then call this
+//! one shared, unfused `__branred` — and the disassembly confirms it: no
+//! `vfmadd` of any form anywhere in it.
 //!
 //! Three entry points, not one shared by projection: `__sin`'s and
 //! `__sincos`'s mid-band (`0.855469 <= |x| < 2.426265`) compute the
@@ -160,6 +165,145 @@ fn reduce_sincos(x: f64) -> (f64, f64, i32) {
     (b, da, n)
 }
 
+// ---------------------------------------------------------------------------
+// `__branred`: the huge-argument reduction
+// ---------------------------------------------------------------------------
+
+/// One half of `__branred`'s digit product: the 2/pi partial sum for one
+/// 27-bit piece of the pre-scaled argument.
+///
+/// `__branred` splits `x * 2^-600` into two exactly-representable halves and
+/// runs this identical body on each, because the product `x1 * toverp[k+i]`
+/// must itself be exact — 27 bits of `x1` times 24 bits of table is 51 bits,
+/// inside `f64`'s 53. Returns `(b, bb, sum)`: the fractional part of
+/// `x_half * 2/pi` as an unevaluated `b + bb`, and the integer part reduced
+/// modulo 4 by the `big1` rounding.
+///
+/// Every operation here is a separate rounding. That is not a simplification:
+/// `branred.c` is its own translation unit and is *not* built with `-mfma`
+/// (glibc's `sysdeps/x86_64/fpu/multiarch/Makefile` puts `-mfma -mavx2` on
+/// `s_sin-fma.c` / `s_tan-fma.c`, which then call this one shared, unfused
+/// `__branred`). Confirmed by disassembly: `__branred` in `libm.so.6`
+/// contains no `vfmadd`/`vfmsub` of any form, only `mulsd`/`addsd`/`subsd`.
+/// Rust never contracts `a * b + c` on its own, so the plain spellings below
+/// are already the right ones — but writing `mul_add` here would be a bug.
+#[inline(always)]
+fn branred_half(xh: f64) -> (f64, f64, f64) {
+    // `k = ((biased exponent) - 450) / 24`, clamped at zero: which 24-bit
+    // digit of `2/pi` the product's leading bit lands on. C's division
+    // truncates toward zero, and so does Rust's, so a small negative
+    // numerator gives 0 in both and only a numerator below -24 reaches the
+    // clamp.
+    let mut k = (((xh.to_bits() >> 52) & 2047) as i32 - 450) / 24;
+    if k < 0 {
+        k = 0;
+    }
+
+    // `gor.i[HIGH_HALF] -= (k * 24) << 20`, as a 64-bit subtraction. `T576`'s
+    // low word is zero and the subtrahend's low 32 bits are zero, so no
+    // borrow crosses the word boundary and this is exactly the high-word
+    // arithmetic the C performs.
+    let mut gor = f64::from_bits(t::T576.to_bits() - (((k * 24) as u64) << 52));
+
+    let mut r = [0.0f64; 6];
+    for (i, ri) in r.iter_mut().enumerate() {
+        *ri = xh * t::TOVERP[k as usize + i] * gor;
+        gor *= t::TM24;
+    }
+
+    // The first three digits are big enough to carry an integer part; peel it
+    // off with the round-to-integer trick and accumulate it into `sum`.
+    let mut sum = 0.0;
+    for ri in r.iter_mut().take(3) {
+        let s = (*ri + t::BRANRED_BIG) - t::BRANRED_BIG;
+        sum += s;
+        *ri -= s;
+    }
+
+    // Summed low-to-high so the smallest terms are not lost, then the
+    // rounding error of that sum recovered high-to-low.
+    let mut t_val = 0.0;
+    for i in 0..6 {
+        t_val += r[5 - i];
+    }
+    let bb = (((((r[0] - t_val) + r[1]) + r[2]) + r[3]) + r[4]) + r[5];
+
+    let s = (t_val + t::BRANRED_BIG) - t::BRANRED_BIG;
+    sum += s;
+    let t_val = t_val - s;
+    let b = t_val + bb;
+    let bb = (t_val - b) + bb;
+
+    // `big1`'s ulp is 4, so this rounds `sum` to a multiple of 4 and leaves
+    // the residue — which is all `n mod 4` needs.
+    let s = (sum + t::BRANRED_BIG1) - t::BRANRED_BIG1;
+    (b, bb, sum - s)
+}
+
+/// `__branred`: reduce `x` to `(a, da, n)` with `x = n*pi/2 + (a + da)` and
+/// `|a + da| <= pi/4`, for `105414350 <= |x| < 2^1024`.
+///
+/// A port of glibc's `sysdeps/ieee754/dbl-64/branred.c` (the IBM Accurate
+/// Mathematical Library), which is what `__sin`, `__cos`, `__sincos` and
+/// `__tan` all reach for once the argument is too large for `reduce_sincos`'s
+/// three- or four-part Cody-Waite splitting to hold `pi/2` to enough bits.
+/// The algorithm is Payne-Hanek: multiply by a 75-digit base-2^24
+/// representation of `2/pi` ([`t::TOVERP`]), keep only the six digits
+/// straddling the binary point, and drop the integer part.
+///
+/// `n` is returned already reduced modulo 4, as the quadrant `do_sincos`
+/// wants. It is a *signed* result: C's `((int) sum) & 3` truncates toward
+/// zero and then masks in two's complement, which `as i32` and `&` reproduce
+/// exactly — and `sum` is bounded to `[-5, 5]` by the `big1` rounding above,
+/// so the conversion cannot saturate.
+#[inline(always)]
+fn branred(x: f64) -> (f64, f64, i32) {
+    // Pre-scale so the split below cannot overflow, then Dekker-split into
+    // two halves of at most 27 significant bits each.
+    let x = x * t::TM600;
+    let t_val = x * t::SPLIT;
+    let x1 = t_val - (t_val - x);
+    let x2 = x - x1;
+
+    let (b1, bb1, sum1) = branred_half(x1);
+    let (b2, bb2, sum2) = branred_half(x2);
+
+    let sum = sum1 + sum2;
+    let b = b1 + b2;
+    let bb = if b1.abs() > b2.abs() {
+        (b1 - b) + b2
+    } else {
+        (b2 - b) + b1
+    };
+
+    // Fold the fraction into `[-1/2, 1/2]`, carrying into the quadrant count.
+    let (b, sum) = if b > 0.5 {
+        (b - 1.0, sum + 1.0)
+    } else if b < -0.5 {
+        (b + 1.0, sum - 1.0)
+    } else {
+        (b, sum)
+    };
+
+    let s = b + (bb + bb1 + bb2);
+    let t_val = ((b - s) + bb) + (bb1 + bb2);
+
+    // Multiply the reduced fraction back by `pi/2`, in a three-way split of
+    // the constant (`MP1` + `BRANRED_MP2` + `HP1`) against a two-way split of
+    // `s`, so every partial product is exact. `BRANRED_MP2` is `branred.h`'s
+    // own spelling of the middle term and differs from `usncs.h`'s `MP2` in
+    // its last two significand digits — see the table module.
+    let sp = s * t::SPLIT;
+    let t1 = sp - (sp - s);
+    let t2 = s - t1;
+    let b = s * t::HP0;
+    let bb = (((t1 * t::MP1 - b) + t1 * t::BRANRED_MP2) + t2 * t::MP1)
+        + (t2 * t::BRANRED_MP2 + s * t::HP1 + t_val * t::HP0);
+    let a = b + bb;
+    let aa = (b - a) + bb;
+    (a, aa, (sum as i32) & 3)
+}
+
 /// `do_sincos`: `sin`/`cos` of `a + da` in quadrant `n`, as one value —
 /// `__sin`/`__cos`'s own shape (not `__sincos`'s, which inlines the
 /// equivalent choice differently; see the module doc).
@@ -192,8 +336,19 @@ pub fn sin(x: f64) -> f64 {
         let (a, da, n) = reduce_sincos(x);
         return do_sincos_one(a, da, n);
     }
-    // |x| >= 105414350: the `__branred` band, deliberately not ported.
-    f64::sin(x)
+    // 105414350 <= |x| < 2^1024: `__branred`'s Payne-Hanek reduction, then
+    // the same `do_sincos` tail the band below uses.
+    if k < 0x7ff00000 {
+        let (a, da, n) = branred(x);
+        return do_sincos_one(a, da, n);
+    }
+    // |x| >= 2^1024 — infinity or a NaN. `retval = x / x`, glibc's own
+    // spelling: NaN either way, carrying `x`'s payload when `x` is a NaN.
+    // The `EDOM` errno `__sin` raises for an infinity is not Rust's to set.
+    #[allow(clippy::eq_op)]
+    {
+        x / x
+    }
 }
 
 /// `cos(x)`.
@@ -217,7 +372,14 @@ pub fn cos(x: f64) -> f64 {
         let (a, da, n) = reduce_sincos(x);
         return do_sincos_one(a, da, n + 1);
     }
-    f64::cos(x)
+    if k < 0x7ff00000 {
+        let (a, da, n) = branred(x);
+        return do_sincos_one(a, da, n + 1);
+    }
+    #[allow(clippy::eq_op)]
+    {
+        x / x
+    }
 }
 
 /// `(sin(x), cos(x))`.
@@ -239,8 +401,14 @@ pub fn sincos(x: f64) -> (f64, f64) {
         return (do_cos(a, da).copysign(x), do_sin(a, da));
     }
     if k < 0x7ff00000 {
-        if k < 0x419921FB {
-            let (mut a, mut da, n) = reduce_sincos(x);
+        {
+            // `__sincos` picks the reduction with a conditional expression
+            // rather than a separate branch, so both bands share one tail.
+            let (mut a, mut da, n) = if k < 0x419921FB {
+                reduce_sincos(x)
+            } else {
+                branred(x)
+            };
             let n = n & 3;
             if n == 1 || n == 2 {
                 a = -a;
@@ -253,10 +421,12 @@ pub fn sincos(x: f64) -> (f64, f64) {
                 (sinx, if n & 2 != 0 { -cosx } else { cosx })
             };
         }
-        // |x| >= 105414350: not ported, see the module doc.
-        return (f64::sin(x), f64::cos(x));
     }
-    (f64::sin(x), f64::cos(x))
+    // |x| >= 2^1024 — `*sinx = *cosx = x / x`.
+    #[allow(clippy::eq_op)]
+    {
+        (x / x, x / x)
+    }
 }
 
 /// `tan(x)`: a port of glibc's `__tan` (`sysdeps/ieee754/dbl-64/s_tan.c` —
@@ -265,11 +435,11 @@ pub fn sincos(x: f64) -> (f64, f64) {
 /// Ported rather than left as `f64::tan` for the same reason `sin`/`cos`
 /// are: `src/kernels/double/trig.rs`'s vector `BitExact` path needs a
 /// schedule to replay lane-parallel, and the platform call is opaque to
-/// that. The huge-argument band (`|x| > 1e8`, where the source reaches for
-/// `__branred`'s Payne-Hanek reduction) is deliberately **not** ported: it
-/// still calls straight through to `f64::tan`, which is bit-exact by
-/// construction and correct for every input — a `patch_lanes` repair the
-/// vector kernel reaches for, not a port with a gap in it.
+/// that. The huge-argument band (`|x| > 1e8`) is ported too, through
+/// `branred`; the source duplicates its two band bodies rather than
+/// sharing them with (VIII)/(IX), but they are the same computation on an
+/// `EADD`-compensated argument, so `tan_sub_n` serves both — which the
+/// exhaustive sweep of that band confirms.
 ///
 /// The reduction is shared with `sin`/`cos` (`HPINV`, `TOINT`, `MP1`/`MP2`,
 /// `PP3`/`PP4` are bit-identical between `usncs.h` and `utan.h`, asserted by
@@ -359,9 +529,19 @@ pub fn tan(x: f64) -> f64 {
         };
         return tan_sub(t, sum, cc);
     }
-    // (VI): `|x| > 1e8` — `__branred`'s Payne-Hanek reduction, not ported,
-    // see the module doc.
-    f64::tan(x)
+    // (X)/(XI): `1e8 < |x| < 2^1024` — reduction by algorithm iii,
+    // `__branred`. The source duplicates the two band bodies rather than
+    // sharing them with (VIII)/(IX), but they are the same computation on an
+    // `EADD`-compensated `(a, da)`, so [`tan_sub_n`] serves both.
+    let (a, da, n) = branred(x);
+    // EADD(a, da, t1, t2).
+    let t1 = a + da;
+    let t2 = if a.abs() > da.abs() {
+        (a - t1) + da
+    } else {
+        (da - t1) + a
+    };
+    tan_sub_n((n & 1) as u32, t1, t2)
 }
 
 /// The `(IV)`/`(V)` common tail: `tan` (or `-cot`) of the reduced argument
@@ -374,7 +554,17 @@ pub fn tan(x: f64) -> f64 {
 /// `a`/`da` prepared together, before the `ya <= gy2` branch.
 #[inline(always)]
 fn tan_sub(t: f64, a: f64, da: f64) -> f64 {
-    let n = (t.to_bits() & 1) as u32;
+    tan_sub_n((t.to_bits() & 1) as u32, a, da)
+}
+
+/// [`tan_sub`] with the quadrant parity passed in rather than read off the
+/// reduction's rounded `t`.
+///
+/// Bands (X)/(XI) need this: `__branred` returns the quadrant as an integer
+/// directly (`n = __branred(...) & 1`), with no `TOINT`-rounded double to
+/// take the low bit of.
+#[inline(always)]
+fn tan_sub_n(n: u32, a: f64, da: f64) -> f64 {
     let (ya, yya, sy) = if a < 0.0 {
         (-a, -da, -1.0)
     } else {

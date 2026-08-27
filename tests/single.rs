@@ -46,6 +46,10 @@ mod libm {
         pub safe fn asinhf(x: f32) -> f32;
         pub safe fn acoshf(x: f32) -> f32;
         pub safe fn roundf(x: f32) -> f32;
+        pub safe fn sincosf(x: f32, s: *mut f32, c: *mut f32);
+        pub safe fn atan2f(y: f32, x: f32) -> f32;
+        pub safe fn powf(x: f32, y: f32) -> f32;
+        pub safe fn hypotf(x: f32, y: f32) -> f32;
     }
 }
 
@@ -276,4 +280,163 @@ suite!(
     "roundf",
     |x| Round::new().eval(x),
     libm::roundf
+);
+
+// ---------------------------------------------------------------------------
+// The functions `suite!` cannot express
+// ---------------------------------------------------------------------------
+//
+// `sincosf` returns a pair, and `atan2f`/`powf`/`hypotf` take two arguments —
+// a 2^64 domain, which no sweep can exhaust. They were delegating calls until
+// the platform routines were ported, so they need their own coverage here or
+// nothing in the repository would catch a regression in them.
+
+/// `sincosf` through `extern "C"`, one half at a time.
+fn platform_sincosf(x: f32) -> (f32, f32) {
+    let (mut s, mut c) = (0.0f32, 0.0f32);
+    libm::sincosf(x, &raw mut s, &raw mut c);
+    (s, c)
+}
+
+/// Both halves at once, so a swapped pair cannot pass by testing one of them.
+///
+/// `suite!` takes a `path` for its reference and `sincosf` needs a wrapper, so
+/// this spells the two tests out rather than going through the macro.
+fn check_sincos(stride: u32) {
+    check(
+        "sincosf (sin)",
+        stride,
+        |x| SinCos::new().eval(x).0,
+        |x| platform_sincosf(x).0,
+    );
+    check(
+        "sincosf (cos)",
+        stride,
+        |x| SinCos::new().eval(x).1,
+        |x| platform_sincosf(x).1,
+    );
+}
+
+#[test]
+fn sincos_matches_libm_sampled() {
+    check_sincos(STRIDE);
+}
+
+#[test]
+#[ignore = "sweeps all 2^32 f32 inputs; minutes, not seconds"]
+fn sincos_matches_libm_exhaustive() {
+    check_sincos(1);
+}
+
+/// xorshift64*, for the two-argument corpora.
+struct Rng2(u64);
+
+impl Rng2 {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+/// Compare a two-argument function over a structured random corpus.
+///
+/// Four shapes, cycled: raw bit patterns (which land on NaN and infinity far
+/// more often than any realistic distribution), a raw base against a small
+/// integer exponent, two non-negative bit patterns, and two values built from
+/// a uniformly random exponent — which is the only one of the four that
+/// reliably lands in the bands where `powf` over- and underflows.
+fn check2(name: &str, n: u64, ours: impl Fn(f32, f32) -> f32, theirs: impl Fn(f32, f32) -> f32) {
+    use std::hint::black_box;
+    let mut g = Rng2(0x1234_5678_9abc_def1);
+    let mut bad = 0u64;
+    let mut shown = 0;
+    for i in 0..n {
+        let (x, y) = match i % 4 {
+            0 => (
+                f32::from_bits(g.next() as u32),
+                f32::from_bits(g.next() as u32),
+            ),
+            1 => (
+                f32::from_bits(g.next() as u32),
+                ((g.next() % 128) as i32 - 64) as f32,
+            ),
+            2 => (
+                f32::from_bits(g.next() as u32 & 0x7fff_ffff),
+                f32::from_bits(g.next() as u32 & 0x7fff_ffff),
+            ),
+            _ => {
+                let e = |v: u64| {
+                    f32::from_bits(
+                        ((v % 254 + 1) << 23) as u32 | (v as u32 >> 9) | ((v as u32 & 1) << 31),
+                    )
+                };
+                (e(g.next()), e(g.next()))
+            }
+        };
+        let (a, b) = (
+            ours(black_box(x), black_box(y)),
+            theirs(black_box(x), black_box(y)),
+        );
+        if a.to_bits() != b.to_bits() {
+            bad += 1;
+            if shown < 8 {
+                shown += 1;
+                eprintln!(
+                    "{name}: x = {:#010x}, y = {:#010x} => ours {:#010x}, libm {:#010x}",
+                    x.to_bits(),
+                    y.to_bits(),
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        bad, 0,
+        "{name}: {bad} of {n} input pairs differ from the platform libm"
+    );
+}
+
+/// The pair count the default run uses. `--ignored` runs a hundred times more.
+const PAIRS: u64 = 2_000_000;
+
+macro_rules! suite2 {
+    ($fast:ident, $slow:ident, $name:literal, $f:expr, $libm:expr) => {
+        #[test]
+        fn $fast() {
+            check2($name, PAIRS, $f, $libm);
+        }
+
+        #[test]
+        #[ignore = "200M input pairs; minutes, not seconds"]
+        fn $slow() {
+            check2($name, 100 * PAIRS, $f, $libm);
+        }
+    };
+}
+
+suite2!(
+    atan2_matches_libm_sampled,
+    atan2_matches_libm_large,
+    "atan2f",
+    |y, x| Atan2::new().eval(y, x),
+    |y, x| libm::atan2f(y, x)
+);
+suite2!(
+    pow_matches_libm_sampled,
+    pow_matches_libm_large,
+    "powf",
+    |x, y| Pow::new().eval(x, y),
+    |x, y| libm::powf(x, y)
+);
+suite2!(
+    hypot_matches_libm_sampled,
+    hypot_matches_libm_large,
+    "hypotf",
+    |x, y| Hypot::new().eval(x, y),
+    |x, y| libm::hypotf(x, y)
 );

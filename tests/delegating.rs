@@ -1,13 +1,19 @@
 //! `BitExact` must be bit-exact for *every* function, not just the ported ones.
 //!
-//! The functions in this file reach that guarantee by delegation rather than
-//! by replaying a schedule (see [`rmath::reference`]), which makes it cheap to
-//! state and easy to get wrong in a way no accuracy test would catch: a kernel
-//! that quietly took its `Fast` path under `BitExact` would still look fine to
-//! within a few ulp. So the check here is `to_bits()` equality against the
-//! platform, at every vector width, exactly as for the ported functions.
+//! The functions in this file reach that guarantee by walking the lane array
+//! and calling the scalar reference once per lane, rather than by replaying a
+//! schedule lane-parallel (see [`rmath::reference`]). The file's name predates
+//! the point where that reference stopped being the platform's routine and
+//! became this crate's own port; what it still names is the *kernel shape*, a
+//! scalar loop rather than a vector schedule, not where the answer comes from.
 //!
-//! Lane independence matters as much as the values: a delegating kernel walks
+//! That shape is cheap to state and easy to get wrong in a way no accuracy
+//! test would catch: a kernel that quietly took its `Fast` path under
+//! `BitExact` would still look fine to within a few ulp. So the check here is
+//! `to_bits()` equality against the platform, at every vector width, exactly
+//! as for the ported functions.
+//!
+//! Lane independence matters as much as the values: a scalar-loop kernel walks
 //! the lane array by hand, and an off-by-one there would show up only at some
 //! widths.
 

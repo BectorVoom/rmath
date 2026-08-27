@@ -242,6 +242,8 @@ def values(text: str, defs: dict) -> list[float]:
             element,
         )
         e = re.sub(r"\bN\b", str(defs["N"]), e)
+        if "POWF_SCALE" in defs:
+            e = re.sub(r"\bPOWF_SCALE\b", repr(defs["POWF_SCALE"]), e)
         if not re.fullmatch(r"[-+*/(). \t\n0-9e]+", e):
             raise ValueError(f"unparsed initialiser element: {element!r}")
         out.append(float(eval(e)))
@@ -451,7 +453,18 @@ def emit_logf_like(kind: str):
 
     def emit(text: str, defs: dict) -> str:
         n = defs["N"]
-        tab = [hexfloat(t) for t in nums(field(text, "tab"))]
+        # `values` rather than `nums`: `powf_log2_data.c` writes every `logc`
+        # as `<literal> * POWF_SCALE`, and `nums` refuses a field carrying
+        # arithmetic precisely so that factor cannot be silently dropped.
+        # `POWF_SCALE` is `1 << POWF_SCALE_BITS` as a double, and
+        # `DEFS_POWF` pins those bits to 0 (the `TOINT_INTRINSICS == 0` build
+        # x86-64 compiles), so the factor is 1 -- but it is evaluated, not
+        # assumed.
+        defs = {**defs, "POWF_SCALE": float(1 << defs.get("POWF_SCALE_BITS", 0))}
+        # The rows are `{invc, logc}` pairs; flatten them to one list so that
+        # `elements` splits on the individual constants rather than the rows.
+        flat = "{" + field(text, "tab").replace("{", " ").replace("}", " ") + "}"
+        tab = values(flat, defs)
         poly = values(field(text, "poly"), defs)
         assert len(tab) == 2 * n, f"{kind} tab has {len(tab)} entries, expected {2 * n}"
 
@@ -585,6 +598,7 @@ TARGETS = [
     ("exp2f_data.c", DEFS_EXP2F, "single/exp.rs", emit_exp2f),
     ("logf_data.c", DEFS_LOGF, "single/log.rs", emit_logf_like("logf")),
     ("log2f_data.c", DEFS_LOG2F, "single/log2.rs", emit_logf_like("log2f")),
+    ("powf_log2_data.c", DEFS_POWF, "single/pow.rs", emit_logf_like("powf")),
 ]
 
 
@@ -766,10 +780,25 @@ def emit_trig_tables(src_dir: Path | None) -> str:
         ("tm24", "TM24", "`2^-24`, the per-step scale `__branred`'s loop divides `T576` by."),
         ("big", "BRANRED_BIG", "`1.5 * 2^52` (`= TOINT`), `__branred`'s own round-to-integer constant -- named separately from `usncs.h`'s `BIG` since the two are different magnitudes."),
         ("big1", "BRANRED_BIG1", "`1.5 * 2^54`, four times `BRANRED_BIG`."),
+        ("mp2", "BRANRED_MP2", "`pi/2`'s middle third as `__branred` splits it -- **not** `usncs.h`'s `MP2`. The two headers disagree in the last two hex digits of the significand (`-0x1.DDE974p-27` here against `-0x1.DDE973Cp-27` there), so the final `s * pi/2` recombination cannot borrow the shared constant."),
     ]:
         bits = mynumber_bits(branred_le, name)
         w(f"/// {doc}")
         w(f"pub const {const}: f64 = f64::from_bits(0x{bits:016x});\n")
+
+    # `branred.h` re-declares `hp0`, `hp1` and `mp1` too. Those three *are*
+    # bit-identical to `usncs.h`'s, so they are asserted rather than
+    # re-emitted -- and the assert is what makes the `mp2` exception above a
+    # checked fact rather than a comment.
+    for name, const in [("hp0", "HP0"), ("hp1", "HP1"), ("mp1", "MP1")]:
+        shared = struct.unpack("<Q", struct.pack("<d", double_const(usncs, name)[0]))[0]
+        assert mynumber_bits(branred_le, name) == shared, (
+            f"{const} differs between usncs.h and branred.h"
+        )
+    assert (
+        mynumber_bits(branred_le, "mp2")
+        != struct.unpack("<Q", struct.pack("<d", double_const(usncs, "mp2")[0]))[0]
+    ), "branred.h's mp2 now matches usncs.h's; BRANRED_MP2 is redundant"
 
     w("/// `2/pi`, base `2^24`, as 75 24-bit digits -- `__branred`'s arbitrary-\n"
       "/// precision multiplier for the Payne-Hanek reduction. Each entry is an\n"

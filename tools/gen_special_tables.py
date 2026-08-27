@@ -47,6 +47,11 @@ FILES = {
     "e_j0f.c": "flt-32",
     "e_j1f.c": "flt-32",
     "s_sincosf_data.c": "flt-32",
+    "s_asincosf_data.c": "flt-32",
+    "s_asincoshf_data.c": "flt-32",
+    "e_sincoshf_data.c": "flt-32",
+    "s_asinh.c": "dbl-64",
+    "e_acosh.c": "dbl-64",
 }
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -661,22 +666,6 @@ def gen_bessel_single(src: Path | None) -> str:
             32,
         )
     )
-    sc = strip_comments(fetch(src, "s_sincosf_data.c"))
-    words = re.findall(r"0x[0-9a-fA-F]+", array_body(sc, "__inv_pio4[24]"))
-    parts.append(
-        "/// `4/pi` to 192 bits, as six overlapping 32-bit windows per shift.\n"
-        "///\n"
-        "/// Payne-Hanek reduction for the asymptotic branches: above `x = 2^7`\n"
-        "/// or so the argument of the cosine is known to far fewer bits than the\n"
-        "/// answer needs, and only an exact `4/pi` recovers them. Shared with\n"
-        "/// glibc's own `sinf`/`cosf`, which is where these words come from.\n"
-        f"pub static INV_PIO4: [u32; {len(words)}] = [\n"
-        + "\n".join(
-            "    " + " ".join(f"{w}," for w in words[i : i + 4])
-            for i in range(0, len(words), 4)
-        )
-        + "\n];"
-    )
     for stem, rust, doc in [
         ("pr", "P1R", "/// `ponef`'s numerator, one row per interval of `1/x`."),
         ("ps", "P1S", "/// `ponef`'s denominator."),
@@ -684,6 +673,403 @@ def gen_bessel_single(src: Path | None) -> str:
         ("qs", "Q1S", "/// `qonef`'s denominator."),
     ]:
         parts.append(four(j1, stem, 32, doc, rust))
+    return "\n\n".join(parts) + "\n"
+
+
+
+def gen_single_trig(src: Path | None) -> str:
+    """`src/tables/single/trig.rs`: `sinf`/`cosf`/`sincosf`/`tanf` data.
+
+    A different upstream from the CORE-MATH families above -- these are ARM's
+    optimized-routines, which glibc took wholesale for the binary32 sine
+    family -- so the header names that origin rather than CORE-MATH's.
+    """
+    sc = strip_comments(fetch(src, "s_sincosf_data.c"))
+    parts = [
+        HEADER.format(
+            title="`sinf`/`cosf`/`sincosf`/`tanf` data: the shared quadrant "
+                  "polynomials and the 192-bit `4/pi`.",
+            origin="sysdeps/ieee754/flt-32/s_sincosf_data.c",
+        ).replace(
+            "itself taken from the CORE-MATH project.\n"
+            "//! Copyright (c) 2022-2025 Alexei Sibidanov, Paul Zimmermann, Tom Hubrecht and\n"
+            "//! Claude-Pierre Jeannerod, MIT licence.",
+            "itself taken from ARM's optimized-routines\n"
+            "//! project -- a different upstream from the CORE-MATH families in the\n"
+            "//! sibling table modules. Copyright (c) 2018-2026 Arm Limited and\n"
+            "//! Free Software Foundation, Inc., MIT licence.",
+        )
+    ]
+
+    # `__sincosf_table[2]`: two `sincos_t` records, the second holding the
+    # cosine polynomial negated so that quadrants 2 and 3 come out free. The
+    # C is `#if TOINT_INTRINSICS`-conditional in exactly one field, `hpi_inv`;
+    # x86-64 does not define it, so the `p+23` prescaled spelling is the one
+    # that compiles -- asserted rather than assumed.
+    body = array_body(sc, "__sincosf_table[2]")
+    recs = re.findall(r"\{\s*\{[^}]*\}(?:[^{}]*)\}", body, re.S)
+    assert len(recs) == 2, f"expected 2 sincos_t records, found {len(recs)}"
+
+    fields = ["SIGN", "HPI_INV", "HPI", "C0", "C1", "C2", "C3", "C4", "S1", "S2", "S3"]
+    rows = []
+    for rec in recs:
+        vals = numbers(rec)
+        # Four `sign` entries, then `hpi_inv` twice (both arms of the #if),
+        # then the nine remaining scalars.
+        assert len(vals) == 4 + 2 + 9, f"sincos_t has {len(vals)} literals"
+        sign, both_hpi_inv, rest = vals[:4], vals[4:6], vals[6:]
+        toint, scaled = both_hpi_inv
+        assert scaled[1] == toint[1] * 2.0 ** 24, (
+            "hpi_inv's two spellings are not the same value scaled by 2^24"
+        )
+        rows.append((sign, scaled, rest))
+    assert len(fields) == 11
+
+    parts.append(
+        "/// The sign of `sin` in quadrants 0..3. Identical in both records,\n"
+        "/// asserted by the generator rather than emitted twice."
+    )
+    assert rows[0][0] == rows[1][0], "the two records' sign tables differ"
+    parts[-1] += "\npub static SIGN: [f64; 4] = [\n    " + " ".join(
+        cell(v, 64) for _, v in rows[0][0]
+    ) + "\n];"
+
+    parts.append(
+        "/// `2/pi`, prescaled by `2^24` so that `reduce_fast`'s quadrant lands\n"
+        "/// in bits 24..31 of the `int32` conversion.\n"
+        "///\n"
+        "/// The `TOINT_INTRINSICS` arm of `s_sincosf_data.c` spells this\n"
+        "/// `p-1` instead and rounds with a dedicated instruction. x86-64 does\n"
+        "/// not define that macro, so this is the constant that compiles.\n"
+        f"pub const HPI_INV: f64 = {cell(rows[0][1][1], 64)[:-1]};"
+    )
+    parts.append(
+        "/// `pi/2`, `reduce_fast`'s single subtraction constant.\n"
+        f"pub const HPI: f64 = {cell(rows[0][2][0][1], 64)[:-1]};"
+    )
+
+    docs = {
+        "C0": "/// Cosine polynomial, constant term. `POLY[0]` is `cos`; `POLY[1]` is\n"
+              "/// the same polynomial negated, which is how quadrants 2 and 3 get\n"
+              "/// their sign for free.",
+        "C1": "/// Cosine polynomial, `x^2` coefficient.",
+        "C2": "/// Cosine polynomial, `x^4` coefficient.",
+        "C3": "/// Cosine polynomial, `x^6` coefficient.",
+        "C4": "/// Cosine polynomial, `x^8` coefficient.",
+        "S1": "/// Sine polynomial, `x^3` coefficient. Not negated in the second\n"
+              "/// record -- only the cosine half is.",
+        "S2": "/// Sine polynomial, `x^5` coefficient.",
+        "S3": "/// Sine polynomial, `x^7` coefficient.",
+    }
+    names = ["C0", "C1", "C2", "C3", "C4", "S1", "S2", "S3"]
+    parts.append(
+        "/// `POLY[k][i]`: the two `sincos_t` records' polynomial coefficients,\n"
+        "/// in the order " + ", ".join(f"`{n}`" for n in names) + ".\n"
+        "///\n"
+        "/// One flat pair of rows rather than a struct, because the only thing\n"
+        "/// the algorithm does with the record is index it by `n & 2`.\n"
+        "pub static POLY: [[f64; 8]; 2] = [\n"
+        + "".join(
+            "    [\n        " + " ".join(cell(v, 64) for _, v in row[2][1:]) + "\n    ],\n"
+            for row in rows
+        )
+        + "];"
+    )
+    for i, n in enumerate(names):
+        parts.append(f"{docs[n]}\npub const {n}: usize = {i};")
+
+    words = re.findall(r"0x[0-9a-fA-F]+", array_body(sc, "__inv_pio4[24]"))
+    parts.append(
+        "/// `4/pi` to 192 bits, as six overlapping 32-bit windows per shift.\n"
+        "///\n"
+        "/// Payne-Hanek reduction: past `|x| = 120` the argument of the sine is\n"
+        "/// known to far fewer bits than the answer needs, and only an exact\n"
+        "/// `4/pi` recovers them. Shared with the `f32` Bessel functions, whose\n"
+        "/// asymptotic branches reduce the same way.\n"
+        f"pub static INV_PIO4: [u32; {len(words)}] = [\n"
+        + "\n".join(
+            "    " + " ".join(f"{w}," for w in words[i : i + 4])
+            for i in range(0, len(words), 4)
+        )
+        + "\n];"
+    )
+    return "\n\n".join(parts) + "\n"
+
+
+
+def gen_single_invtrig(src: Path | None) -> str:
+    """`src/tables/single/invtrig.rs`: `asinf`/`acosf`'s shared accurate path."""
+    text = strip_comments(fetch(src, "s_asincosf_data.c"))
+    parts = [
+        HEADER.format(
+            title="`asinf`/`acosf` data: the two degree-11 polynomials their "
+                  "accurate paths share.",
+            origin="sysdeps/ieee754/flt-32/s_asincosf_data.c",
+        )
+    ]
+    parts.append(
+        emit_flat(
+            "C0",
+            "/// `asin(z)/z - 1` as a degree-11 polynomial in `z^2`, for the\n"
+            "/// small-argument accurate path both functions fall back to.",
+            numbers(array_body(text, "__asincosf_c0[]")),
+            3,
+        )
+    )
+    parts.append(
+        emit_flat(
+            "C1",
+            "/// The near-1 accurate path's polynomial in `1 - |x|`, multiplied\n"
+            "/// by `sqrt(1 - |x|)` at the call site — which is where the\n"
+            "/// leading `sqrt(2)` in `C1[0]` comes from.",
+            numbers(array_body(text, "__asincosf_c1[]")),
+            3,
+        )
+    )
+    return "\n\n".join(parts) + "\n"
+
+
+def gen_single_asincosh(src: Path | None) -> str:
+    """`src/tables/single/asincosh.rs`: `asinhf`/`acoshf`'s shared logarithm."""
+    text = strip_comments(fetch(src, "s_asincoshf_data.c"))
+    parts = [
+        HEADER.format(
+            title="`asinhf`/`acoshf` data: the 129-entry reciprocal / logarithm "
+                  "table and its two polynomials.",
+            origin="sysdeps/ieee754/flt-32/s_asincoshf_data.c",
+        )
+    ]
+    ix = numbers(array_body(text, "__asincoshf_ix[]"))
+    lix = numbers(array_body(text, "__asincoshf_lix[]"))
+    assert len(ix) == 129 and len(lix) == 129, (len(ix), len(lix))
+    parts.append(
+        emit_flat(
+            "IX",
+            "/// `IX[j] ~= 1/c_j` for the 128 subintervals of `[1, 2)`, so that\n"
+            "/// `w * IX[j] - 1` is the small residual the polynomial sees.",
+            ix,
+            4,
+        )
+    )
+    parts.append(
+        emit_flat(
+            "LIX",
+            "/// `LIX[j] = log(c_j)`, with `LIX[128] = log(2)` doing double duty\n"
+            "/// as the per-exponent scale.",
+            lix,
+            4,
+        )
+    )
+    parts.append(
+        emit_flat(
+            "C",
+            "/// The fast path's degree-3 correction, `log(1 + z) ~= z * C`.",
+            numbers(array_body(text, "__asincoshf_c[]")),
+            3,
+        )
+    )
+    parts.append(
+        emit_flat(
+            "CP",
+            "/// The accurate path's degree-6 correction, reached only when the\n"
+            "/// fast path's error bound cannot settle the last bit.",
+            numbers(array_body(text, "__asincoshf_cp[]")),
+            2,
+        )
+    )
+    return "\n\n".join(parts) + "\n"
+
+
+def gen_single_sincosh(src: Path | None) -> str:
+    """`src/tables/single/sincosh.rs`: `sinhf`/`coshf`'s shared exponential."""
+    text = strip_comments(fetch(src, "e_sincoshf_data.c"))
+    parts = [
+        HEADER.format(
+            title="`sinhf`/`coshf` data: the 32-entry `2^(k/32)` table and the "
+                  "two exponential polynomials.",
+            origin="sysdeps/ieee754/flt-32/e_sincoshf_data.c",
+        )
+    ]
+    parts.append(
+        emit_flat(
+            "C",
+            "/// The fast path's degree-3 `2^z` polynomial on `|z| <= 1/64`.",
+            numbers(array_body(text, "__sincoshf_c[]")),
+            4,
+        )
+    )
+    parts.append(
+        emit_flat(
+            "CH",
+            "/// The accurate path's degree-6 `2^z` polynomial, same interval.",
+            numbers(array_body(text, "__sincoshf_ch[]")),
+            3,
+        )
+    )
+    words = re.findall(r"0x[0-9a-fA-F]+", array_body(text, "__sincoshf_tb[]"))
+    assert len(words) == 32, f"tb has {len(words)} entries"
+    parts.append(
+        "/// `TB[k] = 2^(k/32 - 1)` as an exact bit pattern: the table half of\n"
+        "/// the exponential's `2^(k/32) * 2^z` split. Stored as `u64` because\n"
+        "/// that is how the C stores it -- the exponent is added into the bits\n"
+        "/// directly rather than by a multiply.\n"
+        f"pub static TB: [u64; {len(words)}] = [\n"
+        + "\n".join(
+            "    " + " ".join(f"{w}," for w in words[i : i + 3])
+            for i in range(0, len(words), 3)
+        )
+        + "\n];"
+    )
+    return "\n\n".join(parts) + "\n"
+
+
+
+def decl_body(text: str, decl: str, occurrence: int = 0) -> str:
+    """The braced initialiser of the `occurrence`-th `decl ... = {...}`.
+
+    `array_body` above anchors on the next `{` after the declaration, which
+    is enough for a data file but not for a source file: `s_asinh.c` contains
+    both a `static const double cl[3] = {...}` and expressions that index
+    `cl[3]`, and the naive search lands on a *code* block. Anchoring on the
+    `=` between the declaration and the brace rules that out.
+    """
+    pos = -1
+    for _ in range(occurrence + 1):
+        pos = text.index(decl, pos + 1)
+    eq = text.index("=", pos + len(decl) - 1)
+    j = text.index("{", eq)
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j : k + 1]
+    raise ValueError(f"unterminated initialiser for {decl!r}")
+
+
+def gen_asincosh_double(src: Path | None) -> str:
+    """`src/tables/double/asincosh_acc.rs`: `asinh`/`acosh`'s accurate paths.
+
+    The fast paths' tables live in the sibling `asincosh.rs`. These are the
+    ones the *second* step needs — the four-way logarithm table, its
+    triple-double logarithms, the two double-double polynomials, and the
+    short lists of arguments where even that cannot place the last bit.
+    """
+    a = strip_comments(fetch(src, "s_asinh.c"))
+    c = strip_comments(fetch(src, "e_acosh.c"))
+    parts = [
+        HEADER.format(
+            title="`asinh`/`acosh` accurate-path data: the four-way logarithm "
+                  "table, its triple-double logarithms, and the exception lists.",
+            origin="sysdeps/ieee754/dbl-64/{s_asinh.c,e_acosh.c}",
+        )
+    ]
+
+    # `t1`..`t4` and `LL` are byte-identical between the two files -- they are
+    # one logarithm shared by both functions. Asserted, then emitted once.
+    for name in ["t1[]", "t2[]", "t3[]", "t4[]", "LL[4][17][3]"]:
+        va = numbers(decl_body(a, "static const double " + name))
+        vc = numbers(decl_body(c, "static const double " + name))
+        assert [v for _, v in va] == [v for _, v in vc], (
+            f"{name} differs between s_asinh.c and e_acosh.c"
+        )
+
+    sizes = {"t1[]": 17, "t2[]": 16, "t3[]": 16, "t4[]": 16}
+    docs = {
+        "t1[]": "/// `T1[i]` is `2^(-i/16)` to 28 bits: the first of four table\n"
+                "/// stages, together reducing the argument to within `2^-16` of 1.",
+        "t2[]": "/// The second stage, `2^(-i/256)`.",
+        "t3[]": "/// The third stage, `2^(-i/4096)`.",
+        "t4[]": "/// The fourth stage, `2^(-i/65536)`.",
+    }
+    for name, rust in [("t1[]", "T1"), ("t2[]", "T2"), ("t3[]", "T3"), ("t4[]", "T4")]:
+        v = numbers(decl_body(a, "static const double " + name))
+        assert len(v) == sizes[name], (name, len(v))
+        parts.append(emit_flat(rust, docs[name], v, 4))
+
+    ll = numbers(decl_body(a, "static const double LL[4][17][3]"))
+    assert len(ll) == 4 * 17 * 3, len(ll)
+    parts.append(
+        "/// `LL[s][i]` is `-log(T{s+1}[i])` as an unevaluated triple-double.\n"
+        "///\n"
+        "/// Three limbs, not two: the accurate path exists precisely because\n"
+        "/// two are not enough near the argument where the logarithm cancels.\n"
+        "/// The four stages' entries are summed, which is what makes one\n"
+        "/// 65-thousand-entry logarithm out of four sixteen-entry ones."
+        + "\npub static LL: [[[f64; 3]; 17]; 4] = [\n"
+        + "".join(
+            "    [\n"
+            + "".join(
+                "        ["
+                + " ".join(cell(v, 64) for _, v in ll[(s * 17 + i) * 3 : (s * 17 + i) * 3 + 3])
+                + "],\n"
+                for i in range(17)
+            )
+            + "    ],\n"
+            for s in range(4)
+        )
+        + "];"
+    )
+
+    for label, text, zero_n, zero_name, zero_doc in [
+        ("ASINH", a, 12, "ZERO",
+         "the series `asinh(x)/x - 1` in `x^2` that `as_asinh_zero` needs where\n"
+         "/// the argument is small enough that the logarithm has nothing left"),
+        ("ACOSH", c, 10, "ONE",
+         "the series in `x - 1` that `as_acosh_one` needs just above 1, where\n"
+         "/// `sqrt(x^2 - 1)` cancels"),
+    ]:
+        ch = numbers(decl_body(text, "static const double ch[][2]", 0))
+        assert len(ch) == 2 * zero_n, (label, len(ch))
+        parts.append(
+            emit_rows(
+                f"{label}_{zero_name}_CH",
+                f"/// The double-double half of {zero_doc}.",
+                [ch[i : i + 2] for i in range(0, len(ch), 2)],
+            )
+        )
+        cl = numbers(decl_body(text, "static const double cl[]", 0))
+        parts.append(
+            emit_flat(
+                f"{label}_{zero_name}_CL",
+                "/// Its single-double tail, evaluated separately and folded in\n"
+                "/// as `polydd`'s incoming low word.",
+                cl,
+                3,
+            )
+        )
+        rch = numbers(decl_body(text, "static const double ch[][2]", 1))
+        assert len(rch) == 6, (label, len(rch))
+        parts.append(
+            emit_rows(
+                f"{label}_REFINE_CH",
+                "/// The refinement's double-double `log(1 + x)` series.",
+                [rch[i : i + 2] for i in range(0, len(rch), 2)],
+            )
+        )
+        rcl = numbers(decl_body(text, "static const double cl[3]"))
+        assert len(rcl) == 3, (label, len(rcl))
+        parts.append(
+            emit_flat(
+                f"{label}_REFINE_CL",
+                "/// Its single-double tail.",
+                rcl,
+                3,
+            )
+        )
+        db = numbers(decl_body(text, "static const double db[][3]"))
+        assert len(db) % 3 == 0
+        parts.append(
+            emit_rows(
+                f"{label}_DB",
+                "/// `(argument, high, low)` for the arguments where even the\n"
+                "/// refinement lands on a halfway point. Sorted, and searched\n"
+                "/// by bisection; `high + low` is the correctly-rounded answer.",
+                [db[i : i + 3] for i in range(0, len(db), 3)],
+            )
+        )
     return "\n\n".join(parts) + "\n"
 
 
@@ -698,6 +1084,11 @@ def main() -> None:
         (ROOT / "src/tables/single/erf.rs", gen_single),
         (ROOT / "src/tables/double/bessel.rs", gen_bessel_double),
         (ROOT / "src/tables/single/bessel.rs", gen_bessel_single),
+        (ROOT / "src/tables/single/trig.rs", gen_single_trig),
+        (ROOT / "src/tables/single/invtrig.rs", gen_single_invtrig),
+        (ROOT / "src/tables/single/asincosh.rs", gen_single_asincosh),
+        (ROOT / "src/tables/single/sincosh.rs", gen_single_sincosh),
+        (ROOT / "src/tables/double/asincosh_acc.rs", gen_asincosh_double),
     ]:
         path.write_text(gen(args.src))
         print(f"wrote {path.relative_to(ROOT)}", file=sys.stderr)

@@ -2554,18 +2554,6 @@ pub static Y1_ZEROS: [[f32; 7]; 64] = [
     ],
 ];
 
-/// `4/pi` to 192 bits, as six overlapping 32-bit windows per shift.
-///
-/// Payne-Hanek reduction for the asymptotic branches: above `x = 2^7`
-/// or so the argument of the cosine is known to far fewer bits than the
-/// answer needs, and only an exact `4/pi` recovers them. Shared with
-/// glibc's own `sinf`/`cosf`, which is where these words come from.
-pub static INV_PIO4: [u32; 24] = [
-    0xa2, 0xa2f9, 0xa2f983, 0xa2f9836e, 0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529, 0x441529fc,
-    0x1529fc27, 0x29fc2757, 0xfc2757d1, 0x2757d1f5, 0x57d1f534, 0xd1f534dd, 0xf534ddc0, 0x34ddc0db,
-    0xddc0db62, 0xc0db6295, 0xdb629599, 0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041,
-];
-
 /// `ponef`'s numerator, one row per interval of `1/x`.
 pub static P1R: [[f32; 6]; 4] = [
     [

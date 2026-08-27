@@ -97,6 +97,27 @@ where
     F: Fn(f64) -> f64,
     G: Fn(V) -> V,
 {
+    check_width_cmp::<V, _, _, _>(name, vals, scalar, vector, |a, b| {
+        a.to_bits() == b.to_bits()
+    })
+}
+
+/// [`check_width`] with the agreement test supplied.
+///
+/// Exists for one case: the crate's contract for a NaN *result* is that it is
+/// a NaN, not that it carries the platform's sign and payload — which is what
+/// `tests/glibc.rs::same64` has always tested, and what the scalar references
+/// have always satisfied and no more. `y0`/`y1` below reach it on every
+/// negative argument (`0.0 / (0.0 * x)` is a negative quiet NaN on x86-64
+/// where glibc's constant-folded `(x - x) / (x - x)` is a positive one).
+/// Every other caller here passes bit equality and gets the strict test.
+fn check_width_cmp<V, F, G, S>(name: &str, vals: &[f64], scalar: F, vector: G, same: S)
+where
+    V: Simd<Elem = f64>,
+    F: Fn(f64) -> f64,
+    G: Fn(V) -> V,
+    S: Fn(f64, f64) -> bool,
+{
     use rmath::simd::Lanes;
     let mut shown = 0usize;
     let mut bad = 0usize;
@@ -116,7 +137,7 @@ where
             let x = lanes.as_slice()[i];
             let want = scalar(x);
             let have = got.as_slice()[i];
-            if want.to_bits() != have.to_bits() {
+            if !same(want, have) {
                 bad += 1;
                 if shown < 8 {
                     shown += 1;
@@ -140,6 +161,21 @@ where
     );
 }
 
+/// [`check_all_widths`], with NaN treated as NaN — see [`check_width_cmp`].
+macro_rules! check_all_widths_nan_agnostic {
+    ($name:expr, $vals:expr, $scalar:expr, $f:expr) => {{
+        let f = $f;
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        check_width_cmp::<f64, _, _, _>($name, $vals, $scalar, |x| f.eval(x), same);
+        #[cfg(feature = "wide")]
+        {
+            check_width_cmp::<wide::f64x2, _, _, _>($name, $vals, $scalar, |x| f.eval(x), same);
+            check_width_cmp::<wide::f64x4, _, _, _>($name, $vals, $scalar, |x| f.eval(x), same);
+            check_width_cmp::<wide::f64x8, _, _, _>($name, $vals, $scalar, |x| f.eval(x), same);
+        }
+    }};
+}
+
 /// Run the comparison at every supported width.
 macro_rules! check_all_widths {
     ($name:expr, $vals:expr, $scalar:expr, $f:expr) => {{
@@ -160,6 +196,19 @@ where
     V: Simd<Elem = f64>,
     F: Fn(f64, f64) -> f64,
     G: Fn(V, V) -> V,
+{
+    check_width2_cmp::<V, _, _, _>(name, xs, ys, scalar, vector, |a, b| {
+        a.to_bits() == b.to_bits()
+    })
+}
+
+/// [`check_width2`] with the agreement test supplied — see [`check_width_cmp`].
+fn check_width2_cmp<V, F, G, S>(name: &str, xs: &[f64], ys: &[f64], scalar: F, vector: G, same: S)
+where
+    V: Simd<Elem = f64>,
+    F: Fn(f64, f64) -> f64,
+    G: Fn(V, V) -> V,
+    S: Fn(f64, f64) -> bool,
 {
     use rmath::simd::Lanes;
     let mut shown = 0usize;
@@ -182,7 +231,7 @@ where
             let (x, y) = (lx.as_slice()[i], ly.as_slice()[i]);
             let want = scalar(x, y);
             let have = got.as_slice()[i];
-            if want.to_bits() != have.to_bits() {
+            if !same(want, have) {
                 bad += 1;
                 if shown < 8 {
                     shown += 1;
@@ -206,6 +255,42 @@ where
 }
 
 /// Run the two-argument comparison at every supported width.
+/// [`check_all_widths2`], with NaN treated as NaN — see [`check_width_cmp`].
+macro_rules! check_all_widths2_nan_agnostic {
+    ($name:expr, $xs:expr, $ys:expr, $scalar:expr, $f:expr) => {{
+        let f = $f;
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        check_width2_cmp::<f64, _, _, _>($name, $xs, $ys, $scalar, |x, y| f.eval(x, y), same);
+        #[cfg(feature = "wide")]
+        {
+            check_width2_cmp::<wide::f64x2, _, _, _>(
+                $name,
+                $xs,
+                $ys,
+                $scalar,
+                |x, y| f.eval(x, y),
+                same,
+            );
+            check_width2_cmp::<wide::f64x4, _, _, _>(
+                $name,
+                $xs,
+                $ys,
+                $scalar,
+                |x, y| f.eval(x, y),
+                same,
+            );
+            check_width2_cmp::<wide::f64x8, _, _, _>(
+                $name,
+                $xs,
+                $ys,
+                $scalar,
+                |x, y| f.eval(x, y),
+                same,
+            );
+        }
+    }};
+}
+
 macro_rules! check_all_widths2 {
     ($name:expr, $xs:expr, $ys:expr, $scalar:expr, $f:expr) => {{
         let f = $f;
@@ -469,6 +554,77 @@ fn corpus_trig(seed: u64) -> Vec<f64> {
     }
     for _ in 0..300_000 {
         v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    v
+}
+
+/// `j0`/`j1`/`y0`/`y1`'s bands, at the exact bit patterns
+/// `src/reference/double/bessel.rs` and `src/kernels/double/bessel.rs` branch
+/// on — plus, because the asymptotic branch is now a vector replay of glibc's
+/// `__sin`/`__cos` rather than a scalar call, every band those two branch on
+/// as well, *and* those bands halved, since `cos(x + x)` reaches them at half
+/// the argument.
+///
+/// The `2.0` boundary gets the densest treatment: it is where the vector
+/// splits into a series branch and an asymptotic branch, so it is where a
+/// mixed vector is built and where the stand-in argument of
+/// `bessel.rs::branch` has to not change an answer. The corpus is shuffled
+/// afterwards for exactly that reason — laid out in sorted order, whole
+/// chunks would land on one side of the split and the mixed case would go
+/// untested.
+fn corpus_bessel(seed: u64) -> Vec<f64> {
+    let mut rng = Rng(seed);
+    let mut v = universal();
+    for c in [
+        2.0,                                   // series / asymptotic split
+        1.0,                                   // j0's two spellings of the fit
+        f64::from_bits(0x3f20_0000_0000_0000), // 2^-13, j0's collapse to 1 - x^2/4
+        f64::from_bits(0x3e40_0000_0000_0000), // 2^-27, j0 -> 1, j1 -> x/2
+        f64::from_bits(0x3e40_0001_0000_0000), // y0's U/V collapse
+        f64::from_bits(0x3c90_0001_0000_0000), // y1's pole-only band
+        f64::from_bits(0x4006_db6d_0000_0000), // P/Q interval [2, 2.857)
+        f64::from_bits(0x4012_2e8b_0000_0000), // P/Q interval [2.857, 4.547)
+        f64::from_bits(0x4020_0000_0000_0000), // P/Q interval [4.545, 8)
+        f64::from_bits(0x41b0_0000_0000_0000), // PQ_LIMIT, 2^28
+        f64::from_bits(0x4800_0001_0000_0000), // NO_PQ
+        f64::from_bits(0x7fe0_0000_0000_0000), // MAIN_PATH_LIMIT
+        // The trigonometry's own bands, and each one halved for `cos(x + x)`.
+        f64::from_bits(0x3feb_6000_0000_0000), // POLY
+        f64::from_bits(0x4003_68fd_0000_0000), // MID
+        f64::from_bits(0x4193_21fb_0000_0000), // TABLE_LIMIT / __branred handoff
+        f64::from_bits(0x3fdb_6000_0000_0000), // POLY / 2
+        f64::from_bits(0x3ff3_68fd_0000_0000), // MID / 2
+        f64::from_bits(0x4183_21fb_0000_0000), // TABLE_LIMIT / 2
+    ] {
+        v.extend(around(c));
+        v.extend(around(-c));
+    }
+    // Quadrant boundaries, where the asymptotic branch's argument reduction
+    // steps and where `ss`/`cc` swap which of the two is recovered by
+    // division.
+    for k in 2..1500i64 {
+        let q = k as f64 * std::f64::consts::FRAC_PI_4;
+        v.extend(around(q));
+        v.extend(around(-q));
+    }
+    for _ in 0..400_000 {
+        v.push(rng.uniform(-60.0, 60.0)); // ordinary use, both branches
+    }
+    for _ in 0..200_000 {
+        v.push(rng.uniform(1.9, 2.1)); // dense on the split
+    }
+    for _ in 0..200_000 {
+        v.push(rng.uniform(-105_500_000.0, 105_500_000.0)); // straddles __branred
+    }
+    for _ in 0..200_000 {
+        v.push(rng.log_uniform(1e-320, 1e300, true)); // subnormals through huge
+    }
+    for _ in 0..300_000 {
+        v.push(f64::from_bits(rng.next())); // adversarial
+    }
+    // Shuffle, so that a chunk of `LANES` values is a *mixed* vector.
+    for i in (1..v.len()).rev() {
+        v.swap(i, (rng.next() % (i as u64 + 1)) as usize);
     }
     v
 }
@@ -1358,6 +1514,187 @@ fn sincos_bit_exact_at_every_width() {
     }
     check_all_widths!("sincos.sin", &vals, f64::sin, Sin1);
     check_all_widths!("sincos.cos", &vals, f64::cos, Cos1);
+}
+
+/// The Bessel pair, against the platform's own `j0`/`j1`/`y0`/`y1`.
+///
+/// These used to be a `delegating.rs` entry — `BitExact` handed any vector
+/// with a lane at or above 2 to the scalar routine, so there was nothing to
+/// check that `map_lanes` did not already guarantee. The asymptotic branch is
+/// vectorised now, which is exactly the change that makes this file the
+/// arbiter: three replayed trigonometric calls and a four-row blend ladder,
+/// every one of which has a boundary to get wrong.
+mod platform {
+    unsafe extern "C" {
+        pub safe fn j0(x: f64) -> f64;
+        pub safe fn j1(x: f64) -> f64;
+        pub safe fn y0(x: f64) -> f64;
+        pub safe fn y1(x: f64) -> f64;
+        pub safe fn jn(n: i32, x: f64) -> f64;
+        pub safe fn yn(n: i32, x: f64) -> f64;
+    }
+}
+
+/// `(n, x)` pairs for `jn`/`yn`, one pair per index.
+///
+/// The three `jn` branches are picked by `n` against `x`, so the corpus is
+/// built as pairs rather than as a cross product: every pair names the branch
+/// it is there to reach, and the list is shuffled so that a vector of
+/// `LANES` consecutive pairs straddles branches, orders and signs at once —
+/// which is the case the masked recurrences exist to get right and the one a
+/// sorted corpus would never build.
+///
+/// Orders stay modest on purpose. The recurrences are `n` steps long for both
+/// the vector and the scalar reference, so `n = 2^24` is sixteen million
+/// iterations either way and tests nothing that `n = 2000` does not — except
+/// where the branch itself is cheap, which is why the `N_LIMIT` boundary
+/// appears only against a Taylor-branch `x`.
+fn corpus_jn_yn(seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Rng(seed);
+    let mut p: Vec<(f64, f64)> = Vec::new();
+
+    // Specials and domain edges, against every interesting order.
+    let orders = [
+        0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        3.0,
+        5.0,
+        -5.0,
+        33.0,
+        34.0,
+        -34.0,
+        40.0,
+        200.0,
+        -200.0,
+        1000.0,
+        2000.0,
+        16_777_216.0,
+        16_777_217.0,
+        0.5,
+        -0.5,
+        2.7,
+    ];
+    let edges = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        1.0,
+        -1.0,
+        2.0,
+        f64::from_bits(0x3e10_0000_0000_0000), // jn's Taylor cutoff, 2^-30
+        f64::from_bits(0x3e0f_ffff_ffff_ffff),
+        f64::from_bits(0x3e10_0000_0000_0001),
+        f64::from_bits(0x52d0_0000_0000_0000), // the 2^302 asymptotic form
+        f64::from_bits(0x52cf_ffff_ffff_ffff),
+        1e300,
+        -1e300,
+    ];
+    for &n in orders.iter() {
+        for &x in edges.iter() {
+            p.push((n, x));
+            p.push((n, -x));
+        }
+    }
+
+    // Forward recurrence: n <= x, so the order is small against the argument.
+    for _ in 0..120_000 {
+        let n = (rng.uniform(0.0, 40.0)).floor();
+        p.push((n, rng.uniform(n, 400.0)));
+    }
+    // Backward recurrence: x < n, the continued fraction's own branch.
+    for _ in 0..120_000 {
+        let n = (rng.uniform(2.0, 300.0)).floor();
+        p.push((n, rng.uniform(1e-9, n)));
+    }
+    // Backward recurrence with renormalisation: `n ln(2n/x)` past
+    // `ln(DBL_MAX)`, which needs a large order against a small argument.
+    for _ in 0..40_000 {
+        let n = (rng.uniform(60.0, 400.0)).floor();
+        p.push((n, rng.log_uniform(1e-6, 1e-1, false)));
+    }
+    // `yn`'s early exit: the forward recurrence reaches -inf here.
+    for _ in 0..40_000 {
+        let n = (rng.uniform(2.0, 400.0)).floor();
+        p.push((n, rng.log_uniform(1e-3, 3.0, false)));
+    }
+    // The Taylor branch, and negative orders throughout.
+    for _ in 0..40_000 {
+        let n = (rng.uniform(0.0, 60.0)).floor();
+        let x = rng.log_uniform(1e-320, 1e-30, false);
+        p.push((n, x));
+        p.push((-n, x));
+    }
+    for _ in 0..40_000 {
+        let n = (rng.uniform(0.0, 300.0)).floor();
+        p.push((-n, rng.uniform(-300.0, 300.0)));
+    }
+
+    for i in (1..p.len()).rev() {
+        p.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+    }
+    (
+        p.iter().map(|q| q.0).collect(),
+        p.iter().map(|q| q.1).collect(),
+    )
+}
+
+#[test]
+fn j0_bit_exact_at_every_width() {
+    let vals = corpus_bessel(0x4A30_0000_0000_0001);
+    check_all_widths!("j0", &vals, |x| platform::j0(x), J0::new());
+}
+
+#[test]
+fn j1_bit_exact_at_every_width() {
+    let vals = corpus_bessel(0x4A31_0000_0000_0001);
+    check_all_widths!("j1", &vals, |x| platform::j1(x), J1::new());
+}
+
+#[test]
+fn y0_bit_exact_at_every_width() {
+    let vals = corpus_bessel(0x5930_0000_0000_0001);
+    check_all_widths_nan_agnostic!("y0", &vals, |x| platform::y0(x), Y0::new());
+}
+
+#[test]
+fn y1_bit_exact_at_every_width() {
+    let vals = corpus_bessel(0x5931_0000_0000_0001);
+    check_all_widths_nan_agnostic!("y1", &vals, |x| platform::y1(x), Y1::new());
+}
+
+/// `jn`/`yn` against the platform, at every width.
+///
+/// These were `delegating.rs`'s last entry and are now three masked
+/// recurrences apiece; the corpus above names each branch it reaches.
+#[test]
+fn jn_bit_exact_at_every_width() {
+    let (ns, xs) = corpus_jn_yn(0x3E10_0000_0000_0001);
+    check_all_widths2!(
+        "jn",
+        &ns,
+        &xs,
+        |n: f64, x: f64| platform::jn(n as i32, x),
+        Jn::new()
+    );
+}
+
+#[test]
+fn yn_bit_exact_at_every_width() {
+    let (ns, xs) = corpus_jn_yn(0x52D0_0000_0000_0001);
+    check_all_widths2_nan_agnostic!(
+        "yn",
+        &ns,
+        &xs,
+        |n: f64, x: f64| platform::yn(n as i32, x),
+        Yn::new()
+    );
 }
 
 #[test]

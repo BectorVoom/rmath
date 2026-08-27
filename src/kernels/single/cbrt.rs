@@ -2,10 +2,11 @@
 //!
 //! Two policies, two shapes:
 //!
-//! * **`BitExact`** delegates to the platform's `cbrtf` one lane at a time,
-//!   exactly as before this kernel existed: the platform routine is cheap
-//!   enough that widening into the double-precision `cbrt` kernel measured at
-//!   half its speed, so parity is the honest ceiling there.
+//! * **`BitExact`** runs [`crate::reference::single::expm1::cbrt`] one lane
+//!   at a time — this crate's own port of CORE-MATH's correctly-rounded
+//!   `cbrtf`. The routine is cheap enough that widening into the
+//!   double-precision `cbrt` kernel measured at half its speed, so a scalar
+//!   loop is the honest ceiling there.
 //!
 //! * **`Fast`** is native: a bit-pattern seed for `|x|^(-1/3)`, three Newton
 //!   steps run in widened `f64` lanes — where quadratic convergence is not

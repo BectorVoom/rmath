@@ -661,6 +661,15 @@ math_fn_pair! {
 //
 // Ports of fdlibm, which is what glibc still runs for these. See
 // `crate::kernels::double::bessel` for which parts vectorise and which do not.
+//
+// What `Finite` means for all six: `0 < |x| < 52707175` (`Y0`/`Y1`/`Yn`
+// additionally require `x` to be a normal, and `Jn`/`Yn` require
+// `|n| <= 2^24`). The magnitude is the trigonometry's, not the Bessel
+// functions' own — above it the asymptotic branch would need glibc's
+// `__branred` argument reduction, which is where every kernel in this crate
+// hands a lane back to `crate::reference`. `FullRange` does exactly that and
+// is correct on every input; `Finite` skips the test and returns a wrong
+// number instead, as it does everywhere else.
 // ---------------------------------------------------------------------------
 
 math_fn! {

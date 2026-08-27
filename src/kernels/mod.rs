@@ -218,6 +218,35 @@ pub(crate) fn outside<V: Simd>(x: V, limit: V::Elem) -> V::Mask {
     x.abs().lt_mask(V::splat(limit)).not()
 }
 
+/// True when so many lanes need the scalar reference that computing the
+/// vector at all is a loss.
+///
+/// A repair-heavy vector pays twice: once for a main path whose answer is
+/// mostly discarded, and again for the per-lane calls that replace it. Below
+/// half the lanes surviving, the second bill is the larger one and the whole
+/// vector goes straight to `map_lanes` instead — the shape `erfc`, `y0` and
+/// `y1` already had for the `all()` case, with the cut moved off the extreme.
+///
+/// Half, rather than the `LANES / speedup` a napkin calculation gives, because
+/// the napkin is wrong in two ways that both point the same direction: a
+/// repaired lane is not one scalar call but a scalar call plus an extract and
+/// an insert, and the lanes that need repairing are exactly the ones whose
+/// scalar call is the expensive kind (`reference::j0` past the argument
+/// reduction's reach does three `__branred` trigonometric calls, not three
+/// table lookups). Measured on the `random-bit` and `boundary` corpora, where
+/// the density is high enough for the choice to show: at `LANES / 3` the
+/// Bessel `FullRange` rows read 0.65-0.93x against the scalar routine, at
+/// `LANES / 2` they read 0.69-1.16x, and the corpora with no repair at all
+/// are unchanged either way.
+///
+/// This is not a correctness switch. Both routes give the same bits; it only
+/// decides which one is cheaper for the vector in hand.
+#[inline(always)]
+pub(crate) fn mostly_repaired<M: Mask>(repaired: M) -> bool {
+    let live = M::LANES - repaired.to_bitmask().count_ones() as usize;
+    live * 2 <= M::LANES
+}
+
 /// Lanes that are not a *positive* normal number: negatives, zero,
 /// subnormals, infinities and NaN.
 ///

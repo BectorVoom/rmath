@@ -106,6 +106,9 @@ pub const BRANRED_BIG: f64 = f64::from_bits(0x4338000000000000);
 /// `1.5 * 2^54`, four times `BRANRED_BIG`.
 pub const BRANRED_BIG1: f64 = f64::from_bits(0x4358000000000000);
 
+/// `pi/2`'s middle third as `__branred` splits it -- **not** `usncs.h`'s `MP2`. The two headers disagree in the last two hex digits of the significand (`-0x1.DDE974p-27` here against `-0x1.DDE973Cp-27` there), so the final `s * pi/2` recombination cannot borrow the shared constant.
+pub const BRANRED_MP2: f64 = f64::from_bits(0xbe4dde9740000000);
+
 /// `2/pi`, base `2^24`, as 75 24-bit digits -- `__branred`'s arbitrary-
 /// precision multiplier for the Payne-Hanek reduction. Each entry is an
 /// exact small integer, stored as `f64` because that is what `__branred`

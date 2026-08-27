@@ -117,16 +117,29 @@
 //!
 //! # What each function actually gives you
 //!
-//! Five kinds of kernel, and the difference is worth knowing before you pick a
+//! Four kinds of kernel, and the difference is worth knowing before you pick a
 //! policy:
 //!
 //! | kind | `BitExact` | `Fast` |
 //! |---|---|---|
 //! | **Exact** — `floor`, `ceil`, `round`, `rint`, `trunc`, `copysign`, `fmod`, `remainder`, `remquo`, `modf`, `frexp`, `ldexp`, `scalbn`, `ilogb`, `fdim`, `fmin`, `fmax`, `nextafter`, `sqrt` | vectorised; exact by construction, on every platform | same code |
-//! | **Correctly rounded** — `erf`, `erfc` | vectorised; the *nearest representable value*, which is stronger than matching this platform | same arithmetic without the rounding test; below 0.51 ulp |
-//! | **Ported** — `exp`, `exp2`, `exp10`, `expm1`, `ln`, `log2`, `pow`, `cbrt`, `sinh`, `cosh`, `tanh` | vectorised; replays the platform schedule | separate table-free vector path |
-//! | **Delegating** — `sin`, `cos`, `sincos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `asinh`, `acosh`, `atanh`, `log10`, `log1p`, `hypot`, `jn`, `yn` | one lane at a time; bit-exact, but no faster than the call it replaces | vectorised, with a measured ulp bound |
-//! | **Mixed** — `j0`, `j1`, `y0`, `y1` | vectorised below `\|x\| = 2`; delegating above it, where the cost is the platform's trigonometry | fully vectorised, 2.4x to 3.0x |
+//! | **Correctly rounded** — `erf`, `erfc`, `asinh`, `acosh`, and in `f32` most of the library | vectorised where a kernel exists; the *nearest representable value*, which is stronger than matching this platform | same arithmetic without the rounding test; below 0.51 ulp |
+//! | **Ported** — every other `f64` function: the exponentials and logarithms, `pow`, `cbrt`, `hypot`, the hyperbolics, the trigonometric and inverse-trigonometric families, and the Bessel family `j0` through `yn` | vectorised; replays the platform schedule | separate table-free vector path |
+//! | **Own** — `lgamma`, `lgamma_r`, `tgamma` | one implementation for both policies, documented by its measured error | same |
+//!
+//! **Nothing here delegates any more.** The crate does not call the library
+//! it exists to replace, in either precision, on any input — verified by the
+//! rlib carrying no undefined libm symbol at all. What is left is a
+//! difference in *shape*, not in provenance: some functions have a
+//! lane-parallel replay of their schedule, and some run
+//! [`reference::single`] or [`reference::double`] one lane at a time under
+//! [`simd::map_lanes`]. `sinf`, `cosf`, `sincosf`, `tanf`, `cbrtf`, `tanhf`,
+//! the `f32` inverse-trigonometric and hyperbolic families and the whole
+//! single-precision Bessel family are in the second group, because glibc's
+//! `float` routines are separate algorithms rather than narrowed `double`
+//! ones and nobody has vectorised them yet. Their `BitExact` rows sit at
+//! 0.94x-1.00x; [`Fast`] is where their vector path lives, and for those it
+//! is a 3x to 18x difference.
 //!
 //! The exact functions need no apology: IEEE-754 pins their results down
 //! completely, so every correct implementation is bit-identical and both
@@ -144,28 +157,20 @@
 //! input in thirty thousand where it does not. The fast path vectorises; the
 //! accurate path is the rare-lane repair every kernel here already has.
 //!
-//! The delegating ones are the honest part. glibc implements those families
-//! with the IBM Accurate Portable Math Library routines, whose operation
-//! schedule turns on tables of several hundred entries and on per-expression
-//! fused-multiply-add placement the compiler chooses and the C source does not
-//! show. Reproducing that has not been done here, so under `BitExact` those
-//! kernels call the platform routine per lane: still bit-exact — substituting
-//! `rmath` cannot change your result — but at parity, not faster.
-//! [`Fast`] is where their vector path lives, and it is a large win: 20x for
-//! the trigonometric family on this machine.
+//! The ported group is the crate's headline case, and the hardest of it was
+//! glibc's IBM Accurate Portable Math Library routines: tables of several
+//! hundred entries and per-expression fused-multiply-add placement the
+//! compiler chooses and the C source does not show, which had to be read out
+//! of a disassembly. The trigonometric family went first, and the Bessel
+//! family followed from it — `j0` and the rest are about ninety per cent
+//! trigonometry above `|x| = 2`, so they were stuck at parity until `__sin`
+//! and `__cos` had a vector form to call. `jn` and `yn` came last: they choose
+//! between three algorithms on `n` against `x`, one of them a continued
+//! fraction whose length is decided at run time, and they are three masked
+//! recurrences in which a finished lane freezes and the loop ends when all of
+//! them have. See [`kernels::double::bessel`].
 //!
-//! `j0`, `j1`, `y0` and `y1` are the mixed case, and they are mixed for that
-//! same reason. Below `|x| = 2` they are rational functions of `x^2` and
-//! vectorise completely. Above it they are `sqrt(2/(pi x))` times a
-//! combination of `sin x`, `cos x` and `cos 2x` — three delegated calls, where
-//! the scalar routine gets away with two by sharing one argument reduction. So
-//! under `BitExact` a vector with any lane at or above 2 goes to the scalar
-//! routine, because a "vectorised" version of that branch measures *slower*
-//! than the call it replaces. `jn` and `yn` are delegating outright: they
-//! choose between three algorithms on `n` against `x`, and one of them runs a
-//! continued fraction whose length is decided at run time.
-//!
-//! `lgamma`, `lgamma_r` and `tgamma` are a case of their own. Rust has no
+//! `lgamma`, `lgamma_r` and `tgamma` are the "own" case. Rust has no
 //! `f64::tgamma`, so there is no call for `BitExact` to be bit-exact *to*;
 //! both policies run one vectorised implementation, documented by its measured
 //! error. See [`kernels::double::gamma`]. `lgamma_r`'s *sign* is exact.
@@ -187,17 +192,16 @@
 //!
 //! # Requires `std`
 //!
-//! For `mul_add` and `sqrt`, which are not in `core`, and for the delegating
-//! references, which are `std`'s own `sin`, `cos` and the rest. Supporting
-//! `no_std` needs a correctly-rounded software FMA — evaluating `a * b + c`
-//! instead would break every guarantee above — and would restrict the crate to
-//! the exact and ported groups, since the delegating ones are *defined* as the
-//! platform's routine.
+//! For exactly two operations, `mul_add` and `sqrt`, which are not in `core`.
+//! Both are IEEE-754 *arithmetic* — `fma` and `sqrt` are as much a part of
+//! the standard as `+` — not transcendental functions this crate could have
+//! ported instead. Supporting `no_std` therefore needs a correctly-rounded
+//! software FMA: evaluating `a * b + c` instead would break every guarantee
+//! above, since half the schedules here turn on exactly which multiplies fuse.
 //!
-//! The ported references are deliberately self-contained, so that the
-//! functions this crate claims to replace are not implemented by calling the
-//! thing it replaces. The delegating ones are the stated exception, and the
-//! table above says which they are.
+//! Nothing else. Every reference is self-contained, so that the functions
+//! this crate claims to replace are not implemented by calling the thing it
+//! replaces — there is no exception to that any more, in either precision.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]

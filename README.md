@@ -8,6 +8,10 @@ call is opaque to it. The loop stays scalar no matter how well the rest of it
 would have vectorised. `rmath` provides those functions as vector code, so the
 loop can vectorise.
 
+It implements them, rather than wrapping them: the crate does not link a
+single routine from the library it exists to replace, in either precision, on
+any input.
+
 ```rust
 use rmath::prelude::*;
 
@@ -28,17 +32,15 @@ f.eval_slice(&src, &mut out);       // widest vectors, scalar tail
 
 ## What is covered
 
-Around sixty functions, in six groups that differ in what they can promise.
+Around sixty functions, in four groups that differ in what they can promise.
 The distinction is not bookkeeping — it decides whether the default policy is
 faster than the call it replaces, so it is stated up front rather than buried.
 
 | group | functions | `BitExact` | `Fast` |
 |---|---|---|---|
 | **Exact** | `floor` `ceil` `round` `rint` `trunc` `copysign` `fmod` `remainder` `remquo` `modf` `frexp` `ldexp` `scalbn` `ilogb` `fdim` `fmin` `fmax` `nextafter` `sqrt` | vectorised, exact on every platform | same code |
-| **Correctly rounded** | `erf` `erfc` | vectorised; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
-| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `log1p` `hypot` `pow` `cbrt` `sinh` `cosh` `tanh` `asinh` `acosh` `atanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` | vectorised, replays the platform schedule | separate table-free vector path |
-| **Mixed** | `j0` `j1` `y0` `y1` | vectorised below \|x\| = 2, delegating above it | fully vectorised, 2.4x–3.1x |
-| **Delegating** | `jn` `yn` | one lane at a time: bit-exact, but only at parity | vectorised, measured ulp bound |
+| **Correctly rounded** | `erf` `erfc` `asinh` `acosh`, and in `f32` most of the library | vectorised where a kernel exists; the nearest representable value, on every platform | same arithmetic without the rounding test, below 0.51 ulp |
+| **Ported** | `exp` `exp2` `exp10` `expm1` `ln` `log2` `log10` `log1p` `hypot` `pow` `cbrt` `sinh` `cosh` `tanh` `asinh` `acosh` `atanh` `sin` `cos` `sincos` `tan` `atan` `atan2` `asin` `acos` `j0` `j1` `y0` `y1` `jn` `yn` | vectorised, replays the platform schedule | separate table-free vector path |
 | **Own** | `lgamma` `lgamma_r` `tgamma` | — | one implementation, <= 2 ulp measured bound |
 
 **Exact** needs no caveat. IEEE-754 pins those results down completely, so any
@@ -46,11 +48,13 @@ correct implementation is bit-identical, on any platform, forever; both policy
 axes are genuine no-ops.
 
 **Correctly rounded** is the strongest guarantee here, and stronger than
-"bit-exact" as the rest of this README uses the term. glibc computes `erf` and
-`erfc` with CORE-MATH's routines, which return the representable value
-*nearest the true result* for every input. That is a property of the answer,
+"bit-exact" as the rest of this README uses the term. glibc has been moving
+family by family onto CORE-MATH's routines, which return the representable
+value *nearest the true result* for every input — `erf` and `erfc` in double
+precision, along with `asinh` and `acosh`, and in single precision nearly
+everything that is not an exponential or a logarithm. That is a property of the answer,
 not of the route to it, so any two correctly-rounded implementations agree —
-which makes `BitExact` for this pair a claim about mathematics rather than
+which makes `BitExact` for these a claim about mathematics rather than
 about the host's `libm`. It is reached the way CORE-MATH reaches it: a
 double-double fast path with a proven error bound, a test asking whether the
 bound settles the last bit, and a scalar accurate path for the roughly one
@@ -71,8 +75,18 @@ lane-parallel rather than one lane at a time. `sincos` benefits most because
 it shares one argument reduction across both outputs, the same asymmetry the
 platform routine itself exploits. `tan`'s kernel keeps the family's six-band
 shape but adds the cotangent's compensated-division path, and hands `|x| >
-1e8` to the same `patch_lanes` repair as the other three; it measures **2.77x
-`BitExact`**, a step under `sin`/`cos`'s 3.0x for exactly that extra work.
+1e8` to the same `patch_lanes` repair as the other three.
+
+All four also *guard* their narrow bands rather than blending them. The tiny,
+polynomial and mid bands nest, so one `any()` decides whether any of the three
+is reachable at all, and a vector of large arguments — every asymptotic Bessel
+argument, most of any wide corpus — runs the table path alone instead of
+evaluating three more kernels and discarding them. Blending is still what
+happens *within* a mixed vector; the guard only skips work no lane wants. On
+the default corpus that took `sin` from 2.45x to **5.67x**, `cos` from 2.44x
+to **5.77x** and `sincos` from 2.75x to **6.90x**; on `--corpus=in-domain`,
+whose angles are small enough to sit inside the bands, it changes nothing
+either way (2.05x / 1.93x / 2.32x), which is the shape a guard should have.
 `asinh` (2.45x), `acosh` (1.01x-2.05x), `log1p` (2.57x-2.69x), and `atanh` (3.53x-3.69x)
 are fully vectorised.
 `asin`/`acos` are the pair this round rebuilt. Their table is really indexed by the
@@ -85,19 +99,31 @@ gather (`Simd::gather_run`) reads as two 512-bit loads instead of twelve scalar 
 `BitExact` went from **0.75x to 4.8-5.5x**, with no scalar repair left on any input;
 `Fast` delivers **9.2-10.1x**.
 
-**Mixed** is the order-0 and order-1 Bessel functions, and the split is forced
-by their shape. Below `|x| = 2` they are rational functions of `x^2` and
-vectorise completely. Above it they are `sqrt(2/(pi x))` times a combination of
-`sin x`, `cos x` and `cos 2x` — three delegated calls, where the scalar routine
-gets away with two by sharing one argument reduction. So under `BitExact` a
-vector with any lane at or above 2 is handed to the scalar routine: a
-"vectorised" version of that branch measures *slower* than the call it
-replaces, and shipping it would have been a loss dressed up as an
-optimisation. `Fast` vectorises both branches.
+**Ported** used to have two exceptions, and the reasons they stopped being
+exceptions are the two most interesting things in this crate's recent
+history. Both were the Bessel family.
 
-**Delegating** is the honest part. `jn` and `yn` choose between three algorithms on
-`n` against `x`, and one of them runs a continued fraction whose length is
-decided at run time, so there is no vector shape to give them.
+The first was `j0`/`j1`/`y0`/`y1`. Below `|x| = 2` they are rational functions
+of `x^2` and vectorise completely; above it they are `sqrt(2/(pi x))` times a
+combination of `sin x`, `cos x` and `cos 2x`, which is about ninety per cent
+of their cost. While glibc's `__sin`/`__cos` were only available here one lane
+at a time, vectorising that branch meant *three* scalar trigonometric calls
+per lane where the routine being replaced makes two, and it measured 0.8x. So
+`BitExact` handed any vector with a lane at or above 2 to the scalar routine
+and settled for parity — the honest answer at the time, and stale the moment
+the IBM Accurate Portable Math schedule was ported. The three calls are now
+one shared argument reduction and two kernel evaluations plus a second
+reduction for `cos 2x`, all packed: **3.8-4.0x** under the default policy,
+against 0.95-1.11x before.
+
+The second was `jn`/`yn`, which choose between three algorithms on `n` against
+`x`, one of them a continued fraction whose length is decided at run time. The
+standing argument was that a vector would have to run the longest lane's loop
+for every lane. That is true and it is not the objection it sounds like: the
+scalar routine runs the *sum* of the lanes' trip counts, so the longest is
+already the cheaper of the two. Each branch is a masked recurrence in which a
+finished lane freezes and the loop ends when all of them have — **3.0-4.7x**,
+bit-exact, where the README used to record parity.
 
 **Own** is the Gamma family. Rust has no `f64::tgamma`, so there is no call for
 `BitExact` to be bit-exact *to*; both policies run one vectorised
@@ -131,7 +157,8 @@ That is not ceremony; it earned its place twice:
   rounded once. That is the standard trick and it is *very nearly* right — it
   failed on 1 input in 4e9 for `log10f` and 2 for `sinhf`, where the `f64`
   result lands within its own error of an `f32` rounding boundary. Those
-  functions now delegate instead, which is both exact and faster.
+  functions run a native scalar `f32` port once per lane instead, which is
+  both exact and faster.
 
 ## The two questions it makes you answer
 
@@ -207,10 +234,10 @@ distribution.
 | `acosh` |  4.54 ns | **1.90x** | 2.01x | 7.50x | **8.32x** |
 | `atanh` |  3.88 ns | **3.54x** | 3.62x | 13.82x | **14.87x** |
 | `sqrt`  |  0.52 ns | 1.03x | 1.05x | 1.05x | 1.05x |
-| `sin`   | 13.58 ns | **2.07x** (2.97x def) | 2.07x | 16.67x | **16.83x** |
-| `cos`   | 14.20 ns | **1.78x** (3.01x def) | 1.84x | 15.40x | **15.56x** |
-| `sincos`| 17.97 ns | **2.45x** (3.59x def) | 2.51x | 17.61x | **19.03x** |
-| `tan`   | 16.86 ns | **2.51x** (2.77x def) | 2.55x | 18.02x | **18.93x** |
+| `sin`   | 13.58 ns | **2.05x** (5.67x def) | 2.12x | 16.99x | **17.07x** |
+| `cos`   | 14.20 ns | **1.93x** (5.77x def) | 1.85x | 15.41x | **15.22x** |
+| `sincos`| 17.97 ns | **2.32x** (6.90x def) | 2.36x | 16.03x | **18.09x** |
+| `tan`   | 16.86 ns | **2.34x** (2.89x def) | 2.47x | 17.60x | **18.47x** |
 | `atan`  |  7.05 ns | **1.92x** (8.52x coh) | 1.87x | 11.64x | **13.48x** |
 | `atan2` | 14.98 ns | **1.58x** (2.74-3.03x def) | — | 12.40x | — |
 | `asin`  | 13.39 ns | **5.49x** | 5.47x | 9.23x | **9.84x** |
@@ -236,12 +263,11 @@ read a row at a time, the same schedule is **4.8-5.5x** (see `ROADMAP.md`'s Cycl
 rows deliver 9.2-10.1x.
 `log10` reuses `ln`'s exact table walk. `log1p` replays `__log1p_fma` lane-parallel with vectorised reduction and Horner FMA tail, `asinh`/`acosh`/`atanh` evaluate vectorised band structures with `V::select` blending, and `hypot` replays Borges "MyHypot3" compensated correction with unfused vector arithmetic.
 
-### Delegating — parity by default, and a large win under `Fast`
+### Gamma
 
-| function | scalar | `BitExact` | `Fast` | + `Finite` |
-|---|--:|--:|--:|--:|
-| `jn`/`yn` | 38.0 ns | 0.95-1.11x | 1.80-2.55x | 1.77-2.56x |
-| `lgamma`| 32.56 ns | **4.37x** (no second policy) | | |
+| function | scalar | `rmath` |
+|---|--:|--:|
+| `lgamma`| 32.56 ns | **4.37x** (no second policy) |
 
 
 ### Special functions — bit-exact *and* several times faster
@@ -259,19 +285,46 @@ time.
 | `erfc`  | 60.59 ns | **3.98x** | 4.14x | 4.32x | **4.29x** |
 | `exp10` |  2.21 ns | **1.88x** | 2.13x | 3.29x | **3.58x** |
 
-### Bessel — parity by default, 2.4x to 3.1x under `Fast`
+### Bessel — four times the platform, bit for bit
 
-| function | scalar | `BitExact` | `Fast` | + `Finite` |
-|---|--:|--:|--:|--:|
-| `j0` | 37.89 ns | 0.95x | 3.07x | **3.19x** |
-| `j1` | 37.84 ns | 0.95x | 3.05x | **3.00x** |
-| `y0` | 38.02 ns | **1.10x** | 2.45x | 2.44x |
-| `y1` | 37.79 ns | **1.11x** | 2.35x | **2.40x** |
+| function | scalar | `BitExact` | + `Finite` | `Fast` | + `Finite` |
+|---|--:|--:|--:|--:|--:|
+| `j0` | 35.40 ns | **4.00x** | 4.18x | 6.73x | **7.17x** |
+| `j1` | 35.48 ns | **3.98x** | 4.13x | 6.80x | **7.15x** |
+| `y0` | 35.64 ns | **3.78x** | 3.97x | 6.55x | **7.09x** |
+| `y1` | 35.35 ns | **3.78x** | 3.97x | 6.58x | **7.04x** |
+| `jn` (one order per buffer) | 71.34 ns | **3.45x** | | 4.26x | |
+| `jn` (order varying per lane) | 71.00 ns | **3.02x** | | 3.70x | |
+| `yn` (one order per buffer) | 66.54 ns | **4.68x** | | 6.45x | |
+| `yn` (order varying per lane) | 66.24 ns | **3.98x** | | 5.25x | |
 
-The `BitExact` column is the point of the design rather than a disappointment:
-it is what an honest vectorisation of a function whose cost is delegated
-trigonometry looks like. `Fast` replaces that trigonometry with rmath's own
-and the vector reappears.
+The `BitExact` column read 0.95-1.11x until the trigonometric family was
+ported, and the honest description of it then was "what an honest
+vectorisation of a function whose cost is delegated trigonometry looks like".
+That was true of the code and false of the problem: the cost was delegated
+because the schedule had not been read out yet, not because it could not be.
+
+Three things carry the current number. The three trigonometric calls share one
+argument reduction and two kernel evaluations
+(`trig::sincos_split`, which replays `__sin` and `__cos` rather than
+`__sincos` — they are not the same computation and fdlibm's Bessel routines
+are bit-exact against the separate pair). The four-row `P`/`Q` coefficient
+table is a three-`select` blend ladder rather than a twenty-three-slot
+per-lane gather. And each of the two branches hands the lanes it is *not*
+answering for a stand-in argument, so a mixed vector does not open the
+trigonometry's narrow bands — or, worse, send `y0`'s nested `j0` down its own
+asymptotic branch — for an answer that is about to be discarded.
+
+`jn` and `yn` are masked recurrences over the same `j0`/`j1` and `y0`/`y1`,
+computed as a *pair* so the order-0 and order-1 evaluations share their
+trigonometry too. Their two rows are the same code on two corpora: one order
+across the whole buffer, and a different order in every lane. The gap between
+them is the cost of running each lane's loop to the longest lane's trip count,
+which is the price of the design and still well inside the scalar routine's
+sum-of-all-lanes.
+
+The `Fast` gains came along for free — the same structural work, with rmath's
+own trigonometry underneath.
 
 ### Single precision
 
@@ -293,11 +346,12 @@ and the vector reappears.
 
 Several of those deserve comment rather than burial:
 
-- **The delegating column is 1.00x on purpose.** Those kernels run the
-  platform's own scalar routine once per lane, so parity is the ceiling, and
-  the small shortfall on some rows is the cost of packing and unpacking the
-  lane array around it. If you want those functions vectorised, that is what
-  `Fast` is for — and it is a 4x to 22x difference, not a rounding one.
+- **The 1.00x column is 1.00x on purpose.** Those kernels run a *scalar*
+  routine once per lane — this crate's own, not the platform's, since nothing
+  here calls `libm` any more — so parity is the ceiling, and the small
+  shortfall on some rows is the cost of packing and unpacking the lane array
+  around it. If you want those functions vectorised, that is what `Fast` is
+  for — and it is a 4x to 22x difference, not a rounding one.
 - **`sqrt` gains nothing**, and cannot. IEEE-754 *requires* square root to be
   correctly rounded, every target here has one instruction that does it, and
   glibc lowers `sqrt` to that same instruction — so there is no schedule to
@@ -321,7 +375,8 @@ Several of those deserve comment rather than burial:
 - **`cbrtf` and `tanhf` sit just under parity under `BitExact`.** Their
   single-precision routines are cheap enough that widening into the
   double-precision kernel costs more than it saves, so the bit-exact path
-  delegates; see `src/kernels/single/`. Both have native `Fast` paths instead
+  walks the lanes over the scalar `f32` port instead; see
+  `src/kernels/single/`. Both have native `Fast` paths instead
   of the widened one: `cbrtf`'s is a bit-pattern seed and three Newton steps,
   within 1 ulp; `tanhf`'s is a direct polynomial below `|x| = 1` and
   `1 - 2/(e^{2x}+1)` above it (via the native `f32` `exp2`), within 2 ulp,
@@ -428,7 +483,7 @@ Four properties fall out of that split:
 3. Add one `math_fn!` block to `src/function_defs.rs` and re-export from
    `src/lib.rs`.
 4. Add the corpus and the assertion: `tests/bit_exact.rs` for a port,
-   `tests/delegating.rs` for a delegating kernel, `tests/accuracy.rs` for the
+   `tests/delegating.rs` for a scalar-loop kernel, `tests/accuracy.rs` for the
    `Fast` bound, `tests/single.rs` for `f32`, `tests/glibc.rs` if `std` has no
    method to compare against.
 
@@ -437,7 +492,7 @@ Four properties fall out of that split:
 | file | what it establishes |
 |---|---|
 | `tests/bit_exact.rs` | the ported kernels match the platform, at every width, over millions of inputs |
-| `tests/delegating.rs` | `BitExact` really is bit-exact for the delegating kernels too — a kernel that quietly took its `Fast` path would still look fine to an accuracy test |
+| `tests/delegating.rs` | `BitExact` really is bit-exact for the kernels that walk the lanes rather than replaying a schedule — one that quietly took its `Fast` path would still look fine to an accuracy test |
 | `tests/single.rs` | every `f32` function against the platform; `--ignored` runs all 2^32 inputs per function |
 | `tests/accuracy.rs` | the `Fast` ulp bounds this file quotes, so loosening one fails the build |
 | `tests/glibc.rs` | the functions `std` has no method for — `erf`, `erfc`, the Bessel family, `exp10`, `remquo`, `modf`, `ilogb`, `fdim`, `fmin`, `fmax`, `rint`, `scalbn`, `lgamma_r` — against the platform `libm` through `extern "C"`, at every width; `--ignored` runs all 2^32 `f32` inputs |
@@ -450,17 +505,19 @@ cargo test --release -- --ignored     # the exhaustive f32 sweeps, ~90 s
 
 ## Status
 
-Covered: the exact, correctly-rounded, ported, mixed, delegating and Gamma
-groups listed at the top — around sixty functions, in both precisions.
+Covered: the exact, correctly-rounded, ported and Gamma groups listed at the
+top — around sixty functions, in both precisions.
+
+**The crate no longer links `libm` at all.** Not in `f64`, not in `f32`, not
+on any input: every reference is this crate's own port, and the compiled rlib
+carries no undefined libm symbol. The only things it still takes from outside
+`core` are `mul_add` and `sqrt`, which are IEEE-754 arithmetic rather than
+library functions. In `f64` every `BitExact` path is additionally a genuine
+vector schedule, the Bessel family included; in `f32` several are still a
+scalar loop over the port, which is a speed gap and not a provenance one.
 
 Known limitations, in rough order of how much they would be missed:
 
-- **Sixteen functions are delegating, not ported.** Their `BitExact` path is
-  correct but not fast. The trigonometric family is what is most worth porting
-  next, and it is the largest remaining job: glibc uses the IBM Accurate
-  Portable Math Library routines there, with a 440-entry table and a separate
-  reduction for huge arguments. `log10` is a smaller one — it is not the
-  fdlibm composition on `log`, so it needs its own schedule read out.
 - **`lgamma` on the negative half-line** is a difference of comparable terms
   near its zeros, where relative error is unbounded for any implementation. The
   bound there is stated as absolute (below 1e-12), not relative.
@@ -479,13 +536,23 @@ Known limitations, in rough order of how much they would be missed:
   the scalar call it replaces. `Fast` widens to the double-precision vector
   kernel, which is both faster and — since glibc's own bound for `j0f` is 9
   ulps — more accurate, just not identical.
-- **`jn` and `yn` are scalar under both policies.** The backward recurrence
-  runs a continued fraction whose length is decided at run time by iterating
-  until a convergent exceeds `1e9`; a vector would run the longest lane's loop
-  for every lane.
+- **The `f64` Bessel family's vector path stops at `|x| = 52707175`.** That is
+  the trigonometry's limit, not theirs: above it `sin`/`cos` need glibc's
+  `__branred` Payne-Hanek reduction, which the scalar reference reproduces but
+  the vector kernel does not. Under `FullRange` such a lane goes to the scalar
+  reference, which is the same three scalar trigonometric calls the repair
+  would have made and none of the vector work around them; under `Finite` the caller has vouched for the bound and
+  gets a wrong number if they were wrong. `jn`/`yn` additionally take the
+  vector path only for `|n| <= 2^24`, past which fdlibm's own `int` arithmetic
+  is what the reference reproduces and the recurrence is sixteen million steps
+  long however it is spelled.
 - **Requires `std`**, for exactly two operations: `mul_add` and `sqrt`, neither
-  of which is in `core`. Supporting `no_std` needs a correctly-rounded software
-  FMA — evaluating `a * b + c` instead would break every guarantee above.
+  of which is in `core`. Both are IEEE-754 *arithmetic* rather than library
+  functions, and neither reaches `libm.so` in practice — `sqrt` lowers to one
+  instruction and `mul_add` resolves against `compiler-builtins`. Supporting
+  `no_std` needs a correctly-rounded software FMA: evaluating `a * b + c`
+  instead would break every guarantee above, since half the schedules here
+  turn on exactly which multiplies fuse.
 - **Bit-exactness is verified on x86-64 + glibc.** The test suite is the
   arbiter on any other platform, and is designed to fail rather than mislead.
 
@@ -497,9 +564,18 @@ single-precision counterparts are ported from
 (MIT OR Apache-2.0 WITH LLVM-exception), the same code glibc uses; `cbrt` is
 ported from [`libm`](https://github.com/rust-lang/compiler-builtins) (MIT),
 itself a port of core-math's `cbrt.c`, Copyright (c) 2021-2022 Alexei Sibidanov.
-`erf` and `erfc` are ported from glibc's copies of the
+`erf`, `erfc`, `asinh` and `acosh`, together with most of the
+single-precision library — `tanf`, `asinf`, `acosf`, `atanf`, `atan2f`, the
+hyperbolic family, `expm1f`, `log1pf`, `log10f`, `cbrtf` — are ported from
+glibc's copies of the
 [CORE-MATH](https://core-math.gitlabpages.inria.fr/) routines, Copyright (c)
 2022-2025 Alexei Sibidanov, Paul Zimmermann, Tom Hubrecht and Claude-Pierre
 Jeannerod (MIT); the Bessel family from glibc's fdlibm, Copyright (c) 1993 Sun
-Microsystems, Inc. The `Fast` coefficients are this crate's own, generated by
+Microsystems, Inc.; and `sinf`, `cosf`, `sincosf` again from ARM
+optimized-routines. The double-precision trigonometric and
+inverse-trigonometric families, including `__branred`'s Payne-Hanek reduction,
+follow glibc's own IBM Accurate Mathematical Library sources, Copyright (C)
+2001-2026 Free Software Foundation, Inc., `LGPL-2.1-or-later` — see the
+per-table headers in `src/tables/double/` for exactly which constants that
+covers. The `Fast` coefficients are this crate's own, generated by
 `tools/gen_poly.py`.

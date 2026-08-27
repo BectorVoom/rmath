@@ -28,6 +28,14 @@ use rmath::prelude::*;
 use std::time::Instant;
 
 /// The platform's own routines, for the functions `std` does not expose.
+///
+/// This is a *baseline*, not a dependency: every row this benchmark prints is
+/// "rmath against the platform", so the platform has to be callable here or
+/// there is nothing to measure. The crate itself no longer links a single
+/// libm routine — see `src/reference` — and neither does the corpus
+/// generation below, which builds its log-uniform magnitudes out of
+/// `rmath::reference::{ln, exp}` rather than `f64::ln` / `f64::exp` so that
+/// the only calls crossing into `libm.so` are the ones being timed.
 mod libm {
     unsafe extern "C" {
         pub safe fn erf(x: f64) -> f64;
@@ -37,6 +45,8 @@ mod libm {
         pub safe fn j1(x: f64) -> f64;
         pub safe fn y0(x: f64) -> f64;
         pub safe fn y1(x: f64) -> f64;
+        pub safe fn jn(n: i32, x: f64) -> f64;
+        pub safe fn yn(n: i32, x: f64) -> f64;
         pub safe fn erff(x: f32) -> f32;
         pub safe fn erfcf(x: f32) -> f32;
         pub safe fn exp10f(x: f32) -> f32;
@@ -349,9 +359,11 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
                     .collect(),
                 posargs: (0..n)
                     .map(|i| {
-                        ((1e-12f64).ln()
-                            + ((1e12f64).ln() - (1e-12f64).ln()) * (i as f64 / n.max(1) as f64))
-                            .exp()
+                        rmath::reference::exp(
+                            rmath::reference::ln(1e-12)
+                                + (rmath::reference::ln(1e12) - rmath::reference::ln(1e-12))
+                                    * (i as f64 / n.max(1) as f64),
+                        )
                     })
                     .collect(),
                 angargs: (0..n)
@@ -420,7 +432,11 @@ fn generate_corpora(profile: &str, n: usize) -> Corpora {
             // Default
             expargs: (0..n).map(|_| rng.uniform(-40.0, 40.0)).collect(),
             posargs: (0..n)
-                .map(|_| rng.uniform((1e-12f64).ln(), (1e12f64).ln()).exp())
+                .map(|_| {
+                    rmath::reference::exp(
+                        rng.uniform(rmath::reference::ln(1e-12), rmath::reference::ln(1e12)),
+                    )
+                })
                 .collect(),
             angargs: (0..n).map(|_| rng.uniform(-1e4, 1e4)).collect(),
             unitargs: (0..n).map(|_| rng.uniform(-1.0, 1.0)).collect(),
@@ -561,6 +577,52 @@ fn main() {
             Hypot::builder().accuracy(Fast).domain(FullRange).build(),
         );
 
+        // `jn`/`yn` carry the order in a float lane, so they go through the
+        // two-argument harness. Two corpora each: one order across the whole
+        // buffer, which is what a caller sweeping `x` at fixed `n` does and
+        // what the masked recurrences are shaped for, and a mixed one, where
+        // every lane's loop has a different trip count and the vector pays
+        // the longest of them.
+        let mut nrng = Rng(0x2545_F491_4F6C_DD1E);
+        let fixed_order: Vec<f64> = vec![5.0; n];
+        let mixed_order: Vec<f64> = (0..n).map(|_| nrng.uniform(0.0, 10.0).floor()).collect();
+        binary(
+            "jn (n=5)",
+            &fixed_order,
+            &corpora.besselargs,
+            &mut dst,
+            |n, x| libm::jn(n as i32, x),
+            Jn::new(),
+            Jn::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+        binary(
+            "jn (mixed)",
+            &mixed_order,
+            &corpora.besselargs,
+            &mut dst,
+            |n, x| libm::jn(n as i32, x),
+            Jn::new(),
+            Jn::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+        binary(
+            "yn (n=5)",
+            &fixed_order,
+            &corpora.besselargs,
+            &mut dst,
+            |n, x| libm::yn(n as i32, x),
+            Yn::new(),
+            Yn::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+        binary(
+            "yn (mixed)",
+            &mixed_order,
+            &corpora.besselargs,
+            &mut dst,
+            |n, x| libm::yn(n as i32, x),
+            Yn::new(),
+            Yn::builder().accuracy(Fast).domain(FullRange).build(),
+        );
+
         println!("\n{:<10} {:>10} {:>9}", "function", "libm ns", "rmath");
         println!("{}", "-".repeat(32));
         gamma("lgamma", &corpora.hypargs, &mut dst);
@@ -675,7 +737,11 @@ fn single_precision(n: usize) {
     let mut rng = Rng(0xB5AD_4ECE_DA10_80CC);
     let e: Vec<f32> = (0..n).map(|_| rng.uniform(-40.0, 40.0) as f32).collect();
     let p: Vec<f32> = (0..n)
-        .map(|_| rng.uniform((1e-12f64).ln(), (1e12f64).ln()).exp() as f32)
+        .map(|_| {
+            rmath::reference::exp(
+                rng.uniform(rmath::reference::ln(1e-12), rmath::reference::ln(1e12)),
+            ) as f32
+        })
         .collect();
     let mut d = vec![0.0f32; n];
 

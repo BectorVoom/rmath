@@ -8,7 +8,64 @@ or the ulp methodology of `tests/accuracy.rs`.
 
 ## 1. Where we stand
 
-The round of work just completed closed four gaps:
+### The libm dependency is gone
+
+The round of work most recently completed removed the last call from `src/`
+into the platform's `libm`. Every scalar reference is now this crate's own
+port, in both precisions, and the compiled rlib carries no undefined libm
+symbol at all. What was ported to get there:
+
+- **`__branred`** (`sysdeps/ieee754/dbl-64/branred.c`), the Payne-Hanek
+  reduction `sin`/`cos`/`sincos`/`tan` reach for past `|x| = 105414350`. It is
+  deliberately unfused — `branred.c` is its own translation unit and glibc
+  does not build it with `-mfma`, which the disassembly confirms. Verified over
+  400M inputs in the affected bands, zero mismatches.
+- **`log2`, `log10`** as scalar references. `log10`'s negative-argument NaN
+  comes from the SVID compatibility wrapper, *not* from `__ieee754_log10` —
+  `log10` still has only the wrapped `log10@@GLIBC_2.2.5` to link against,
+  where `log2`'s wrapper was left behind at `log2@GLIBC_2.2.5` when
+  `versioned_symbol` promoted the bare `__log2` at `GLIBC_2.29`. The two
+  therefore return oppositely-signed NaNs for a negative argument, which a
+  port that assumed symmetry would get wrong.
+- **`asinh`, `acosh`** (`f64`), including CORE-MATH's triple-double refinement
+  and its exception tables. Verified over 480M inputs.
+- **The whole `f32` library**: `sinf`, `cosf`, `sincosf`, `tanf`, `asinf`,
+  `acosf`, `atanf`, `atan2f`, `sinhf`, `coshf`, `tanhf`, `asinhf`, `acoshf`,
+  `log10f`, `log1pf`, `expm1f`, `cbrtf`, `hypotf`, `powf`. Every
+  one-argument function was verified **exhaustively** — all 2^32 bit patterns,
+  not a sample. `powf` and `atan2f` have a 2^64 domain and were checked over
+  400M structured random pairs instead.
+- **The Bessel references' trigonometry**, in both precisions, rewired onto
+  the crate's own `sincos`/`cos`. The distinction matters: glibc's Bessel
+  sources call `__sincos (x, &s, &c)`, which is not the same computation as
+  `sin(x)` and `cos(x)` evaluated separately, and `2 <= x < 2.426265` is
+  exactly the band where the two can differ.
+
+Two findings worth recording, because both would have made the crate quietly
+wrong:
+
+- **`f32::atanh` is not a libm call.** Rust evaluates
+  `0.5 * ln_1p(2x / (1 - x))` itself, and that disagrees with glibc's
+  correctly-rounded `atanhf` on roughly one input in ten. rmath's promise is
+  about the call the caller was already making, so `reference::single::atanh`
+  reproduces Rust's composition — over this crate's own `log1p`, which is
+  bit-exact to `log1pf`, so nothing crosses into `libm.so`.
+  `reference::double::atanh` already made the same choice.
+- **`0.0 / 0.0` folds to the wrong NaN.** Rust constant-folds it to a
+  *positive* quiet NaN; x86's `divss`/`divsd` produce the sign-set "real
+  indefinite". Several CORE-MATH routines spell their invalid-argument result
+  as `(x - x) / (x - x)` on a constant, so those need an optimisation barrier
+  to reproduce the platform's sign.
+
+What is *not* affected: `tests/` and `examples/bench.rs` still call the
+platform through `extern "C"`, and must — they are the comparison baseline the
+whole guarantee is measured against. `examples/bench.rs`'s corpus generation
+was moved off `f64::ln`/`f64::exp` so that the only calls crossing into
+`libm.so` there are the ones being timed.
+
+### The round before that
+
+The round before closed four gaps:
 
 - `tan` `BitExact` stopped delegating: **0.98x → 2.77x**, bit-exact (the
   last member of the A1 trigonometric family, see §6a).
@@ -32,6 +89,8 @@ What remains, grouped by what it costs the user today:
 | `Fast` `pow` floor is `Fast` `exp2`'s ~2 ulp | pow ≤4 measured | ~1 ulp if `exp2`'s fast path is tightened |
 | `tgamma` above 18 | done: <= 2 ulp (1 ulp near overflow) | — |
 | `f32` `Fast` kernels that widen to `f64` | `tanhf` 2.20x, `erff` 1.57x, `sinf` via f64 | native f32 arithmetic is 2–4x cheaper |
+| Bessel `BitExact` — `j0`/`j1`/`y0`/`y1` ported **and** vectorised, `jn`/`yn` as masked recurrences (Cycle 7 in §6a) | done: **4.00x / 3.98x / 3.78x / 3.78x**, `jn`/`yn` **3.02-4.68x** (both rows read 0.95-1.11x before) | — |
+| `f32` Bessel `BitExact` | scalar loop over the crate's own port, ~1.00x | open: needs glibc's 64-polynomial repair and a 192-bit Payne-Hanek branch |
 
 ## 2. Constraints that shape every change
 
@@ -60,8 +119,11 @@ These are the crate's contracts; the plan treats them as hard.
 
 ## 3. Workstream A — `BitExact` throughput
 
-The delegating rows are the largest remaining value: `BitExact` is the default
-policy, and sixteen functions currently gain nothing under it.
+The scalar-loop rows are the largest remaining value: `BitExact` is the default
+policy, and the functions that walk their lanes gain nothing under it. Note
+that this is now purely a *speed* gap — since the libm removal above, those
+rows run this crate's own port once per lane rather than the platform's
+routine, so what is missing is a lane-parallel schedule replay, not a port.
 
 ### A1. Trigonometric family port (`sin`, `cos`, `sincos`, `tan`) — **all four done**
 
@@ -1373,6 +1435,132 @@ widening whenever the f64 kernel does more than the f32 result needs.
   adds for `sqrt` is composition: a `sqrt` inside a loop that also calls `exp`
   vectorises with it instead of blocking the loop.
 
+- **Cycle 7 done: the Bessel family `BitExact` — the last two "there is no
+  vector shape for this" rows, both wrong.** `j0`/`j1`/`y0`/`y1` read
+  0.95-1.11x and `jn`/`yn` read 0.95-1.11x; they now read **4.00x / 3.98x /
+  3.78x / 3.78x** and **3.02-4.68x**, bit-exact, on the default corpus at 1M
+  elements. Two separate stale conclusions, with two different kinds of
+  mistake behind them.
+
+  **1. `j0`/`j1`/`y0`/`y1`: a conclusion that expired.** `bessel.rs::branch`
+  handed any vector with a lane at or above 2 to the scalar routine, on
+  reasoning that was correct when it was written and had been false since A1
+  landed: *"the three trigonometric calls run one lane at a time — glibc
+  computes them with the IBM Accurate Portable Math routines, which this crate
+  does not reproduce"*. A1 reproduced them. Nothing re-read `bessel.rs`
+  afterwards, so a 4x sat behind a comment describing a world that no longer
+  existed. The lesson is not about Bessel functions: **when a port lands, grep
+  for the modules whose documented reason for giving up was that the port did
+  not exist.**
+
+  Removing the bail-out is where it starts, not where it ends. Four further
+  changes, each measured on its own:
+
+  1. **`trig::sincos_split`** — `(sin x, cos x)` bit-identical to the
+     *separate* `__sin` and `__cos`, which is not what `__sincos` computes
+     (glibc's third entry point negates `(a, da)` for two of the four
+     quadrants and recovers the signs afterwards). fdlibm's Bessel routines
+     are bit-exact against the separate pair, so `sincos` could not be
+     borrowed — but the two share one `reduce_sincos` and each of them already
+     evaluates *both* `do_sin(a, da)` and `do_cos(a, da)`, differing only in
+     which the quadrant selects. Run separately that is two reductions and
+     four kernel evaluations; fused it is one and two, for identical bits.
+
+  2. **Guarded bands instead of blended ones**, in `bit_exact::sin`, `cos`,
+     `sincos` and `sin_cos_split`. The tiny/poly/mid bands nest, so one
+     `any()` decides whether any of the three is reachable and a vector of
+     large arguments runs the table path alone. This was measured as a
+     *trigonometry* change as well as a Bessel one: `sin` 2.45x → **5.67x**,
+     `cos` 2.44x → **5.77x**, `sincos` 2.75x → **6.90x** on the default
+     corpus, and unchanged (2.05x / 1.93x / 2.32x) on `--corpus=in-domain`,
+     whose angles sit inside the bands. A guard that helps everywhere would
+     have been a sign the measurement was wrong.
+
+  3. **Stand-in arguments for the discarded lanes.** A mixed vector runs both
+     branches. A lane below 2 sitting inside the asymptotic branch opens the
+     trigonometry's narrow bands for the whole vector; a lane above 2 sitting
+     inside the *series* branch is worse, because `y0`/`y1`'s series nests a
+     whole `j0`/`j1` which then takes its own asymptotic branch and evaluates
+     the trigonometry a second time. They are handed `+-4` and `+-1`
+     respectively. `y0` 3.08x → **3.58x**, `y1` 3.03x → **3.54x**, and `yn`
+     3.88x → 4.60x from the same change.
+
+  4. **A blend ladder for `P`/`Q`, not a gather.** Four coefficient rows
+     chosen by interval; `pq0`/`pq1` want twenty-three coefficients between
+     them, which the per-lane gather read as twenty-three loads *and*
+     twenty-three inserts per lane. Three `select`s against four broadcast
+     constants, loop-invariant and folding into the blend as memory operands,
+     replaces forty-six scalar operations per element with three packed ones
+     per coefficient per vector. (Contrast Cycle 6's `asin`: there the answer
+     was a better-shaped gather, because there were 187 rows. With four rows
+     there is nothing to gather.)
+
+  **2. `jn`/`yn`: an argument that was true and did not imply its
+  conclusion.** The standing reason was *"the backward recurrence runs a
+  continued fraction whose length is decided at run time; a vector would run
+  the longest lane's loop for every lane."* Both clauses are true. The
+  inference is not, because the comparison is against a scalar routine that
+  runs the **sum** of the lanes' trip counts, and `max <= sum` always. The
+  vector is never asymptotically worse and is eight times better on the
+  ordinary case of one order swept across a buffer.
+
+  All three of `jn`'s branches are masked recurrences — forward from `j0`/`j1`,
+  the leading Taylor term, and the backward recurrence with its continued
+  fraction, its downward pass and the renormalising variant of that pass that
+  fdlibm splits out on `n ln(2n/x)` against `ln(DBL_MAX)`. Two details do the
+  work: a lane whose loop has finished **freezes under a mask** and the loop
+  ends when every lane has (so a lane that reaches `-inf` early, which is
+  `yn`'s whole reason for having an early exit, costs nothing after it stops),
+  and **each lane carries its own counter** — `i`, `iv`, `di` are vectors, not
+  splats — so every lane's step 0 is its own first step and the trip count is
+  `max(k)` rather than the span of the lanes' ranges. Order-0 and order-1 are
+  evaluated as a *pair* (`j01`, `y01`) so they share the trigonometry, the
+  `sqrt`, and in `y01`'s case the logarithm and the nested `j0`/`j1` as well:
+  `jn` 2.70x → 3.38x and `yn` 2.66x → 3.88x from that alone.
+
+  **3. Where the vector stops, and who decides.** The asymptotic branch wants
+  `sin x`, `cos x` *and* `cos 2x`, so its real bound is
+  `trig::safe_limit::<A>() / 2` — 52707175 under `BitExact`. It used to be
+  discovered three times per lane, by three separate `patch_lanes` each
+  repairing one third of an answer the caller then discarded. Hoisting it into
+  the Bessel kernels' own `special` mask lets the trigonometry run under
+  `Finite` (no lane that survives to be read is out of range) and makes a
+  repaired lane cost exactly one `reference::j0` — the same three scalar
+  trigonometric calls, without the vector work around them. On
+  `--corpus=random-bit` it took `y0` from 0.39x to 0.93x and `yn` from 0.51x
+  to 1.00x on its own, and to **1.04x** and **1.05x** with (4) below. It
+  narrows what `Finite` promises for the six functions, which
+  `function_defs.rs` now states.
+
+  **4. A density bail-out, calibrated rather than assumed.**
+  `kernels::mostly_repaired` sends the whole vector to `map_lanes` when fewer
+  than half the lanes survive. The napkin says `LANES / speedup`; the napkin is
+  wrong in two ways that point the same direction (a repaired lane is a scalar
+  call *plus* an extract and an insert, and the lanes needing repair are
+  exactly the ones whose scalar call is the expensive kind). Measured both:
+  at `LANES / 3` the Bessel `FullRange` rows read 0.65-0.93x on
+  `--corpus=random-bit` and 0.77-1.00x on `--corpus=boundary`; at `LANES / 2`
+  they read 0.69-1.05x and 0.79-1.18x, and the corpora with no repair are
+  unchanged either way. Against the pre-Cycle-7 baseline manifest that is a
+  gain on every row but `j0` on `random-bit` (0.73x → 0.69x), which is the one
+  place uniformly random 64-bit patterns beat a real distribution and is
+  recorded as such rather than smoothed over. `y0`/`y1` there went 0.91x/0.93x
+  → **1.04x**, and on `--corpus=boundary` 0.86x/0.81x → **1.10x/1.07x**.
+
+  **Verification.** `j0`/`j1`/`y0`/`y1`/`jn`/`yn` moved into
+  `tests/bit_exact.rs` with two new corpora: `corpus_bessel` (the `2.0` split
+  and both rational-fit ladders, plus every band `__sin`/`__cos` branch on
+  *and each of those halved*, since `cos(x + x)` reaches them at half the
+  argument) and `corpus_jn_yn`, which is built as `(n, x)` **pairs** naming
+  the branch each is there to reach and then shuffled, so that a vector of
+  `LANES` consecutive pairs straddles branches, orders and signs at once. Both
+  run at 1, 2, 4 and 8 lanes. `y0`/`y1`/`yn` compare NaN-agnostically, which
+  is the contract `tests/glibc.rs::same64` has always used and which the
+  scalar references have always needed: `0.0 / (0.0 * x)` is a negative quiet
+  NaN on x86-64 where glibc's constant-folded `(x - x) / (x - x)` is a
+  positive one. `scan_single_precision_exhaustive` re-run: `j0f`/`j1f` `Fast`
+  still 9 ulp over 1.17B inputs each, unchanged.
+
 ## 7. Suggested sequencing
 
 Ordered by value density; each phase is independently shippable and ends with
@@ -1475,6 +1663,14 @@ done and its negative verdict is recorded in §3 — see §10 for what remains.
    along the way (`exp`/`exp2`/`exp10`f's native `Fast` paths returning `+-inf`
    or 0 instead of a correct subnormal result, and a coefficient-splitting bug
    in `tools/gen_poly.py` that rounded to `f64` instead of `f32`).
-5. **`jn`/`yn` and f32 Bessel `BitExact`:** the README's reasons for leaving
-   them scalar remain valid; this plan proposes no work there unless a use
-   case surfaces.
+5. ~~**`jn`/`yn` and f32 Bessel `BitExact`:**~~ — **split: `jn`/`yn` done, f32
+   Bessel still open.** "The README's reasons for leaving them scalar remain
+   valid" was half right and is worth keeping as a record of how a stale
+   decision survives. For `jn`/`yn` the reason was an inference that does not
+   follow (`max <= sum`, see Cycle 7 in §6a); for `j0`/`j1`/`y0`/`y1` — which
+   this item did not even list, because the README called them "Mixed" and
+   settled — the reason had simply expired when A1 landed. Both are done:
+   **3.0-4.7x** and **3.8-4.0x**. The f32 Bessel reason is the one that still
+   holds: glibc's `float` routines are a different algorithm with a
+   post-hoc repair decided *after* the rational fit, and one of its three
+   branches is a 192-bit Payne-Hanek reduction.

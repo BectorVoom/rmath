@@ -1,9 +1,12 @@
 //! Sine, cosine and tangent, single precision.
 //!
-//! `BitExact` delegates to the platform's routines, one lane at a time:
-//! `sinf`/`cosf` are not correctly rounded on this platform, so there is no
-//! stronger claim than parity to make, and widening into the double-precision
-//! kernel would cost the round trip for nothing extra.
+//! `BitExact` runs [`crate::reference::single::trig`] one lane at a time —
+//! this crate's own port of `sinf`/`cosf`/`sincosf`/`tanf`, not the platform
+//! call it used to make. There is no vector schedule replay here yet:
+//! `sinf`/`cosf` are not correctly rounded on this platform, so parity is the
+//! strongest claim available, and widening into the double-precision kernel
+//! would cost the round trip for nothing extra. The scalar loop costs what
+//! the delegation did; what changed is that nothing crosses into `libm.so`.
 //!
 //! `Fast` is native — the same shape as [`crate::kernels::double::trig`]'s,
 //! at `f32` precision throughout: Cody-Waite reduction against a three-part

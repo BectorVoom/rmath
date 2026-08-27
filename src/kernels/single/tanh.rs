@@ -1,8 +1,11 @@
 //! Hyperbolic tangent, single precision.
 //!
-//! `BitExact` delegates to the platform's `tanhf`, exactly as before this
-//! kernel existed: widening into the double-precision `tanh` kernel measured
-//! at 0.24x, so parity is the honest ceiling. `Fast` is native, in two bands:
+//! `BitExact` runs [`crate::reference::single::hyper::tanh`] one lane at a
+//! time — this crate's own port of CORE-MATH's correctly-rounded `tanhf`.
+//! Widening into the double-precision `tanh` kernel measured at 0.24x, so a
+//! scalar loop is the honest ceiling; it costs what delegating to the
+//! platform did, minus the call into `libm.so`. `Fast` is native, in two
+//! bands:
 //!
 //! * `|x| <= 1` — `tanh(x) = x * P(x²)`, a direct minimax fit
 //!   (`tables::single::poly::TANH`). No cancellation to route around here:

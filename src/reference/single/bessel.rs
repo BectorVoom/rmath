@@ -26,6 +26,7 @@
 //! matching them means reproducing the schedule exactly, as everywhere else in
 //! this crate.
 
+use super::trig;
 use crate::tables::single::bessel as t;
 
 /// `pi` in `f32`, glibc's `M_PIf`.
@@ -72,7 +73,7 @@ const PI_OVER_2: f64 = f64::from_bits(0x3ff921fb54442d18);
 /// work here: for `x` near `2^127` the reduced argument depends on bits of
 /// `4/pi` far below anything a `double` holds. glibc's `reduce_large`.
 fn reduce_large(xi: u32) -> (f64, i32) {
-    let arr = &t::INV_PIO4[((xi >> 26) & 15) as usize..];
+    let arr = &crate::tables::single::trig::INV_PIO4[((xi >> 26) & 15) as usize..];
     let shift = (xi >> 23) & 7;
 
     let xi = ((xi & 0x00ff_ffff) | 0x0080_0000) << shift;
@@ -119,10 +120,10 @@ fn reduce_aux(x: f32, alpha: f64) -> (f64, i32) {
 #[inline(always)]
 fn quadrant_cos(t: f32, xr: f32, n: i32) -> f32 {
     match n & 3 {
-        0 => t * xr.cos(),
-        2 => -t * xr.cos(),
-        1 => -t * xr.sin(),
-        _ => t * xr.sin(),
+        0 => t * trig::cos(xr),
+        2 => -t * trig::cos(xr),
+        1 => -t * trig::sin(xr),
+        _ => t * trig::sin(xr),
     }
 }
 
@@ -130,10 +131,10 @@ fn quadrant_cos(t: f32, xr: f32, n: i32) -> f32 {
 #[inline(always)]
 fn quadrant_sin(t: f32, xr: f32, n: i32) -> f32 {
     match n & 3 {
-        0 => t * xr.sin(),
-        2 => -t * xr.sin(),
-        1 => t * xr.cos(),
-        _ => -t * xr.cos(),
+        0 => t * trig::sin(xr),
+        2 => -t * trig::sin(xr),
+        1 => t * trig::cos(xr),
+        _ => -t * trig::cos(xr),
     }
 }
 
@@ -353,14 +354,13 @@ pub fn j0(x: f32) -> f32 {
     }
     let x = x.abs();
     if i >= 0x4000_0000 {
-        let s = x.sin();
-        let c = x.cos();
+        let (s, c) = trig::sincos(x);
         let mut ss = s - c;
         let mut cc = s + c;
         if i >= 0x7f00_0000 {
             return j0_asympt(x); // x >= 2^127, where x + x would overflow
         }
-        let z = -(x + x).cos();
+        let z = -trig::cos(x + x);
         if s * c < 0.0 {
             cc = z / ss;
         } else {
@@ -418,14 +418,13 @@ pub fn y0(x: f32) -> f32 {
     // The second window is around y0's first zero, where the rational fit
     // below is useless even though |x| < 2.
     if i >= 0x4000_0000 || (0x3f53_40ed..=0x3f77_b5e5).contains(&i) {
-        let s = x.sin();
-        let c = x.cos();
+        let (s, c) = trig::sincos(x);
         let mut ss = s - c;
         let mut cc = s + c;
         if i >= 0x7f00_0000 {
             return y0_asympt(x);
         }
-        let z = -(x + x).cos();
+        let z = -trig::cos(x + x);
         if s * c < 0.0 {
             cc = z / ss;
         } else {
@@ -462,14 +461,13 @@ pub fn j1(x: f32) -> f32 {
     }
     let y = x.abs();
     if i >= 0x4000_0000 {
-        let s = y.sin();
-        let c = y.cos();
+        let (s, c) = trig::sincos(y);
         let mut ss = -s - c;
         let mut cc = s - c;
         if i >= 0x7f00_0000 {
             return j1_asympt(x);
         }
-        let z = (y + y).cos();
+        let z = trig::cos(y + y);
         if s * c > 0.0 {
             cc = z / ss;
         } else {
@@ -517,14 +515,13 @@ pub fn y1(x: f32) -> f32 {
     // The crossover is below 2 here — `y1`'s first zero is at 2.197, and the
     // rational fit has already lost its digits by 1.757.
     if i >= 0x3fe0_dfbc {
-        let s = x.sin();
-        let c = x.cos();
+        let (s, c) = trig::sincos(x);
         let mut ss = -s - c;
         let mut cc = s - c;
         if i >= 0x7f00_0000 {
             return y1_asympt(x);
         }
-        let z = (x + x).cos();
+        let z = trig::cos(x + x);
         if s * c > 0.0 {
             cc = z / ss;
         } else {
