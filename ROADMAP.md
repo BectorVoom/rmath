@@ -589,7 +589,7 @@ widening whenever the f64 kernel does more than the f32 result needs.
   resolving §10 item 3: bit-pattern seed for `|x|^(-1/3)` (constant found by
   the same search technique as the `f32` kernel's, scaled and refined
   numerically — see the kernel doc), four division-free Newton steps, a
-  compensated final combine. Measures **7-8x against `BitExact`'s 1.7x** — well
+  compensated final combine. Measures **7-8x against `BitExact`'s 1.7x at the time** — well
   past the 3x acceptance bar. Its accuracy bound is **16 ulp** (measured worst
   8, stable from 100M to 500M samples), not the ~2-4 ulp first estimated: the
   `f32` kernel's equivalent gets its extra precision for free by running its
@@ -1561,6 +1561,95 @@ widening whenever the f64 kernel does more than the f32 result needs.
   positive one. `scan_single_precision_exhaustive` re-run: `j0f`/`j1f` `Fast`
   still 9 ulp over 1.17B inputs each, unchanged.
 
+- **Cycle 9: `cbrt` `BitExact`'s exponent surgery, vectorised — the
+  "inherently per-lane" claim in `src/kernels/double/cbrt.rs`'s own module
+  doc turned out to be wrong.** Found by a downstream user (`libxc_rs`),
+  not by this crate's own sweep: its generated SIMD kernels called `cbrt` of
+  *loop-invariant* values (physics constants, runtime parameters bound once
+  per functional) inside their hot loop, and profiling there showed each
+  such call costing a full per-lane pass — because `wide` gives no vector
+  `leading_zeros`/`% 3`/table-select primitives, stage 1 (decompose: table
+  index, rescale factors) and stage 3 (recompose: rebuild the exponent,
+  apply the rounding-boundary snap) both ran `for i in 0..V::LANES` over
+  `Self::Bits` treated as a plain array, one lane at a time. That is
+  *integer* bit arithmetic — shifts, masks, one multiply standing in for
+  `e / 3`, two/three-way table selects — which has no more claim to being
+  "inherently per-lane" than stage 2's floating-point arithmetic beside it,
+  which was already real vector code.
+
+  `src/kernels/double/cbrt.rs::decompose_fast`/`recompose_fast` replace
+  both stages with `wide::u64x2`/`u64x4`/`u64x8` arithmetic (matched to
+  `V::LANES` by a local macro, `f64` itself and any width without an
+  override still running the original per-lane fallback, now named
+  `decompose_scalar`/`recompose_scalar`). Two things worth a future reader's
+  attention:
+
+  - **Subnormal handling moved into the existing repair path instead of
+    being vectorised.** The scalar version shifts a subnormal's mantissa
+    into place inline (`leading_zeros`, which `wide` has no vector
+    instruction for); the vector version instead flags it and lets the
+    existing cold-path machinery call [`crate::reference::cbrt`] on it
+    directly — provably the identical computation, since `reference::cbrt`
+    *is* that same shift followed by the same arithmetic every other lane
+    already runs through this file. `Decomposed::degenerate` (zero/inf/NaN,
+    repaired only under `FullRange`, matching every other kernel's
+    `Finite` contract) and the new `Decomposed::subnormal` (repaired
+    unconditionally — a subnormal `cbrt` is not costly or discontinuous, so
+    `Finite` offers no shortcut here to take) are two separate flags for
+    exactly this reason: collapsing them would have made a `Finite`
+    subnormal input wrong, which the scalar version never was.
+  - **No ordering (`<`/`>`) comparison anywhere reinterprets a float's bits
+    as a signed integer.** The scalar version's recompose does
+    (`(m0 as i64) >> 63`, an arithmetic shift used purely to sign-extend);
+    the vector version gets the same all-ones/all-zeros pattern from an
+    *equality* test on the isolated top bit instead
+    (`(m0 & TOP_BIT).simd_eq(TOP_BIT)`), and separately proves (in the
+    function's own doc) that the one`<=`comparison downstream of it
+    (`(m0 ^ m1) <= (1u64 << 30)`) never sees a top bit set regardless —
+    `m0 XOR m1` is `m0` when `m0`'s top bit is `0` and `!m0` (top bit
+    provably `0`) when it is `1` — so a hypothetical unsigned-vs-signed
+    mismatch in `wide`'s own comparison implementation could not have
+    produced a wrong answer here even before that was checked. Neither
+    avoidance was load-bearing by itself (`wide` compiles a genuine
+    unsigned compare for its `uN` types), but it means this function does
+    not depend on that being true.
+
+  Both were also missing `#[inline(always)]` on first pass — outlined, the
+  `if V::LANES == 8 { .. }` branch and the `Option`-wrapped return were not
+  reliably eliminated, which cost most of the win before it was added; see
+  constraint-by-example rather than take it as given for any future
+  `V::LANES`-dispatched helper in this file.
+
+  Measured, four runs of `examples/bench.rs` (BitExact vs scalar libm
+  within one process) once background load had cleared (an unrelated
+  `cargo check` of a large sibling workspace had been competing for the
+  same cores for part of this session — see Cycle 8's addendum for the
+  same caveat, spelled out in full, about "quiet machine" figures in this
+  file generally): `BitExact` **1.76x -> 2.14-2.20x** (mean 2.18x),
+  `+ Finite` **1.76x -> 2.11-2.19x** (mean 2.15x); `Fast` unaffected
+  (8.07-8.25x / 9.16-9.41x), as expected since this cycle touched only the
+  `BitExact` path. `examples/cbrt_direct.rs` (new; a tight loop bypassing
+  `eval_slice`'s buffer walk, isolating this file's own change from the
+  harness) corroborates with a directly comparable absolute number, best of
+  several runs once load cleared: **f64x8 ~5.1-5.4 ns/elem**, against this
+  same tree's own pre-change **~9-14 ns/elem** measured under the noisier
+  conditions earlier in the session — consistent in direction and rough
+  magnitude with the ratio above, though not run back-to-back on the same
+  quiet window so not quoted as a second precise multiplier.
+
+  Verified: `tests/bit_exact.rs::cbrt_bit_exact_at_every_width` (widths
+  1/2/4/8, ~1.8M values including subnormals, extremes, random bit
+  patterns and exact cubes) and `::special_lanes_do_not_leak_into_neighbours`
+  (mixed vectors with `5e-324`/subnormal lanes beside zero/inf/NaN/ordinary
+  ones in every position) — both pre-existing tests, unmodified, since the
+  contract (`f64::cbrt`, every width, bit for bit) did not change, only how
+  it is met. `kernels::double::cbrt::fast_path_probe` (new, `src/`-internal)
+  asserts `decompose_fast`/`recompose_fast` actually return `Some` for
+  `f64x8` rather than silently falling through to the scalar path, which a
+  correctness test alone cannot distinguish. Full suite: 154/154 (0
+  ignored beyond the pre-existing one, unrelated).
+
+
 ## 7. Suggested sequencing
 
 Ordered by value density; each phase is independently shippable and ends with
@@ -1641,7 +1730,8 @@ done and its negative verdict is recorded in §3 — see §10 for what remains.
    cost, and the hardware gather is not the cure on this machine.
 3. ~~**f64 `cbrt` `Fast`**~~ — **decided: offered.** A native seed-plus-Newton
    `Fast` path landed (`src/kernels/double/cbrt.rs`), measuring 7-8x against
-   `BitExact`'s 1.7x. Its bound is 16 ulp (measured worst 8, stable from 100M
+   `BitExact`'s 1.7x at the time (`BitExact` itself moved to ~2.1-2.2x in
+   Cycle 9, without changing `Fast`). Its bound is 16 ulp (measured worst 8, stable from 100M
    to 500M samples at extreme magnitudes), looser than the ~4 ulp originally
    estimated: unlike the `f32` kernel, there is no wider type for the Newton
    iteration to run in, so the last squaring pays for `r`'s own one-ulp
