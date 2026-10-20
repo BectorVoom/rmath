@@ -11,9 +11,9 @@
 //! else. On a busy machine, run it several times — background load on
 //! other cores can still perturb a single-threaded wall-clock loop.
 use rmath::prelude::*;
+use std::time::Instant;
 #[cfg(feature = "wide")]
 use wide::f64x8;
-use std::time::Instant;
 
 const N: usize = 1 << 20;
 const REPS: usize = 20;

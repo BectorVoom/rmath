@@ -907,7 +907,16 @@ fn traversal_benchmarks() {
             .collect();
         println!(
             "{:<30} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
-            name, times[0], times[1], times[2], times[3], times[4], times[5], times[6], times[7], times[8]
+            name,
+            times[0],
+            times[1],
+            times[2],
+            times[3],
+            times[4],
+            times[5],
+            times[6],
+            times[7],
+            times[8]
         );
         for (&len, &t) in lens.iter().zip(times.iter()) {
             record(format!("{name}_len{len}"), "ns_per_elem", 1.0, t);
@@ -1171,7 +1180,13 @@ fn repair_benchmarks(n: usize) {
                 (1.0 / pct).round() as usize
             };
             (0..n)
-                .map(|i| if step > 0 && i % step == 0 { val_bad } else { val_ok })
+                .map(|i| {
+                    if step > 0 && i % step == 0 {
+                        val_bad
+                    } else {
+                        val_ok
+                    }
+                })
                 .collect()
         })
     };
@@ -1202,7 +1217,13 @@ fn repair_benchmarks(n: usize) {
     );
     println!("{}", "-".repeat(78));
 
-    let corpora_names = ["in-domain", "boundary", "random-bit", "coherent", "mixed-special"];
+    let corpora_names = [
+        "in-domain",
+        "boundary",
+        "random-bit",
+        "coherent",
+        "mixed-special",
+    ];
     let check_fire = |name: &str, is_bad: &dyn Fn(f64) -> bool| {
         let mut rates = Vec::new();
         for &cname in &corpora_names {
@@ -1225,7 +1246,9 @@ fn repair_benchmarks(n: usize) {
         );
     };
 
-    check_fire("exp", &|x| x > 709.78271289338397 || x < -745.1332191019411 || !x.is_finite());
+    check_fire("exp", &|x| {
+        x > 709.78271289338397 || x < -745.1332191019411 || !x.is_finite()
+    });
     check_fire("exp2", &|x| x.abs() >= 1024.0 || !x.is_finite());
     check_fire("expm1", &|x| x > 709.78271289338397 || !x.is_finite());
     check_fire("cosh", &|x| x.abs() > 710.4758600739439 || !x.is_finite());

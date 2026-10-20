@@ -415,13 +415,7 @@ fn scan_single_precision_exhaustive() {
         fast32!(Exp10),
         |x| libm::exp10f(x),
     );
-    scan32_exhaustive(
-        "cbrtf",
-        0x0080_0000,
-        0x7f7f_ffff,
-        fast32!(Cbrt),
-        f32::cbrt,
-    );
+    scan32_exhaustive("cbrtf", 0x0080_0000, 0x7f7f_ffff, fast32!(Cbrt), f32::cbrt);
     scan32_exhaustive(
         "tanhf",
         0x0080_0000,

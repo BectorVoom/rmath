@@ -87,8 +87,9 @@ the default corpus that took `sin` from 2.45x to **5.67x**, `cos` from 2.44x
 to **5.77x** and `sincos` from 2.75x to **6.90x**; on `--corpus=in-domain`,
 whose angles are small enough to sit inside the bands, it changes nothing
 either way (2.05x / 1.93x / 2.32x), which is the shape a guard should have.
-`asinh` (2.45x), `acosh` (1.01x-2.05x), `log1p` (2.57x-2.69x), and `atanh` (3.53x-3.69x)
-are fully vectorised.
+`asinh` (2.45x), `acosh` (1.90x in-domain, **2.22x** on the default corpus now
+that out-of-domain lanes are finished in vector form — see below), `log1p`
+(2.57x-2.69x), and `atanh` (3.53x-3.69x) are fully vectorised.
 `asin`/`acos` are the pair this round rebuilt. Their table is really indexed by the
 argument's top eight bits — `e_asin.c`'s six band-index formulas are six spellings of
 `floor(256*|x|) - 32`, and its band centre is always `(row + 32.5)/256` — so the whole
@@ -369,9 +370,14 @@ Several of those deserve comment rather than burial:
   nothing next to `exp`'s hundred-instruction body and was two of the seven
   instructions in `sqrt`'s. It is written with `chunks_exact` now, and LLVM
   unrolls it.
-- **`acosh` gains far more from `Finite` than anything else** (1.97x to 8.95x).
-  Its domain test is two comparisons *and* a NaN-producing branch for `x < 1`,
-  which is expensive relative to the small amount of arithmetic that follows.
+- **`acosh` gains far more from `Finite` than anything else under `Fast`**
+  (1.97x to 8.95x). Its domain test is two comparisons *and* a NaN-producing
+  branch for `x < 1`, which is expensive relative to the small amount of
+  arithmetic that follows. Under `BitExact` this is no longer true — and on
+  out-of-domain-heavy corpora it *inverts*: `FullRange` finishes bad lanes
+  with three vector arms (`x + x`, `(x - x)/(x - x)`) while `Finite`, whose
+  contract such a corpus violates, still routes them through the interval
+  repair (ROADMAP §6a, Cycle 8 addendum).
 - **`cbrtf` and `tanhf` sit just under parity under `BitExact`.** Their
   single-precision routines are cheap enough that widening into the
   double-precision kernel costs more than it saves, so the bit-exact path

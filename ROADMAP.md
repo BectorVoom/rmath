@@ -1561,6 +1561,129 @@ widening whenever the f64 kernel does more than the f32 result needs.
   positive one. `scan_single_precision_exhaustive` re-run: `j0f`/`j1f` `Fast`
   still 9 ulp over 1.17B inputs each, unchanged.
 
+- **Cycle 8: `asinh`/`acosh` packed log-table gather — measured negative and
+  rolled back; the boundary of Cycle 6's lesson, mapped.** The target was the
+  per-lane integer loop both kernels share (CORE-MATH's two-level log lookup:
+  derive `j` from the mantissa through the 32-entry `B` correction, split it
+  as `i1 = (j >> 5).min(32)`, `i2 = j & 0x1f`, read five slots from four
+  arrays plus one scalar multiply per lane). The Cycle 6 playbook transfers
+  cleanly in *correctness* terms and was built, proved, and then lost the
+  measurement — twice, in two shapes — so what stays is the record.
+
+  **What was established and is worth keeping** (the experiment is ~30 min to
+  reconstruct from this entry):
+
+  1. *The whole `j` derivation runs in exact vector `f64` arithmetic.*
+     `t_norm - 1` is `t * 2^-52` (Sterbenz), `32 * (t_norm - 1)` floors to
+     `i`, the remainder scaled by `2^31` floors to `d >> 16`, and the
+     three-term sum is a sum of integers below `2^53` (`t < 2^52`,
+     `B[i].0 * 2^33 < 2^49`, `|B[i].1 * (d >> 16)| < 2^46`) — every add
+     exact, and `* 2^-42` + `floor` *is* the `>> 42`. No rounding anywhere,
+     verified over every band endpoint, every `d >> 16` edge, every `sum`
+     grazing a multiple of `2^42`, and 5M random mantissas.
+  2. *`j` lands in `[0, 1024]` for every possible 52-bit mantissa* — not just
+     the ones real arguments produce — because each band's `j` is monotone in
+     `d` and all 64 band endpoints stay inside. So a packed table needs no
+     clamp, and the `.min(32)` in the current code is reachable only at
+     `j = 1024` exactly.
+  3. *`R1[i1] * R2[i2]` and `L1[i1][1] + L2[i2][1]` precompute bit-for-bit*
+     in a `const fn` (compile-time IEEE rounds like the hardware), so a
+     combined `j`-indexed row is a pure reshaping; `L1[i1][0]` and
+     `L2[i2][0]` must stay separate slots because `ll` adds them in order.
+     Both packings passed the full suite plus an 84M-value randomized sweep
+     (raw bit patterns, band edges ±ulps, NaNs, subnormals) with 0
+     mismatches at every width.
+
+  **What was measured.** Two shapes: (C) one 33 KiB `j`-indexed table
+  (1025 rows × 4 slots) read by one `gather_run::<4>`; (D) two 1 KiB
+  per-level tables read by two `gather_run::<3>`s, keeping the runtime
+  multiply/add. Interleaved, order-randomized A/B/C/D, minimum over 30+
+  rounds of 12 in-process reps, 1M-element buffers: on `acosh` band 1
+  (`[1.2, 100]`) the baseline per-lane loop read 8.35 ns/elem against 10.47
+  (C) and 10.64 (D); `asinh` `[3, 100]` read 9.73 against 11.40/11.97; no
+  corpus favoured either variant. **Caveat on the record:** every round ran
+  against a saturating background compile (load 15–20 on 8 cores), so the
+  absolute numbers are inflated and the noise floor was ~10%; but the sign
+  was consistent across four independent sessions and ~45 randomized rounds,
+  and a 15–25% deficit on the targeted rows does not survive any plausible
+  quiet-machine correction to a ≥10% win.
+
+  **The lesson, sharpening Cycle 6's.** The asin/acos accept was reopened
+  and won because its per-lane alternative was 12 slots — 96 scalar loads
+  and 84 inserts per vector. Here the per-lane alternative is *five* loads
+  from ~1.6 KiB of always-L1-hot tables plus cheap ALU, and on Zen 5 that
+  idiom beats both a 33 KiB blocked gather (footprint) and a 1 KiB blocked
+  gather (transpose overhead: the `N > 2` override pays eight 64-byte loads
+  and ~24 shuffles per gather regardless of how few slots are wanted). The
+  crossover for `gather_run` repacking sits somewhere above five slots per
+  lane; A5 (hardware element gather) and this entry now bound the same
+  conclusion from two directions. A future quiet-machine retest is cheap —
+  the design above is complete — but the next attempt should change the
+  *shape of the work*, not the shape of the lookup.
+
+  **Two side findings.**
+  1. Outlining `patch_lanes`'s repair loop behind `#[cold] #[inline(never)]`
+     shrank the hot closures by ~9% of code size (real spill-sequence
+     removal, confirmed in disassembly) and still measured neutral to
+     slightly negative on every row — LLVM already sinks the cold block out
+     of the hot path, so the call indirection buys nothing. Rolled back.
+  2. `bench_results/final_native.csv`'s `acosh` **0.94x** row is real and
+     was misattributed twice before the mechanism surfaced. It is not the
+     kernel (in-domain `[1.2, 100]` measures ~1.7x quiet), not the interval
+     fallback (`lb != ub` fires on 0.05% of lanes there, 3.0% on
+     `[1.0001, 1.118]`, measured by sentinel) — it is **domain-error
+     density**: the default corpus's `posargs` is log-uniform over
+     `[1e-12, 1e12]`, so *half* of `acosh`'s inputs are below 1. Every
+     vector carried ~4 invalid lanes, `patch_lanes` fired on essentially
+     100% of vectors with a scalar `reference::acosh` call per bad lane,
+     and the mixed-band dispatch computed `band0` on every vector only to
+     discard it — while scalar glibc dispatches `x < 1` in a couple of
+     cycles. `asinh`, defined everywhere, was untouched, which is why the
+     twins read 2.4x apart. The fix is Cycle 5's `expm1` move applied to
+     the domain edge (see the Cycle 8 addendum below).
+
+- **Cycle 8 addendum: `acosh` `BitExact` out-of-domain lanes finished in
+  vector form — 0.96x → 2.22x on the default corpus.** The reference's
+  entire answer for the out-of-domain region is three one-operation arms:
+  `x + x` for a NaN (payload-preserving, exactly as the hardware add is) and
+  for `+inf`, and `__math_invalid`'s `(x - x) / (x - x)` for everything else
+  — which a packed divide reproduces bit for bit, the x86 default quiet NaN
+  with its sign, matching the scalar `divsd`. Under `FullRange` those arms
+  are now blended behind one `bad.any()` guard, out-of-domain lanes are kept
+  off the `band0` dispatch arm (so a bad-lane-heavy buffer no longer forces
+  the compute-both-bands blend on every vector), and `patch_lanes` keeps
+  only `x == 1` — in domain, but its `band0` interval never collapses — and
+  the ~0.05% of in-domain lanes whose rounding interval fails. The same
+  deliberate, narrow amendment of constraint §2.5 as Cycle 5's `expm1`
+  arms: constants and single operations selected by a comparison, never a
+  re-derivation of structure. `Finite` is untouched.
+
+  Measured, interleaved A/B of two binaries on a quiet machine (load < 2.5),
+  `--corpus=default`, 1M elements, two rounds:
+
+  | row | before | after |
+  |---|--:|--:|
+  | `acosh` `BitExact` | 0.96x / 0.99x | **2.22x / 2.23x** |
+  | `acosh` `BitExact` + `Finite` | 0.99x / 1.01x | 0.97x (unchanged) |
+  | `acosh` `Fast` / `Fast+Finite` | 2.20x / 9.1x | 2.2x / 9.3x (unchanged) |
+  | every other row | — | within its noise band |
+
+  Two notes for the next reader. (1) This makes `BitExact + FullRange`
+  *faster* than `+ Finite` on out-of-domain-heavy corpora — `Finite` still
+  routes a contract-violating lane through the interval repair — so
+  `bench_matrix.py`'s inversion detector will flag `acosh` on such corpora;
+  that inversion is corpus-induced and correct. (2) `acosh` `Fast` under
+  `FullRange` (2.2x vs 9.3x under `Finite`) has the same disease in
+  `dispatch`'s repair mask and would take the same three arms; it is left
+  open here because the fix belongs in (or beside) the shared `dispatch`
+  machinery, not in another special case.
+
+  Verified: the full `bit_exact` suite at widths 1/2/4/8 (strict bits, the
+  corpus includes NaNs, negatives, zeros and raw patterns), plus a dedicated
+  42M-value strict-bit sweep at slice width, dense in out-of-domain lanes,
+  the domain edge `1.0 ± ulps`, `±0`, `±inf` and raw 64-bit patterns:
+  **0 mismatches**.
+
 - **Cycle 9: `cbrt` `BitExact`'s exponent surgery, vectorised — the
   "inherently per-lane" claim in `src/kernels/double/cbrt.rs`'s own module
   doc turned out to be wrong.** Found by a downstream user (`libxc_rs`),
@@ -1648,7 +1771,6 @@ widening whenever the f64 kernel does more than the f32 result needs.
   `f64x8` rather than silently falling through to the scalar path, which a
   correctness test alone cannot distinguish. Full suite: 154/154 (0
   ignored beyond the pre-existing one, unrelated).
-
 
 ## 7. Suggested sequencing
 

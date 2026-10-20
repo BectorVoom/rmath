@@ -103,7 +103,11 @@ fn eval_binary_slice<E: Real, F: Function2<E>>(f: &F, a: &[E], b: &[E], dst: &mu
         v.store_slice(&mut dst[i..i + lanes]);
         i += lanes;
     }
-    for ((x, y), d) in a[end..].iter().zip(b[end..].iter()).zip(dst[end..].iter_mut()) {
+    for ((x, y), d) in a[end..]
+        .iter()
+        .zip(b[end..].iter())
+        .zip(dst[end..].iter_mut())
+    {
         *d = f.eval::<E>(*x, *y);
     }
 }
@@ -149,7 +153,11 @@ fn eval_pair_slice<E: Real, F: FunctionPair<E>>(
         v2.store_slice(&mut second[i..i + lanes]);
         i += lanes;
     }
-    for ((s, f1), f2) in src[end..].iter().zip(first[end..].iter_mut()).zip(second[end..].iter_mut()) {
+    for ((s, f1), f2) in src[end..]
+        .iter()
+        .zip(first[end..].iter_mut())
+        .zip(second[end..].iter_mut())
+    {
         let (a, b) = f.eval::<E>(*s);
         *f1 = a;
         *f2 = b;

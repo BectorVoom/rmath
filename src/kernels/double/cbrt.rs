@@ -393,9 +393,7 @@ fn bit_exact<V: Simd<Elem = f64>, D: Domain>(x: V) -> V {
     let xs = x.to_array();
     let mut out = recomposed.to_array();
     for i in 0..V::LANES {
-        if subnormal.as_slice()[i]
-            || (D::CHECKED && degenerate.as_slice()[i])
-            || cold.as_slice()[i]
+        if subnormal.as_slice()[i] || (D::CHECKED && degenerate.as_slice()[i]) || cold.as_slice()[i]
         {
             out.as_mut_slice()[i] = reference::cbrt(xs.as_slice()[i]);
         }
@@ -427,10 +425,9 @@ fn decompose_fast<V: Simd<Elem = f64>>(bits: &V::Bits) -> Option<Decomposed<V>> 
     macro_rules! width {
         ($uint:ty, $lanes:literal) => {
             if V::LANES == $lanes {
-                let hx: $uint =
-                    <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| {
-                        bits.as_slice()[i]
-                    }));
+                let hx: $uint = <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| {
+                    bits.as_slice()[i]
+                }));
                 let zero = <$uint>::splat(0);
                 let one_bits = <$uint>::splat(1.0f64.to_bits());
                 let sign_bit = hx & <$uint>::splat(1u64 << 63u32);
@@ -444,7 +441,7 @@ fn decompose_fast<V: Simd<Elem = f64>>(bits: &V::Bits) -> Option<Decomposed<V>> 
                 let is_inf_nan = e0.simd_eq(<$uint>::splat(0x7ff));
                 let is_zero = ix.simd_eq(zero);
                 let special = e_zero | is_inf_nan;
-                let subnormal_mask = e_zero & !(is_zero) ;
+                let subnormal_mask = e_zero & !(is_zero);
                 let degenerate_mask = is_zero | is_inf_nan;
 
                 let mant = hx & <$uint>::splat(0x000f_ffff_ffff_ffff);
@@ -537,14 +534,11 @@ fn recompose_fast<V: Simd<Elem = f64>>(y1: V, dy: V, zz: V, et: &V::Bits) -> Opt
         ($uint:ty, $lanes:literal) => {
             if V::LANES == $lanes {
                 let y1_bits = y1.to_bits();
-                let y1v: $uint =
-                    <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| {
-                        y1_bits.as_slice()[i]
-                    }));
+                let y1v: $uint = <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| {
+                    y1_bits.as_slice()[i]
+                }));
                 let et_v: $uint =
-                    <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| {
-                        et.as_slice()[i]
-                    }));
+                    <$uint>::from(core::array::from_fn::<u64, $lanes, _>(|i| et.as_slice()[i]));
 
                 // `342 + 1023 = 1365`; combining the scalar version's two
                 // `wrapping_sub`s into one is exact for wrapping (modular)

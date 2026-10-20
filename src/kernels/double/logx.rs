@@ -279,7 +279,9 @@ pub mod log1p {
         const DIRECT_LO: f64 = f64::from_bits(0xbfd2_bec3_0000_0000); // -0.292893...
         const DIRECT_HI: f64 = f64::from_bits(0x3fda_8279_ffff_ffff); // 0.414213...
 
-        let is_direct = x.gt_mask(V::splat(DIRECT_LO)).and(x.lt_mask(V::splat(DIRECT_HI)));
+        let is_direct = x
+            .gt_mask(V::splat(DIRECT_LO))
+            .and(x.lt_mask(V::splat(DIRECT_HI)));
         if is_direct.all() {
             let is_tiny = x.abs().lt_mask(V::splat(TINY_CUT));
             if is_tiny.all() {
@@ -310,7 +312,9 @@ pub mod log1p {
         }
 
         let one = V::splat(1.0);
-        let is_large = x.abs().ge_mask(V::splat(f64::from_bits(0x4340_0000_0000_0000))); // >= 2^53
+        let is_large = x
+            .abs()
+            .ge_mask(V::splat(f64::from_bits(0x4340_0000_0000_0000))); // >= 2^53
         let uu = one + x;
         let u = V::select(is_large, x, uu);
         let c_pos = (one - (uu - x)) / uu;

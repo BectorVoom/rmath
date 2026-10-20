@@ -173,7 +173,9 @@ macro_rules! impl_scalar {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
             const HALF: Self = 0.5;
-            const HALF_MINUS_ULP: Self = <$elem>::from_bits((((($bias - 2) as $uint) << $mant) | (((1 as $uint) << $mant) - 1)));
+            const HALF_MINUS_ULP: Self = <$elem>::from_bits(
+                (((($bias - 2) as $uint) << $mant) | (((1 as $uint) << $mant) - 1)),
+            );
             const MIN_POSITIVE: Self = <$elem>::MIN_POSITIVE;
             const INFINITY: Self = <$elem>::INFINITY;
             const NEG_INFINITY: Self = <$elem>::NEG_INFINITY;

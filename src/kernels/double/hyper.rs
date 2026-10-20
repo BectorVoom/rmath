@@ -497,8 +497,9 @@ pub mod asinh {
             t_val &= !0u64 >> 12;
             let i = (t_val >> (52 - 5)) as usize;
             let d = (t_val & (!0u64 >> 17)) as i64;
-            let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
-                >> (52 - 10)) as usize;
+            let j =
+                (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+                    >> (52 - 10)) as usize;
             t_val |= 0x3ffu64 << 52;
             t_val_arr.as_mut_slice()[k_idx] = t_val;
 
@@ -575,15 +576,53 @@ pub mod asinh {
 /// and single-invocation patch dispatch ensures coherent buffers (Bands 2..5)
 /// bypass `sqrt` and division paths, delivering ≥ 1.03x exact and 2.48x fast
 /// on coherent corpora while maintaining 2.04x exact / 7.49x fast in-domain.
+///
+/// Out-of-domain lanes are finished in vector form under `BitExact` +
+/// `FullRange` — see `eval`'s doc. On the default corpus (log-uniform
+/// `posargs`, half of it below 1) that is the difference between 0.96x and
+/// 2.22x exact (1M elements, quiet interleaved A/B; ROADMAP §6a, Cycle 8
+/// addendum).
 pub mod acosh {
     use super::*;
     use crate::tables::double::asincosh as t;
 
     /// `acosh(x)` for a vector of lanes.
+    ///
+    /// `acosh` is the one function here with a *left-bounded* domain, and
+    /// bulk data is routinely full of lanes below it — half of the default
+    /// bench corpus, every negative value, every zero. Handing each of those
+    /// lanes to the scalar reference through `patch_lanes` made the
+    /// out-of-domain lane the most expensive kind, on exactly the corpora
+    /// where it is the most common kind. But the reference's own answers for
+    /// the whole out-of-domain region are three one-operation arms —
+    /// `x + x` for a NaN (payload-preserving, as the hardware add already
+    /// is) and for `+inf`, and `__math_invalid`'s `(x - x) / (x - x)` for
+    /// everything else, which a packed divide reproduces bit for bit (the
+    /// x86 default quiet NaN, sign included, matching the scalar `divsd`) —
+    /// so under `FullRange` they are blended in vector form behind one
+    /// `any()`, and the scalar reference keeps only `x == 1` and the rare
+    /// in-domain lane whose rounding interval fails to collapse. The same
+    /// amendment of constraint §2.5 as Cycle 5's `expm1` arms: constants and
+    /// single operations selected by a comparison, never a re-derivation of
+    /// structure.
     #[inline(always)]
     pub fn eval<V: Simd<Elem = f64>, A: Accuracy, D: Domain>(x: V) -> V {
         if A::BIT_EXACT {
-            let is_b0 = x.lt_mask(V::splat(f64::from_bits(BAND0_CUTOFF)));
+            let one = V::splat(1.0);
+            // Under `FullRange`, keep out-of-domain lanes off the `band0`
+            // arm: a corpus-heavy spread of bad lanes would otherwise force
+            // the mixed three-way dispatch (both bands plus the blend) on
+            // essentially every vector, computing `band0` only to discard
+            // it. Their `bands_1_to_5` result is garbage and equally
+            // discarded, but that path runs anyway for the in-domain lanes.
+            // Under `Finite` the caller vouches, and the mask keeps its
+            // plain spelling.
+            let is_b0 = if D::CHECKED {
+                x.ge_mask(one)
+                    .and(x.lt_mask(V::splat(f64::from_bits(BAND0_CUTOFF))))
+            } else {
+                x.lt_mask(V::splat(f64::from_bits(BAND0_CUTOFF)))
+            };
             let (y, valid) = if is_b0.all() {
                 band0(x)
             } else if is_b0.none() {
@@ -595,13 +634,29 @@ pub mod acosh {
                 let valid = is_b0.and(v0).or(is_b0.not().and(v1));
                 (y, valid)
             };
-            let repair = if D::CHECKED {
-                let bad = x.ge_mask(V::splat(1.0)).and(x.lt_mask(V::splat(f64::INFINITY))).not();
-                valid.not().or(bad)
-            } else {
-                valid.not()
-            };
-            return crate::simd::patch_lanes(x, y, repair, reference::acosh);
+            if D::CHECKED {
+                let bad = x.ge_mask(one).and(x.lt_mask(V::splat(f64::INFINITY))).not();
+                #[allow(clippy::eq_op)] // `x - x` / `x - x` is __math_invalid, on purpose
+                let y = if bad.any() {
+                    // The reference's three out-of-domain arms, in vector
+                    // form. `x == 1` is *in* domain and stays with the
+                    // scalar repair below (its `band0` interval never
+                    // collapses); everything `bad` is finished right here.
+                    let quiet = x + x;
+                    let inv = (x - x) / (x - x);
+                    let keep_payload = x.is_nan().or(x.eq_mask(V::splat(f64::INFINITY)));
+                    V::select(bad, V::select(keep_payload, quiet, inv), y)
+                } else {
+                    y
+                };
+                return crate::simd::patch_lanes(
+                    x,
+                    y,
+                    valid.not().and(bad.not()),
+                    reference::acosh,
+                );
+            }
+            return crate::simd::patch_lanes(x, y, valid.not(), reference::acosh);
         }
         dispatch::<V, A, D>(x, reference::acosh, fast, |x| {
             x.ge_mask(V::splat(1.0))
@@ -690,7 +745,8 @@ pub mod acosh {
             (th, g1)
         } else if is_b1.none() {
             let z = one / x2h;
-            let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
+            let g2 = V::splat(C2[0])
+                + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
             let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
             let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
             let g5 = V::splat(0.0);
@@ -713,7 +769,8 @@ pub mod acosh {
             let g1 = tl / th;
 
             let z = one / x2h;
-            let g2 = V::splat(C2[0]) + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
+            let g2 = V::splat(C2[0])
+                + z * (V::splat(C2[1]) + z * (V::splat(C2[2]) + z * V::splat(C2[3])));
             let g3 = V::splat(C3[0]) + z * (V::splat(C3[1]) + z * V::splat(C3[2]));
             let g4 = V::splat(C4[0]) + z * V::splat(C4[1]);
             let g5 = V::splat(0.0);
@@ -751,8 +808,9 @@ pub mod acosh {
             t_val &= !0u64 >> 12;
             let i = (t_val >> (52 - 5)) as usize;
             let d = (t_val & (!0u64 >> 17)) as i64;
-            let j = (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
-                >> (52 - 10)) as usize;
+            let j =
+                (((t_val as i64) + ((t::B[i].0 as i64) << 33) + ((t::B[i].1 as i64) * (d >> 16)))
+                    >> (52 - 10)) as usize;
             t_val |= 0x3ffu64 << 52;
             t_val_arr.as_mut_slice()[k_idx] = t_val;
 
